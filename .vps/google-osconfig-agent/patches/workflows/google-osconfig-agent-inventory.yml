@@ -544,6 +544,8 @@ jobs:
           [[ "$EXPECTED_RUN_ATTEMPT" == "$GITHUB_RUN_ATTEMPT" ]]
           [[ "$EXPECTED_WORKFLOW_SHA" == "$GITHUB_SHA" ]]
           [[ "$EXPECTED_CANDIDATE_ID" == "$SOURCE_CANDIDATE_ID" ]]
+      - name: Install private checkout transport tools
+        run: dnf -y install git openssh-clients python3
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: master
@@ -558,8 +560,6 @@ jobs:
           assert re.fullmatch(r"[0-9a-f]{40}", revision)
           print(f"revision={revision}")
           PY
-      - name: Install private checkout transport tools
-        run: dnf -y install git openssh-clients
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: warelik/machine-maintenance
@@ -1350,6 +1350,8 @@ jobs:
           [[ "$EXPECTED_RUN_ATTEMPT" == "$GITHUB_RUN_ATTEMPT" ]]
           [[ "$EXPECTED_WORKFLOW_SHA" == "$GITHUB_SHA" ]]
           [[ "$EXPECTED_CANDIDATE_ID" == "$SOURCE_CANDIDATE_ID" ]]
+      - name: Install private checkout transport tools
+        run: dnf -y install git openssh-clients python3
       - name: Check out the exact trusted workflow source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1365,8 +1367,6 @@ jobs:
           assert re.fullmatch(r"[0-9a-f]{40}", revision)
           print(f"revision={revision}")
           PY
-      - name: Install private checkout transport tools
-        run: dnf -y install git openssh-clients
       - name: Check out the exact private lifecycle source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -1504,6 +1504,8 @@ jobs:
           [[ "$REUSE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
           [[ "$REUSE_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
           [[ "$REUSE_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+      - name: Install private checkout transport tools
+        run: dnf -y install git openssh-clients python3
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
@@ -1518,8 +1520,6 @@ jobs:
           assert re.fullmatch(r"[0-9a-f]{40}", revision)
           print(f"revision={revision}")
           PY
-      - name: Install private checkout transport tools
-        run: dnf -y install git openssh-clients
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: warelik/machine-maintenance

@@ -186,3 +186,5 @@ Owned stale policy-repair PRs are closed using the existing configured request c
 Trusted coding-task disposition examples are masked before receipt parsing and escaped when issuing new tasks. Real malformed dispositions still block publication.
 
 Signing and verified-artifact recovery install gh before native reservation verification. Policy-only adoption dispatches the next trusted maintenance cycle after exact selective adoption and cleanup; this does not rebuild the unchanged signed baseline. Modern embedded signed candidates initialize and fetch their policy workspace explicitly.
+
+Fedora jobs install Python, Git and OpenSSH immediately after the frozen native-attempt shell guard and before either checkout or the first Python command. The signer validator and workflow regression enforce that order for build, signing and recovery.

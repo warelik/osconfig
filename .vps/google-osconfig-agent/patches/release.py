@@ -5377,7 +5377,7 @@ def _validate_fedora_private_checkout_transport(jobs):
     """Require Git and SSH before each Fedora job's private source checkout."""
     checkout_action = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
     install_name = "Install private checkout transport tools"
-    install_command = "dnf -y install git openssh-clients"
+    install_command = "dnf -y install git openssh-clients python3"
     fedora_image = re.compile(
         r"(?:fedora|docker\.io/library/fedora|quay\.io/fedora/fedora|"
         r"registry\.fedoraproject\.org/fedora):[A-Za-z0-9_.-]+"
@@ -5409,7 +5409,11 @@ def _validate_fedora_private_checkout_transport(jobs):
         ]
         if (len(installs) != 1
                 or installs[0][1] != {"name": install_name, "run": install_command}
-                or installs[0][0] >= private_checkouts[0][0]):
+                or installs[0][0] >= private_checkouts[0][0]
+                or any(index < installs[0][0] and (
+                    str(step.get("uses", "")).startswith("actions/checkout@")
+                    or "python3" in step.get("run", ""))
+                    for index, step in enumerate(steps))):
             raise ValueError(
                 f"{job_name} must install Git and OpenSSH transport tools before its private checkout"
             )
@@ -5955,7 +5959,7 @@ python3 -B .vps/google-osconfig-agent/patches/release.py verify-build-provenance
     pages_index, _ = upload_by_name["google-osconfig-agent-pages"]
     proof_index = step_by_name["Record the exact native signature artifact identity"][0]
     final_proof_index, _ = upload_by_name["google-osconfig-agent-final-proof"]
-    if not (preflight_index < checkout_index < pin_index < transport_index
+    if not (preflight_index < transport_index < checkout_index < pin_index
             < private_checkout_index < receipt_index
             < install_index < download_by_name["google-osconfig-agent-built-rpm"][0]
             < download_by_name["google-osconfig-agent-candidate"][0] < verify_index

@@ -180,3 +180,9 @@ Native review history accepts both plain and backtick-delimited legacy commit pr
 Maintenance reads open carried work and the exact current review pair. Closed archived threads are excluded. Before retiring a superseded pair, machines preserve unresolved findings through the existing finding-batch snapshot. Closed exact receipt pairs remain verifiable by explicit PR numbers; final-attempt accounting is unchanged.
 
 A verified exact private bundle reuses policy validation for both application and policy-only decisions; application tests and signed artifact checks remain separate. Optional policy ancestors do not suppress authorized build/sign/adoption lanes. Native policy fixtures have a bounded 64 MiB file limit; failure logs report all public test locations and kinds without private tracebacks or values.
+
+Owned stale policy-repair PRs are closed using the existing configured request credential when the integration token is read-only. Without that credential, the normal writer-token path remains unchanged.
+
+Trusted coding-task disposition examples are masked before receipt parsing and escaped when issuing new tasks. Real malformed dispositions still block publication.
+
+Signing and verified-artifact recovery install gh before native reservation verification. Policy-only adoption dispatches the next trusted maintenance cycle after exact selective adoption and cleanup; this does not rebuild the unchanged signed baseline. Modern embedded signed candidates initialize and fetch their policy workspace explicitly.

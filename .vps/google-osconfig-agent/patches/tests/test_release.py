@@ -19,6 +19,52 @@ import maintenance
 import release
 
 
+class RepairInstructionProtocolTests(unittest.TestCase):
+    def test_modern_signed_policy_workspace_fetches_exact_objects_and_rejects_mismatch(self):
+        candidate = {"upstream_sha": "1" * 40, "application_sha": "2" * 40,
+                     "configuration_sha": "3" * 40}
+        calls = []
+        fetched = [None]
+        def run(*args, **kwargs):
+            calls.append(args)
+            if args[:2] == ("git", "fetch"):
+                fetched[0] = args[-1]
+            return fetched[0] if args[:3] == ("git", "rev-parse", "FETCH_HEAD") else ""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "missing-modern-workspace"
+            with patch.object(release, "run", side_effect=run):
+                self.assertEqual(release.ensure_published_policy_workspace("warelik/osconfig", root, candidate), root)
+            self.assertEqual([c[-1] for c in calls if c[:2] == ("git", "fetch")], list(candidate.values()))
+            with patch.object(release, "run", return_value="0" * 40):
+                with self.assertRaisesRegex(ValueError, "different exact source"):
+                    release.ensure_published_policy_workspace("warelik/osconfig", root, candidate)
+
+    def test_every_fedora_reservation_consumer_has_gh_before_it_runs(self):
+        document = release.yaml_module().safe_load((release.ROOT / ".github/workflows/google-osconfig-agent-inventory.yml").read_text())
+        for job in ("sign", "recover-validated"):
+            steps = document["jobs"][job]["steps"]
+            verify = next(i for i, step in enumerate(steps) if "release.py verify-final-run" in step.get("run", ""))
+            self.assertTrue(any("gh" in step.get("run", "").split() and step.get("run", "").startswith("dnf -y install ") for step in steps[:verify]), job)
+        self.assertEqual(document["jobs"]["adopt-policy"]["permissions"]["actions"], "write")
+
+    def test_task_example_is_not_a_receipt_but_actual_malformed_receipt_still_blocks(self):
+        base = {"id": 1, "created_at": "2026-10-24T00:00:00Z",
+                "updated_at": "2026-10-24T00:00:00Z",
+                "user": {"login": "warelik", "type": "User"}}
+        task = {**base, "body": "Coding task. " + release.FINDING_DISPOSITION_INSTRUCTION}
+        with patch.object(release, "pages", return_value=[task]):
+            self.assertEqual(release.load_review_finding_history(
+                "warelik/osconfig", 115, published_at="2026-10-23T00:00:00Z")[1:],
+                ([], {}, {}))
+        self.assertNotIn(release.FINDING_DISPOSITION_PREFIX,
+                         release._owner_protocol_comment_body("warelik", task))
+        broken = {**base, "body": task["body"] + '\n<!-- fork-review-disposition:v1 {"schema":1} -->'}
+        with patch.object(release, "pages", return_value=[broken]):
+            with self.assertRaisesRegex(ValueError, "disposition is malformed"):
+                release.load_review_finding_history(
+                    "warelik/osconfig", 115, published_at="2026-10-23T00:00:00Z")
+
+
 class ExactShaReviewTests(unittest.TestCase):
     sha = "a" * 40
     requested = "2026-10-17T12:00:00Z"
@@ -1166,6 +1212,11 @@ class PairedPolicyAdoptionCredentialTests(unittest.TestCase):
                 return {"sha": baseline}
             if path == f"repos/{self.repo}/issues/70/comments" and method == "POST":
                 return {"id": 900, "body": data["body"]}
+            if path == f"repos/{self.repo}/actions/workflows/google-osconfig-agent-inventory.yml/dispatches" and method == "POST":
+                self.assertEqual(data, {"ref": "master"})
+                self.assertEqual(proposal["state"], "closed")
+                self.assertEqual(len(push_calls), 1)
+                return None
             raise AssertionError((path, method))
 
         def git_run(*args, cwd=None, env=None, input=None):
@@ -1225,6 +1276,7 @@ class PairedPolicyAdoptionCredentialTests(unittest.TestCase):
         for changed, needs_owner_token in (([workflow], True), ([ordinary], False)):
             with self.subTest(changed=changed):
                 push_calls, _api_calls, token_mock = self.invoke_adoption(changed)
+                self.assertEqual(_api_calls.count((f"repos/{self.repo}/actions/workflows/google-osconfig-agent-inventory.yml/dispatches", "POST")), 1)
                 self.assertEqual(len(push_calls), 1)
                 args, env = push_calls[0]
                 self.assertEqual(args[:2], ("git", "push"))
@@ -4307,6 +4359,27 @@ class NativePolicyRunnerFixtureTests(unittest.TestCase):
             self.assertIn("test_broken.py:3 failure", report.getvalue())
             self.assertIn("test_broken.py:4 error", report.getvalue())
             self.assertNotIn("PRIVATE_VALUE_CANARY", report.getvalue())
+
+
+
+
+class StalePolicyRepairAuthorizationTests(unittest.TestCase):
+    def test_owned_stale_policy_repair_uses_existing_authorized_write_credential(self):
+        repo = "warelik/osconfig"
+        pull = {"number": 7, "head": {"ref": release.POLICY_REPAIR_BRANCH + "old",
+                                      "repo": {"full_name": repo}},
+                "user": {"login": "github-actions[bot]"}}
+        for configured in (False, True):
+            with self.subTest(configured=configured), \
+                 patch.dict(os.environ, {"CODEX_REQUEST_TOKEN": "fixture-authorized-write"} if configured else {}, clear=True), \
+                 patch.object(release, "pages", return_value=[pull]), \
+                 patch.object(release, "policy_identity", return_value=None), \
+                 patch.object(release, "api") as write:
+                self.assertIsNone(release.open_policy_pull(repo, "a" * 40))
+                expected = {"method": "PATCH", "data": {"state": "closed"}}
+                if configured:
+                    expected["token"] = "fixture-authorized-write"
+                write.assert_called_once_with(f"repos/{repo}/pulls/7", **expected)
 
 
 if __name__ == "__main__":

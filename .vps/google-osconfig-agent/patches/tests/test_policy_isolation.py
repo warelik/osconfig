@@ -436,6 +436,108 @@ raise SystemExit(2)
         self.assertIn("review_ready=false", output)
         self.assertIn("Codex reported a finding on this exact SHA", output)
 
+    def assert_policy_candidate_source_cleanup(self, *, fail_at_delta=False):
+        with tempfile.TemporaryDirectory(prefix="osconfig-policy-source-test-") as temporary:
+            candidate_dir = Path(temporary) / "candidate"
+            candidate_dir.mkdir()
+            pull = self.policy_pull()
+            candidate = {
+                "schema": 1, "repository": self.repo,
+                "upstream_sha": "d" * 40, "application_sha": "e" * 40,
+                "configuration_sha": "f" * 40, "patchset_sha256": "1" * 64,
+                "recipe_sha256": "2" * 64, "platform": "fedora-44/x86_64",
+            }
+            published = {
+                "upstreamTag": "v1.2.3", "upstreamArchiveSha256": "3" * 64,
+                "patchSha256": "4" * 64, "specSha256": "5" * 64,
+            }
+            settings = {"github_owner": "warelik", "github_repo": "osconfig",
+                        "signing_fingerprint": "A1B2C3D4"}
+            source_roots = []
+            real_temporary_directory = release.tempfile.TemporaryDirectory
+
+            def tracked_temporary_directory(*args, **kwargs):
+                manager = real_temporary_directory(*args, **kwargs)
+                source_roots.append(Path(manager.name))
+                return manager
+
+            def api(path, **_kwargs):
+                if path == f"repos/{self.repo}/pulls/42":
+                    return pull
+                if path == f"repos/{self.repo}/actions/variables/FORK_ACCEPTED_BASELINE":
+                    return {"name": "FORK_ACCEPTED_BASELINE", "value": "{}"}
+                raise AssertionError(path)
+
+            def candidate_identity(value):
+                canonical = json.dumps(value, sort_keys=True, separators=(",", ":"))
+                return release.hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+            def published_identity(_repo, _published, work_root):
+                work_root = Path(work_root)
+                self.assertTrue(work_root.is_dir())
+                (work_root / "source-fixture").write_text("temporary checkout", encoding="utf-8")
+                return dict(candidate)
+
+            def create_delta(*_args, **_kwargs):
+                if fail_at_delta:
+                    raise RuntimeError("fixture delta snapshot failed")
+                return "6" * 40, f"review-base/{candidate['configuration_sha']}"
+
+            ensure_pull = iter(({"number": 71}, {"number": 72}))
+            review_result = ({}, {}, {"state": "ready", "complete": True})
+            with (patch.dict(os.environ, {
+                    "GITHUB_REPOSITORY": self.repo,
+                    "GITHUB_SHA": self.config_sha,
+                    "POLICY_PR_NUMBER": "42",
+                    "POLICY_HEAD_SHA": self.candidate_sha,
+                    "OSCONFIG_RPM_SIGNING_FINGERPRINT": settings["signing_fingerprint"],
+                }, clear=True),
+                  patch.object(release.tempfile, "TemporaryDirectory",
+                               side_effect=tracked_temporary_directory),
+                  patch.object(release, "api", side_effect=api),
+                  patch.object(release, "policy_changes", return_value=[release.PREFIX + "release.py"]),
+                  patch.object(release, "repository_settings", return_value=settings),
+                  patch.object(release, "published_manifest", return_value=published),
+                  patch.object(release, "owner_token", return_value="fixture-owner-token"),
+                  patch.object(release, "lifecycle_module", return_value=type(
+                      "LifecycleFixture", (), {"candidate_identity": staticmethod(candidate_identity)})()),
+                  patch.object(release, "verified_pages_baseline",
+                               return_value={"published_at": "2026-10-01T00:00:00Z"}),
+                  patch.object(release, "published_candidate_identity", side_effect=published_identity),
+                  patch.object(release, "accepted_baseline_proof", return_value={"fixture": True}),
+                  patch.object(release, "run", return_value=""),
+                  patch.object(release, "ensure_review_base"),
+                  patch.object(release, "create_delta_snapshot", side_effect=create_delta),
+                  patch.object(release, "create_application_review_context", return_value="7" * 40),
+                  patch.object(release, "ensure_review_branch"),
+                  patch.object(release, "ensure_review_pull",
+                               side_effect=lambda *_args, **_kwargs: next(ensure_pull)),
+                  patch.object(release, "load_review_finding_history", return_value=([], [], {}, {})),
+                  patch.object(release, "create_review_finding_dispositions"),
+                  patch.object(release, "record_policy_pair_context"),
+                  patch.object(release, "request_lifecycle_review"),
+                  patch.object(release, "review_pair_status", return_value=review_result),
+                  patch.object(release, "complete_machine_finding_dispositions",
+                               return_value=review_result),
+                  patch.object(release, "record_review_finding_batch"),
+                  patch.object(release, "output")):
+                if fail_at_delta:
+                    with self.assertRaisesRegex(RuntimeError, "fixture delta snapshot failed"):
+                        release.prepare_policy_candidate(candidate_dir)
+                else:
+                    release.prepare_policy_candidate(candidate_dir)
+
+            self.assertEqual(len(source_roots), 1)
+            self.assertFalse(source_roots[0].exists())
+            self.assertEqual((candidate_dir / "inputs" / "candidate-manifest.json").is_file(),
+                             not fail_at_delta)
+
+    def test_prepare_policy_candidate_removes_temporary_source_after_success(self):
+        self.assert_policy_candidate_source_cleanup()
+
+    def test_prepare_policy_candidate_removes_temporary_source_after_failure(self):
+        self.assert_policy_candidate_source_cleanup(fail_at_delta=True)
+
     def policy_repair_history(self, head, *, created_at, started_at):
         old = int(datetime.now(timezone.utc).timestamp()) - 10800
         state = json.dumps({"config": self.config_sha, "startedAt": started_at}, sort_keys=True)

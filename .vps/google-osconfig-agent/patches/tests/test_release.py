@@ -4272,5 +4272,42 @@ class AlreadyAdoptedProductInputTests(unittest.TestCase):
                 closed.assert_not_called()
 
 
+
+
+class NativePolicyRunnerFixtureTests(unittest.TestCase):
+    def test_native_policy_runner_allows_large_regular_fixture_files(self):
+        with tempfile.TemporaryDirectory(prefix="policy-native-file-limit-") as temporary:
+            root = Path(temporary)
+            (root / "release.py").write_text("def lifecycle_module(): return None\n")
+            tests = root / "tests"
+            tests.mkdir()
+            (tests / "test_regular_fixture.py").write_text(
+                "import unittest\nfrom pathlib import Path\n"
+                "class Fixture(unittest.TestCase):\n"
+                " def test_regular_file(self):\n"
+                "  path=Path('large-fixture.bin')\n"
+                "  path.write_bytes(b'x'*(256*1024))\n"
+                "  self.assertEqual(path.stat().st_size,256*1024)\n")
+            release.run_policy_tests(tests, timeout_seconds=15)
+
+    def test_native_policy_runner_reports_safe_full_failure_locations(self):
+        import contextlib, io
+        with tempfile.TemporaryDirectory(prefix="policy-native-diagnostics-") as temporary:
+            root = Path(temporary)
+            (root / "release.py").write_text("def lifecycle_module(): return None\n")
+            tests = root / "tests"
+            tests.mkdir()
+            (tests / "test_broken.py").write_text(
+                "import unittest\nclass Broken(unittest.TestCase):\n"
+                " def test_one(self): self.fail('PRIVATE_VALUE_CANARY')\n"
+                " def test_two(self): raise ValueError('PRIVATE_VALUE_CANARY')\n")
+            report = io.StringIO()
+            with contextlib.redirect_stdout(report), self.assertRaises(ValueError):
+                release.run_policy_tests(tests, timeout_seconds=15)
+            self.assertIn("test_broken.py:3 failure", report.getvalue())
+            self.assertIn("test_broken.py:4 error", report.getvalue())
+            self.assertNotIn("PRIVATE_VALUE_CANARY", report.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

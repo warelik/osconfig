@@ -1945,5 +1945,32 @@ class FinalReservationPermissionTests(unittest.TestCase):
             self.assertNotRegex(block[0], r"(?m)^      contents: write$")
 
 
+
+
+class PolicyReuseAndOptionalLaneTests(unittest.TestCase):
+    def test_verified_policy_reuse_is_separate_from_application_allowance(self):
+        candidate = {"source": "exact"}
+        for action in ("allow", "policy-only"):
+            for verified in (True, False):
+                with self.subTest(action=action, verified=verified), patch.object(
+                        release, "validated_policy_bundle", return_value=verified) as verify:
+                    self.assertIs(release.validated_policy_for_decision("owner/repo", candidate, 7, action), verified)
+                    verify.assert_called_once_with("owner/repo", candidate, 7)
+        for action in ("wait", "reuse", "already-validated", "invalid"):
+            with patch.object(release, "validated_policy_bundle") as verify:
+                self.assertFalse(release.validated_policy_for_decision("owner/repo", candidate, 7, action))
+                verify.assert_not_called()
+
+    def test_optional_policy_branches_cannot_skip_authorized_delivery_lanes(self):
+        import re
+        root = Path(release.__file__).resolve().parents[3]
+        text = (root / ".github/workflows/google-osconfig-agent-inventory.yml").read_text()
+        for job in ("build-rpm", "sign", "adopt", "adopt-policy", "close-policy-only-candidate", "recover-validated"):
+            block = re.search(r"(?ms)^  " + re.escape(job) + r":\s*\n.*?(?=^  [A-Za-z0-9_-]+:\s*$|\Z)", text)
+            self.assertIsNotNone(block)
+            self.assertRegex(block[0], r"(?m)^      always\(\) && !cancelled\(\) &&$")
+            self.assertIn(".result == 'success'", block[0])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -178,3 +178,5 @@ and the modern-provenance path without network, compilation or Go tests.
 Native review history accepts both plain and backtick-delimited legacy commit prefixes, resolving each to its exact native commit. PR inventories are canonicalized by number; duplicate numbers and actual source changes remain errors.
 
 Maintenance reads open carried work and the exact current review pair. Closed archived threads are excluded. Before retiring a superseded pair, machines preserve unresolved findings through the existing finding-batch snapshot. Closed exact receipt pairs remain verifiable by explicit PR numbers; final-attempt accounting is unchanged.
+
+A verified exact private bundle reuses policy validation for both application and policy-only decisions; application tests and signed artifact checks remain separate. Optional policy ancestors do not suppress authorized build/sign/adoption lanes. Native policy fixtures have a bounded 64 MiB file limit; failure logs report all public test locations and kinds without private tracebacks or values.

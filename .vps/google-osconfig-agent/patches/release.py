@@ -2967,6 +2967,13 @@ def validated_policy_bundle(repo, candidate, full_pr_number):
     return proof is not None
 
 
+def validated_policy_for_decision(repo, candidate, full_pr_number, action):
+    """A strict private policy receipt does not replace application validation."""
+    if action not in {"allow", "policy-only"}:
+        return False
+    return validated_policy_bundle(repo, candidate, full_pr_number)
+
+
 def closed_policy_bundle_reuse(repo, candidate, candidate_id, upstream,
                                baseline_config, application_sha, review_source_sha):
     """Find a closed policy-review pair only when its native receipt is exact."""
@@ -3148,8 +3155,8 @@ def authorize_final(candidate_dir):
             raise ValueError("Successful application artifacts lack a successful exact-candidate policy validation")
     if existing:
         action = existing_reservation_decision(existing, decision)
-        bundle_reuse = (validated_policy_bundle(
-            repo, candidate, int(manifest["candidatePr"])) if action == "policy-only" else False)
+        bundle_reuse = validated_policy_for_decision(
+            repo, candidate, int(manifest["candidatePr"]), action)
         output(final_decision=action, final_candidate_id=candidate_id,
                final_run_id=run_id, final_run_attempt=run_attempt,
                final_workflow_sha=workflow_sha,
@@ -3184,10 +3191,8 @@ def authorize_final(candidate_dir):
     )
     api(f"repos/{repo}/issues/{manifest['candidatePr']}/comments", method="POST",
         data={"body": body})
-    bundle_reuse = False
-    if action == "policy-only":
-        bundle_reuse = validated_policy_bundle(
-            repo, candidate, int(manifest["candidatePr"]))
+    bundle_reuse = validated_policy_for_decision(
+        repo, candidate, int(manifest["candidatePr"]), action)
     output(final_decision=action, final_candidate_id=candidate_id,
            final_run_id=run_id, final_run_attempt=run_attempt,
            final_workflow_sha=workflow_sha,
@@ -5415,6 +5420,7 @@ def _validate_legacy_signing_workflow(workflow):
     )
     if condition.startswith("${{") and condition.endswith("}}"):
         condition = condition[3:-2].strip()
+    condition = condition.removeprefix("always() && !cancelled() && ")
     terms = [re.fullmatch(r"\s*(needs\.[A-Za-z0-9_.-]+)\s*==\s*(['\"])([A-Za-z]+)\2\s*", term)
              for term in condition.split("&&")]
     condition_valid = (all(terms) and set(required_conditions).issubset(
@@ -5617,6 +5623,7 @@ def _validate_shared_signing_workflow(workflow):
     )
     if condition.startswith("${{") and condition.endswith("}}"):
         condition = condition[3:-2].strip()
+    condition = condition.removeprefix("always() && !cancelled() && ")
     terms = [re.fullmatch(
         r"\s*(needs\.[A-Za-z0-9_.-]+)\s*==\s*(?:(['\"])([A-Za-z]+)\2|"
         r"(needs\.[A-Za-z0-9_.-]+|github\.run_id|github\.run_attempt|github\.sha))\s*",
@@ -5960,20 +5967,8 @@ def candidate_policy_tests(candidate_tests, trusted_tests):
     return changed
 
 
-_POLICY_TEST_PREFIX = (
-    "import os,sys,unittest;report=sys.stdout;quiet=open(os.devnull,'w');"
-    "sys.stdout=quiet;sys.stderr=quiet;candidate_package,source_tests,parser_root=sys.argv[1:4];"
-    "sys.path[:0]=[path for path in parser_root.split(os.pathsep) if path];"
-    "sys.path.insert(0,source_tests);sys.path.insert(0,candidate_package);import release;"
-    "release.lifecycle_module();"
-)
-_POLICY_TEST_RESULT = (
-    "expected=suite.countTestCases();"
-    "result=unittest.TextTestRunner(stream=quiet,verbosity=0,failfast=False).run(suite);"
-    "valid=expected>0 and result.testsRun==expected and result.wasSuccessful();"
-    "report.write('OSCONFIG_POLICY_COMPLETE:'+str(result.testsRun)+':'+('pass' if valid else 'fail')+'\\n');"
-    "report.flush();sys.exit(0 if valid else 1)"
-)
+_POLICY_TEST_PREFIX = "import os,sys,unittest,re\nreport=sys.stdout\nquiet=open(os.devnull,'w')\nsys.stdout=quiet;sys.stderr=quiet\ncandidate_package,source_tests,parser_root=sys.argv[1:4]\nsys.path[:0]=[path for path in parser_root.split(os.pathsep) if path]\nsys.path.insert(0,source_tests);sys.path.insert(0,candidate_package)\ntry:\n    import release;\n    release.lifecycle_module();\nexcept Exception as error:\n    kind=type(error).__name__ if type(error).__module__=='builtins' else 'OtherException'\n    allowed={'ValueError','ImportError','ModuleNotFoundError','OSError','FileNotFoundError','PermissionError','TypeError','RuntimeError','SyntaxError','OtherException'}\n    if kind not in allowed: kind='OtherException'\n    report.write('OSCONFIG_POLICY_DIAGNOSTIC:preload:0:error:'+kind+'\\n')\n    report.flush()\n    raise SystemExit(1)\n"
+_POLICY_TEST_RESULT = 'expected=suite.countTestCases()\nresult=unittest.TextTestRunner(stream=quiet,verbosity=0,failfast=False).run(suite)\nvalid=expected>0 and result.testsRun==expected and result.wasSuccessful()\nreport.write(\'OSCONFIG_POLICY_COMPLETE:\'+str(result.testsRun)+\':\'+(\'pass\' if valid else \'fail\')+\'\\n\')\nif not valid:\n    for kind,items in ((\'failure\',result.failures),(\'error\',result.errors)):\n        for _test,detail in items[:128]:\n            frames=re.findall(r\'File "([^"\\n]+)", line ([0-9]+)\',detail)\n            public=[(os.path.basename(path),int(line)) for path,line in frames\n                    if os.path.realpath(os.path.dirname(path))==os.path.realpath(source_tests)\n                    and re.fullmatch(r\'test_[A-Za-z0-9_]+\\.py\',os.path.basename(path))]\n            name,line=public[-1] if public else (\'unknown\',0)\n            report.write(\'OSCONFIG_POLICY_DIAGNOSTIC:\'+name+\':\'+str(line)+\':\'+kind+\'\\n\')\nreport.flush()\nsys.exit(0 if valid else 1)\n'
 POLICY_TEST_LAUNCHER = (
     _POLICY_TEST_PREFIX + "discover_tests=sys.argv[4];"
     "suite=unittest.defaultTestLoader.discover(discover_tests,pattern='test_*.py');"
@@ -6040,7 +6035,7 @@ def run_policy_tests(test_directory, *, timeout_seconds=600):
         process = subprocess.Popen(
             command, cwd=directory, env=env, stdout=protocol, stderr=subprocess.DEVNULL,
             text=True, start_new_session=True,
-            preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_FSIZE, (65536, 65536)))
+            preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024 * 1024, 64 * 1024 * 1024)))
         try:
             process.communicate(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
@@ -6052,7 +6047,20 @@ def run_policy_tests(test_directory, *, timeout_seconds=600):
             print(policy_test_summary([path.name for path in files], timeout_seconds=timeout_seconds))
             raise ValueError(f"Policy test suite timed out after {timeout_seconds} seconds")
         protocol.seek(0)
-        complete = policy_completion_succeeded(process.returncode, protocol.read(129))
+        captured = protocol.read(65537)
+        complete = policy_completion_succeeded(process.returncode, captured)
+    if not complete:
+        bounds = {path.name: len(path.read_text(encoding="utf-8").splitlines()) for path in files}
+        for raw in captured[:65536].splitlines():
+            match = re.fullmatch(rb"OSCONFIG_POLICY_DIAGNOSTIC:([A-Za-z0-9_.]+):([0-9]+):(failure|error)(?::([A-Za-z]+))?", raw)
+            if not match:
+                continue
+            name, line, kind = match[1].decode(), int(match[2]), match[3].decode()
+            if (name in bounds and 1 <= line <= bounds[name]) or (name in {"preload", "unknown"} and line == 0):
+                error_type = match[4].decode() if match[4] else ""
+                if error_type not in {"", "ValueError", "ImportError", "ModuleNotFoundError", "OSError", "FileNotFoundError", "PermissionError", "TypeError", "RuntimeError", "SyntaxError", "OtherException"}:
+                    error_type = "OtherException"
+                print(f"Policy diagnostic: {name}:{line} {kind}" + (f" {error_type}" if error_type else ""))
     status = process.returncode if process.returncode else (0 if complete else 86)
     print(policy_test_summary([path.name for path in files], returncode=status))
     if not complete:

@@ -508,6 +508,7 @@ jobs:
   build-rpm:
     needs: [candidate-source, review, final-guard, prepare]
     if: >-
+      always() && !cancelled() &&
       needs.candidate-source.outputs.exists == 'true' &&
       needs.review.result == 'success' && needs.review.outputs.ready == 'true' &&
       needs.final-guard.result == 'success' && needs.final-guard.outputs.decision == 'allow' &&
@@ -1088,6 +1089,7 @@ jobs:
   adopt-policy:
     needs: [policy-check, policy-review, policy-final-guard, prepare]
     if: >-
+      always() && !cancelled() &&
       needs.policy-check.outputs.changed == 'true' &&
       needs.policy-review.result == 'success' && needs.policy-review.outputs.ready == 'true' &&
       needs.policy-final-guard.result == 'success' &&
@@ -1167,6 +1169,7 @@ jobs:
   close-policy-only-candidate:
     needs: [candidate-source, review, final-guard, prepare]
     if: >-
+      always() && !cancelled() &&
       needs.candidate-source.outputs.exists == 'true' &&
       needs.review.result == 'success' && needs.review.outputs.ready == 'true' &&
       needs.final-guard.result == 'success' && needs.final-guard.outputs.decision == 'policy-only' &&
@@ -1312,6 +1315,7 @@ jobs:
   sign:
     needs: [candidate-source, review, final-guard, prepare, build-rpm]
     if: >-
+      always() && !cancelled() &&
       needs.prepare.outputs.exists == 'true' && needs.build-rpm.result == 'success' &&
       needs.review.result == 'success' && needs.review.outputs.ready == 'true' &&
       needs.candidate-source.outputs.exists == 'true' &&
@@ -1460,6 +1464,7 @@ jobs:
   recover-validated:
     needs: [candidate-source, review, final-guard, prepare]
     if: >-
+      always() && !cancelled() &&
       needs.candidate-source.outputs.exists == 'true' &&
       needs.review.result == 'success' && needs.review.outputs.ready == 'true' &&
       needs.final-guard.result == 'success' &&
@@ -1721,6 +1726,7 @@ jobs:
   adopt:
     needs: [candidate-source, review, final-guard, prepare, publish]
     if: >-
+      always() && !cancelled() &&
       needs.candidate-source.outputs.exists == 'true' &&
       (needs.final-guard.outputs.decision == 'allow' ||
        needs.final-guard.outputs.decision == 'already-validated') &&

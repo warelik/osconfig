@@ -176,3 +176,5 @@ regression covers exact tree identity, refusal of a missing historical blob,
 and the modern-provenance path without network, compilation or Go tests.
 
 Native review history accepts both plain and backtick-delimited legacy commit prefixes, resolving each to its exact native commit. PR inventories are canonicalized by number; duplicate numbers and actual source changes remain errors.
+
+Maintenance reads open carried work and the exact current review pair. Closed archived threads are excluded. Before retiring a superseded pair, machines preserve unresolved findings through the existing finding-batch snapshot. Closed exact receipt pairs remain verifiable by explicit PR numbers; final-attempt accounting is unchanged.

@@ -1462,7 +1462,7 @@ def evaluate_native_review_scope(repo, context, candidate, scope,
                                 _resolved_review_commits(repo, reviews, comments))
 
 
-def native_review_finding_history(repo, candidate, accepted_proof):
+def native_review_finding_history(repo, candidate, accepted_proof, *, current_prs=()):
     baseline = json.loads(accepted_proof["variable"]["value"])
     published_at = baseline["publication"]["published_at"]
     cutoff = parse_utc(published_at)
@@ -1482,7 +1482,8 @@ def native_review_finding_history(repo, candidate, accepted_proof):
             if pull["number"] in seen:
                 raise ValueError("Native review inventory repeated a pull request while paginating")
             seen.add(pull["number"])
-            if parse_utc(pull["updated_at"]) >= cutoff:
+            if (parse_utc(pull["updated_at"]) >= cutoff
+                    and (pull.get("state") == "open" or pull["number"] in current_prs)):
                 selected.append(pull)
         return sorted(selected, key=lambda pull: pull["number"])
     initial = inventory()
@@ -1602,7 +1603,9 @@ def review_pair_status(repo, manifest, *, signed_transition=None):
                                         allow_closed=allow_closed)
     delta = evaluate_native_review_scope(repo, contexts["delta"], candidate, "delta",
                                          accepted_baseline, allow_closed=allow_closed)
-    native_history = native_review_finding_history(repo, candidate, accepted_baseline)
+    native_history = native_review_finding_history(
+        repo, candidate, accepted_baseline,
+        current_prs=(contexts["full"]["pr"], contexts["delta"]["pr"]))
     history = _native_authoritative_findings(
         manifest.get("findingHistory", []), native_history["findings"])
     by_id = {}

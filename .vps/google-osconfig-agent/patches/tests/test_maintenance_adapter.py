@@ -1516,10 +1516,13 @@ class NativeAdapterTests(unittest.TestCase):
         other = {**pull, "number": 92, "updated_at": "2026-10-20T10:00:00Z"}
         proof = {"variable": {"value": json.dumps({"publication": {
             "published_at": "2026-10-19T09:00:00Z"}})}}
-        inventories = iter(([other, pull], [pull, other]))
+        archived = {**pull, "number": 99, "state": "closed"}
+        inventories = iter(([other, pull, archived], [archived, pull, other]))
         def pages(route):
             return next(inventories) if "/pulls?" in route else []
         def api(route):
+            if route.endswith("/99"):
+                raise AssertionError("Archived review discussion must not be read")
             return other if route.endswith("/92") else pull
         core = types.SimpleNamespace(review_history=Mock(return_value={"complete": True}))
         with (patch.object(release, "pages", side_effect=pages),

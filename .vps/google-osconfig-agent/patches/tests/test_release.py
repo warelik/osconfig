@@ -20,6 +20,16 @@ import release
 
 
 class RepairInstructionProtocolTests(unittest.TestCase):
+    def test_reported_repair_source_is_not_replaced_by_its_review_only_child(self):
+        source, context = "e" * 40, "f" * 40
+        manifest = {"candidateSha": context}
+        pull = {"head": {"sha": context}}
+        self.assertEqual(release.application_report_source(source, manifest, pull), source)
+        with self.assertRaisesRegex(ValueError, "changed review context"):
+            release.application_report_source(source, manifest, {"head": {"sha": "d" * 40}})
+        with self.assertRaisesRegex(ValueError, "changed review context"):
+            release.application_report_source("invalid", manifest, pull)
+
     def test_fedora_bootstrap_installs_python_and_transport_before_checkout_and_first_python_use(self):
         document = release.yaml_module().safe_load((release.ROOT / ".github/workflows/google-osconfig-agent-inventory.yml").read_text())
         for job in ("build-rpm", "sign", "recover-validated"):

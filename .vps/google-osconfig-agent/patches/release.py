@@ -2250,6 +2250,17 @@ def _canonical_review_records(records, label):
         raise ValueError(f"Native {label} finding records are not canonical JSON") from error
 
 
+def application_report_source(reported_source, manifest, pull):
+    """Keep the reported repair SHA separate from its later review-only child."""
+    expected = ((manifest.get("reviewContexts") or {}).get("full") or {}).get("review_sha") or manifest.get("candidateSha")
+    if (not SHA.fullmatch(reported_source or "") or not SHA.fullmatch(expected or "")
+            or (pull.get("head") or {}).get("sha") != expected):
+        raise ValueError("Current application finding proposal has a changed review context")
+    # The caller still verifies seed -> reported source -> application ancestry
+    # and exact allowlisted file blobs before accepting any disposition.
+    return reported_source
+
+
 def complete_machine_finding_dispositions(repo, manifest, full, delta, pair, token):
     """Adopt an explicit native Codex repair report only after both exact reviews finish."""
     if (pair.get("complete") is not True or pair.get("state") != "findings"
@@ -2349,8 +2360,8 @@ def complete_machine_finding_dispositions(repo, manifest, full, delta, pair, tok
         head = record["source_sha"]
         if policy and head != state["head"]:
             raise ValueError("Current policy finding proposal names a different source SHA")
-        if not policy and head != (pull.get("head") or {}).get("sha"):
-            raise ValueError("Current application finding proposal is not bound to the repair PR head")
+        if not policy:
+            head = application_report_source(head, manifest, pull)
         target = candidate["configuration_sha"] if policy else candidate["application_sha"]
         comparison = api(f"repos/{repo}/compare/{head}...{target}") if not policy else None
         if not policy and (comparison.get("status") not in {"ahead", "identical"}

@@ -4529,5 +4529,751 @@ class StalePolicyRepairAuthorizationTests(unittest.TestCase):
                 write.assert_called_once_with(f"repos/{repo}/pulls/7", **expected)
 
 
+class PublishedProductInputsAndRepositoryConfNormalizationTests(unittest.TestCase):
+    repo = "warelik/osconfig"
+    upstream = "1" * 40
+    archive_sha = "2" * 64
+    fingerprint = "A" * 40
+    old_evr = "0:20261027.00-1.vps494.fc44"
+    new_evr = "0:20261029.00-1.vps1.fc44"
+
+    def write_recipe_fixture(self, root):
+        patch_dir = root / "patches"
+        source_dir = root / "source"
+        (patch_dir / "rpm").mkdir(parents=True)
+        source_dir.mkdir(parents=True)
+        for relative in release.PRODUCT_BUILD_INPUTS:
+            path = patch_dir / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"fixture content for {relative}\n", encoding="utf-8")
+        lock_payload = {
+            "tag": "20261029.00",
+            "commit": self.upstream,
+            "archiveSha256": self.archive_sha,
+        }
+        (source_dir / "source.lock").write_text(
+            json.dumps(lock_payload) + "\n", encoding="utf-8")
+        return patch_dir, source_dir
+
+    def repository_conf_bytes(self, evr, *, fingerprint=None, extra_comment=False):
+        lines = [
+            "# Managed by ~/.vps/google-osconfig-agent/install.sh; local edits are replaced on the next install.",
+            "github_owner=warelik",
+            "github_repo=osconfig",
+            f"signing_fingerprint={fingerprint or self.fingerprint}",
+            f"minimum_evr={evr}",
+        ]
+        if extra_comment:
+            lines.insert(1, "# unexpected local comment")
+        return ("\n".join(lines) + "\n").encode("utf-8")
+
+    @staticmethod
+    def blob_record(raw):
+        sha = hashlib.sha1(f"blob {len(raw)}\0".encode("ascii") + raw).hexdigest()
+        response = {
+            "sha": sha,
+            "size": len(raw),
+            "encoding": "base64",
+            "content": base64.b64encode(raw).decode("ascii") + "\n",
+        }
+        return sha, response
+
+    def test_published_product_inputs_match_uses_signed_recipe_digest_and_fails_closed(self):
+        with tempfile.TemporaryDirectory(prefix="osconfig-signed-recipe-match-") as temporary:
+            root = Path(temporary)
+            patch_dir, source_dir = self.write_recipe_fixture(root)
+            with patch.object(release, "PATCH_DIR", patch_dir):
+                recipe_sha = release.prepared_recipe_digest(source_dir)
+                candidate = {
+                    "schema": 1,
+                    "repository": self.repo,
+                    "upstream_sha": self.upstream,
+                    "application_sha": "3" * 40,
+                    "configuration_sha": "4" * 40,
+                    "patchset_sha256": "5" * 64,
+                    "recipe_sha256": recipe_sha,
+                    "platform": "fedora-44/x86_64",
+                }
+                candidate_id = release.frozen_candidate_identity(candidate)
+                published = {
+                    "candidateSha": "6" * 40,
+                    "upstreamCommit": self.upstream,
+                    "upstreamArchiveSha256": self.archive_sha,
+                    "patchSha256": release.digest(patch_dir / "osconfig-inventory.patch"),
+                    "specSha256": release.digest(patch_dir / "rpm/google-osconfig-agent.spec"),
+                    "candidate": candidate,
+                    "candidateIdentity": candidate_id,
+                }
+                with patch.object(release, "content",
+                                  side_effect=AssertionError("ABI recipe digest needs no content API")):
+                    self.assertTrue(
+                        release.published_product_inputs_match(self.repo, published, source_dir))
+                    legacy_published = {
+                        key: value for key, value in published.items()
+                        if key not in {"candidate", "candidateIdentity"}
+                    }
+                    self.assertTrue(release.published_product_inputs_match(
+                        self.repo, legacy_published, source_dir, baseline_candidate=candidate))
+
+                    wrong_identity = {**published, "candidateIdentity": "f" * 64}
+                    self.assertFalse(
+                        release.published_product_inputs_match(self.repo, wrong_identity, source_dir))
+
+                    (patch_dir / "build-rpm.sh").write_text("modified build recipe\n", encoding="utf-8")
+                    self.assertFalse(
+                        release.published_product_inputs_match(self.repo, published, source_dir))
+                    (patch_dir / "build-rpm.sh").write_text(
+                        "fixture content for build-rpm.sh\n", encoding="utf-8")
+                    self.assertTrue(
+                        release.published_product_inputs_match(self.repo, published, source_dir))
+
+                    (patch_dir / "prepare-source.sh").unlink()
+                    self.assertFalse(
+                        release.published_product_inputs_match(self.repo, published, source_dir))
+                    (patch_dir / "prepare-source.sh").write_text(
+                        "fixture content for prepare-source.sh\n", encoding="utf-8")
+
+                missing_error = release.CommandFailure(1, ["gh", "api"], stderr="404 Not Found")
+                with patch.object(release, "content", side_effect=missing_error):
+                    self.assertFalse(release.published_product_inputs_match(
+                        self.repo, legacy_published, source_dir))
+
+    def test_repository_conf_minimum_evr_normalization_preserves_other_config_deltas(self):
+        baseline_sha = "a" * 40
+        current_sha = "b" * 40
+        old_raw = self.repository_conf_bytes(self.old_evr)
+        new_raw = self.repository_conf_bytes(self.new_evr)
+        rotated_raw = self.repository_conf_bytes(self.new_evr, fingerprint="B" * 40)
+        comment_raw = self.repository_conf_bytes(self.new_evr, extra_comment=True)
+        old_blob, old_response = self.blob_record(old_raw)
+        new_blob, new_response = self.blob_record(new_raw)
+        rotated_blob, rotated_response = self.blob_record(rotated_raw)
+        comment_blob, comment_response = self.blob_record(comment_raw)
+
+        blobs = {
+            old_blob: old_response,
+            new_blob: new_response,
+            rotated_blob: rotated_response,
+            comment_blob: comment_response,
+        }
+
+        def make_api(current_conf_blob, *, current_mode="100644"):
+            def fake_api(route):
+                if route == f"repos/{self.repo}/git/trees/{baseline_sha}?recursive=1":
+                    return {"truncated": False, "tree": [
+                        {"path": release.REPOSITORY_CONF, "mode": "100644",
+                         "sha": old_blob, "type": "blob"},
+                        {"path": "AGENTS.md", "mode": "100644", "sha": "c" * 40, "type": "blob"},
+                    ]}
+                if route == f"repos/{self.repo}/git/trees/{current_sha}?recursive=1":
+                    return {"truncated": False, "tree": [
+                        {"path": release.REPOSITORY_CONF, "mode": current_mode,
+                         "sha": current_conf_blob, "type": "blob"},
+                        {"path": "AGENTS.md", "mode": "100644", "sha": "c" * 40, "type": "blob"},
+                    ]}
+                if route.startswith(f"repos/{self.repo}/git/blobs/"):
+                    return blobs[route.rsplit("/", 1)[-1]]
+                self.fail(f"Unexpected API call: {route}")
+            return fake_api
+
+        with patch.object(release, "api", side_effect=make_api(new_blob)):
+            self.assertTrue(release.policy_inputs_match_published_config(
+                self.repo, baseline_sha, current_sha, published_evr=self.new_evr))
+            self.assertFalse(release.policy_inputs_match_published_config(
+                self.repo, baseline_sha, current_sha))
+            self.assertFalse(release.policy_inputs_match_published_config(
+                self.repo, baseline_sha, current_sha,
+                published_evr="0:20261028.00-1.vps2.fc44"))
+
+        for bad_blob, mode in ((rotated_blob, "100644"),
+                               (comment_blob, "100644"),
+                               (new_blob, "100755")):
+            with self.subTest(blob=bad_blob, mode=mode), \
+                 patch.object(release, "api", side_effect=make_api(bad_blob, current_mode=mode)):
+                self.assertFalse(release.policy_inputs_match_published_config(
+                    self.repo, baseline_sha, current_sha, published_evr=self.new_evr))
+
+        with tempfile.TemporaryDirectory(prefix="osconfig-candidate-conf-norm-") as temporary:
+            root = Path(temporary)
+            product_root = root / "product"
+            policy_root = root / "policy"
+            product_root.mkdir()
+            conf_file = policy_root / release.REPOSITORY_CONF
+            conf_file.parent.mkdir(parents=True)
+            conf_file.write_bytes(new_raw)
+            conf_file.chmod(0o644)
+
+            def tree_and_blob_api(route):
+                if route == f"repos/{self.repo}/git/trees/{baseline_sha}?recursive=1":
+                    return {"truncated": False, "tree": [
+                        {"path": release.REPOSITORY_CONF, "mode": "100644",
+                         "sha": old_blob, "type": "blob"},
+                    ]}
+                if route == f"repos/{self.repo}/git/blobs/{old_blob}":
+                    return old_response
+                self.fail(f"Unexpected API call: {route}")
+
+            with patch.object(release, "api", side_effect=tree_and_blob_api), \
+                 patch.object(release, "run", return_value=new_blob):
+                self.assertTrue(release.candidate_config_inputs_match(
+                    self.repo, baseline_sha, product_root, policy_root,
+                    published_evr=self.new_evr))
+                self.assertFalse(release.candidate_config_inputs_match(
+                    self.repo, baseline_sha, product_root, policy_root))
+                conf_file.chmod(0o755)
+                self.assertFalse(release.candidate_config_inputs_match(
+                    self.repo, baseline_sha, product_root, policy_root,
+                    published_evr=self.new_evr))
+                conf_file.chmod(0o644)
+                conf_file.write_bytes(rotated_raw)
+                self.assertFalse(release.candidate_config_inputs_match(
+                    self.repo, baseline_sha, product_root, policy_root,
+                    published_evr=self.new_evr))
+
+
+class NoChangeAndClosedPolicyOnlyPrepareReuseTests(unittest.TestCase):
+    repo = "warelik/osconfig"
+    upstream = "1" * 40
+    baseline_config = "2" * 40
+    application_sha = "3" * 40
+    review_source_sha = "4" * 40
+    delta_sha = "5" * 40
+    config = "6" * 40
+    proposal_head = "7" * 40
+    evr = "0:20261029.00-1.vps1.fc44"
+
+    def test_prepare_no_change_exits_even_with_closed_historical_pr_but_keeps_open_pr(self):
+        with tempfile.TemporaryDirectory(prefix="osconfig-prepare-nochange-") as temporary:
+            root = Path(temporary)
+            patch_dir = root / "patches"
+            source_dir = root / "source"
+            (patch_dir / "rpm").mkdir(parents=True)
+            source_dir.mkdir(parents=True)
+            archive_bytes = b"upstream tarball fixture\n"
+            archive_sha = hashlib.sha256(archive_bytes).hexdigest()
+            (source_dir / "source.tar.gz").write_bytes(archive_bytes)
+            lock = {"tag": "20261029.00", "commit": self.upstream, "archiveSha256": archive_sha}
+            for target in (source_dir / "source.lock", patch_dir / "source.lock"):
+                target.write_text(json.dumps(lock) + "\n", encoding="utf-8")
+            (patch_dir / "osconfig-inventory.patch").write_text("patch\n", encoding="utf-8")
+            (patch_dir / "rpm/google-osconfig-agent.spec").write_text("spec\n", encoding="utf-8")
+            patch_sha = release.digest(patch_dir / "osconfig-inventory.patch")
+            spec_sha = release.digest(patch_dir / "rpm/google-osconfig-agent.spec")
+            baseline_candidate = {
+                "schema": 1, "repository": self.repo, "upstream_sha": self.upstream,
+                "application_sha": self.application_sha, "configuration_sha": self.baseline_config,
+                "patchset_sha256": "8" * 64, "recipe_sha256": "9" * 64,
+                "platform": "fedora-44/x86_64",
+            }
+            published = {
+                "upstreamCommit": self.upstream,
+                "upstreamArchiveSha256": archive_sha,
+                "patchSha256": patch_sha,
+                "specSha256": spec_sha,
+                "packageEvr": self.evr,
+                "candidateSha": self.review_source_sha,
+            }
+            settings = {
+                "github_owner": "warelik", "github_repo": "osconfig",
+                "signing_fingerprint": "A" * 40, "minimum_evr": self.evr,
+            }
+            output_file = root / "github-output"
+            core = Mock(candidate_identity=Mock(return_value="a" * 64))
+
+            def fake_api(route, **_kwargs):
+                if route == f"repos/{self.repo}/commits/{release.DEFAULT_BRANCH}":
+                    return {"sha": self.config}
+                if route == f"repos/{self.repo}/actions/variables/FORK_ACCEPTED_BASELINE":
+                    return {"name": "FORK_ACCEPTED_BASELINE", "value": "{}"}
+                self.fail(f"Unexpected API call: {route}")
+
+            env = {
+                "GITHUB_REPOSITORY": self.repo,
+                "GITHUB_SHA": self.config,
+                "OSCONFIG_RPM_SIGNING_FINGERPRINT": "A" * 40,
+                "OSCONFIG_SOURCE_DIR": str(source_dir),
+                "GITHUB_OUTPUT": str(output_file),
+            }
+            with patch.dict(os.environ, env, clear=False), \
+                 patch.object(release, "PATCH_DIR", patch_dir), \
+                 patch.object(release, "repository_settings", return_value=settings), \
+                 patch.object(release, "api", side_effect=fake_api), \
+                 patch.object(release, "published_baseline_manifest", return_value=published), \
+                 patch.object(release, "owner_token", return_value="owner-token"), \
+                 patch.object(release, "lifecycle_module", return_value=core), \
+                 patch.object(release, "verified_pages_baseline", return_value={}), \
+                 patch.object(release, "published_candidate_identity",
+                              return_value=baseline_candidate), \
+                 patch.object(release, "accepted_baseline_proof", return_value={"variable": {}}), \
+                 patch.object(release, "published_product_inputs_match", return_value=True), \
+                 patch.object(release, "policy_inputs_match_published_config", return_value=True):
+                output_file.write_text("", encoding="utf-8")
+                with patch.object(release, "find_review_pull",
+                                  return_value={"number": 88, "state": "closed"}), \
+                     patch.object(release, "run",
+                                  side_effect=AssertionError("Closed historical PR must not rebuild")):
+                    release.prepare(root / "candidate-closed")
+                rendered = output_file.read_text(encoding="utf-8")
+                self.assertIn("candidate_exists=false", rendered)
+                self.assertIn("published=true", rendered)
+
+                with patch.object(release, "find_review_pull",
+                                  return_value={"number": 88, "state": "open"}), \
+                     patch.object(release, "run", side_effect=RuntimeError("entered assembly")), \
+                     self.assertRaisesRegex(RuntimeError, "entered assembly"):
+                    release.prepare(root / "candidate-open")
+
+    def test_closed_native_policy_validated_and_expected_config_guard(self):
+        candidate_value = {
+            "schema": 1, "repository": self.repo, "upstream_sha": self.upstream,
+            "application_sha": self.application_sha, "configuration_sha": self.delta_sha,
+            "patchset_sha256": "8" * 64, "recipe_sha256": "9" * 64,
+            "platform": "fedora-44/x86_64",
+        }
+        candidate_id = release.frozen_candidate_identity(candidate_value)
+        baseline = {"published_at": "2026-10-31T00:00:00Z"}
+        core = Mock(authorize_final=Mock(return_value={
+            "candidate_id": candidate_id, "decision": "policy-only",
+            "policy_validation_allowed": True,
+        }))
+
+        with patch.object(release, "validated_policy_bundle", return_value=True), \
+             patch.object(release, "native_final_history") as history_call:
+            self.assertTrue(release._closed_native_policy_validated(
+                self.repo, candidate_value, candidate_id, 51, baseline))
+            history_call.assert_not_called()
+
+        with patch.object(release, "validated_policy_bundle", return_value=False), \
+             patch.object(release, "native_final_history",
+                          return_value={"complete": True}) as history_call, \
+             patch.object(release, "lifecycle_module", return_value=core), \
+             patch.object(release, "policy_validation_state",
+                          return_value={"active": False, "failed": False, "validated": True}):
+            self.assertTrue(release._closed_native_policy_validated(
+                self.repo, candidate_value, candidate_id, 51, baseline))
+            self.assertEqual(history_call.call_args.kwargs.get("candidate_pr"), 51)
+
+        for bad_state in (
+            {"active": False, "failed": False, "validated": False},
+            {"active": True, "failed": False, "validated": True},
+            {"active": False, "failed": True, "validated": True},
+        ):
+            with self.subTest(state=bad_state), \
+                 patch.object(release, "validated_policy_bundle", return_value=False), \
+                 patch.object(release, "native_final_history", return_value={"complete": True}), \
+                 patch.object(release, "lifecycle_module", return_value=core), \
+                 patch.object(release, "policy_validation_state", return_value=bad_state):
+                self.assertFalse(release._closed_native_policy_validated(
+                    self.repo, candidate_value, candidate_id, 51, baseline))
+
+        non_policy_core = Mock(authorize_final=Mock(return_value={
+            "candidate_id": candidate_id, "decision": "allow", "allowed": True,
+        }))
+        with patch.object(release, "validated_policy_bundle", return_value=False), \
+             patch.object(release, "native_final_history", return_value={"complete": True}), \
+             patch.object(release, "lifecycle_module", return_value=non_policy_core):
+            self.assertFalse(release._closed_native_policy_validated(
+                self.repo, candidate_value, candidate_id, 51, baseline))
+
+        full_branch = f"review/{self.upstream}-{candidate_id}"
+        delta_branch = f"review/changes-{self.delta_sha}"
+        record = {
+            "schema": 1, "proposalPr": 21, "proposalHead": self.config,
+            "candidate": candidate_value, "candidateId": candidate_id,
+            "applicationSha": self.application_sha, "reviewSourceSha": self.review_source_sha,
+            "baselineConfig": self.baseline_config, "deltaSha": self.delta_sha, "deltaPr": 22,
+        }
+        closed_full = {
+            "number": 21, "state": "closed",
+            "base": {"ref": f"review-base/{self.upstream}", "sha": self.upstream,
+                     "repo": {"full_name": self.repo}},
+            "head": {"ref": full_branch, "sha": self.review_source_sha,
+                     "repo": {"full_name": self.repo}},
+            "body": "<!-- osconfig-policy-candidate:v1 "
+                    + json.dumps(record, sort_keys=True, separators=(",", ":"))
+                    + " -->",
+        }
+        closed_delta = {
+            "number": 22, "state": "closed",
+            "base": {"ref": f"review-base/{self.baseline_config}", "sha": self.baseline_config,
+                     "repo": {"full_name": self.repo}},
+            "head": {"ref": delta_branch, "sha": self.delta_sha,
+                     "repo": {"full_name": self.repo}},
+        }
+        with patch.object(release, "find_review_pull", return_value=closed_full), \
+             patch.object(release, "api", return_value=closed_delta), \
+             patch.object(release, "validated_policy_bundle", return_value=True):
+            self.assertEqual(
+                release.closed_policy_bundle_reuse(
+                    self.repo, candidate_value, candidate_id, self.upstream,
+                    self.baseline_config, self.application_sha, self.review_source_sha,
+                    expected_config=self.config),
+                (closed_full, closed_delta, full_branch),
+            )
+            with self.assertRaisesRegex(ValueError, "exact current configuration"):
+                release.closed_policy_bundle_reuse(
+                    self.repo, candidate_value, candidate_id, self.upstream,
+                    self.baseline_config, self.application_sha, self.review_source_sha,
+                    expected_config=self.proposal_head)
+
+        adopted_record = {**record, "proposalPr": 60, "proposalHead": self.proposal_head}
+        adopted_full = {
+            **closed_full,
+            "body": "<!-- osconfig-policy-candidate:v1 "
+                    + json.dumps(adopted_record, sort_keys=True, separators=(",", ":"))
+                    + " -->",
+        }
+        proposal_pull = {
+            "number": 60, "state": "closed",
+            "user": {"login": "github-actions[bot]", "type": "Bot"},
+            "base": {"ref": "master", "sha": self.baseline_config,
+                     "repo": {"full_name": self.repo}},
+            "head": {"ref": "repair/osconfig-policy-fixture", "sha": self.proposal_head,
+                     "repo": {"full_name": self.repo}},
+        }
+
+        def adopted_api(route):
+            if route == f"repos/{self.repo}/pulls/60":
+                return proposal_pull
+            if route == f"repos/{self.repo}/pulls/22":
+                return closed_delta
+            self.fail(f"Unexpected API call: {route}")
+
+        bot_receipt = [{
+            "user": {"login": "github-actions[bot]", "type": "Bot"},
+            "body": (f"Paired exact-source review and final policy validation passed; "
+                     f"selectively adopted `{self.config}` in this same final run. "
+                     "No RPM was rebuilt or provenance rewritten."),
+        }]
+        with patch.object(release, "find_review_pull", return_value=adopted_full), \
+             patch.object(release, "api", side_effect=adopted_api), \
+             patch.object(release, "pages", return_value=bot_receipt), \
+             patch.object(release, "_closed_native_policy_validated",
+                          return_value=True) as native_proof, \
+             patch.object(release, "validated_policy_bundle",
+                          side_effect=AssertionError("baseline path uses native proof")):
+            self.assertEqual(
+                release.closed_policy_bundle_reuse(
+                    self.repo, candidate_value, candidate_id, self.upstream,
+                    self.baseline_config, self.application_sha, self.review_source_sha,
+                    expected_config=self.config, baseline=baseline),
+                (adopted_full, closed_delta, full_branch),
+            )
+            native_proof.assert_called_once_with(
+                self.repo, candidate_value, candidate_id, 21, baseline)
+
+        untrusted_receipt = [{
+            "user": {"login": "external-user", "type": "User"},
+            "body": bot_receipt[0]["body"],
+        }]
+        with patch.object(release, "find_review_pull", return_value=adopted_full), \
+             patch.object(release, "api", side_effect=adopted_api), \
+             patch.object(release, "pages", return_value=untrusted_receipt), \
+             self.assertRaisesRegex(ValueError, "exact current configuration"):
+            release.closed_policy_bundle_reuse(
+                self.repo, candidate_value, candidate_id, self.upstream,
+                self.baseline_config, self.application_sha, self.review_source_sha,
+                expected_config=self.config, baseline=baseline)
+
+    def test_review_ref_pushes_use_owner_auth_only_when_workflows_change(self):
+        old_sha = "1" * 40
+        new_sha = "2" * 40
+        pushes = []
+
+        def make_run(*, remote="", ls_tree="", show="", diff=""):
+            def fake_run(*args, cwd=None, env=None, input=None):
+                if args[:3] == ("git", "ls-remote", "--refs"):
+                    return remote
+                if args[:4] == ("git", "ls-tree", "-r", "--name-only"):
+                    return ls_tree
+                if args[:4] == ("git", "show", "--format=", "--name-only"):
+                    return show
+                if args[:3] == ("git", "diff", "--name-only"):
+                    return diff
+                if args[:3] == ("git", "fetch", "--no-tags"):
+                    return ""
+                if args[:3] == ("git", "rev-parse", "FETCH_HEAD"):
+                    return old_sha
+                if args[:2] == ("git", "push"):
+                    pushes.append((args, env))
+                    return ""
+                self.fail(f"Unexpected command: {args}")
+            return fake_run
+
+        with patch.object(release, "owner_token", return_value="fixture-owner-token") as token, \
+             patch.object(release, "run",
+                          side_effect=make_run(ls_tree=".github/workflows/codeql.yml")):
+            release.ensure_review_base(Path("/work"), self.repo, f"review-base/{new_sha}", new_sha)
+        self.assertEqual(len(pushes), 1)
+        self.assertEqual((pushes[-1][1] or {}).get("GH_TOKEN"), "fixture-owner-token")
+        token.assert_called_once_with(self.repo)
+
+        pushes.clear()
+        with patch.object(release, "owner_token",
+                          side_effect=AssertionError("no workflow change")) as token, \
+             patch.object(release, "run", side_effect=make_run()):
+            release.ensure_review_base(Path("/work"), self.repo, f"review-base/{new_sha}", new_sha)
+        self.assertEqual(len(pushes), 1)
+        self.assertIsNone(pushes[-1][1])
+
+        with patch.object(release, "run",
+                          side_effect=make_run(remote=f"{old_sha}\trefs/heads/review-base/{new_sha}")), \
+             self.assertRaisesRegex(ValueError, "does not point at its exact source SHA"):
+            release.ensure_review_base(Path("/work"), self.repo, f"review-base/{new_sha}", new_sha)
+
+        pushes.clear()
+        ok_ancestor = subprocess.CompletedProcess(["git", "merge-base"], 0, "", "")
+        with patch.object(release, "owner_token",
+                          side_effect=AssertionError("fast-forward without workflow diff")), \
+             patch.object(release.subprocess, "run", return_value=ok_ancestor), \
+             patch.object(release, "run",
+                          side_effect=make_run(remote=f"{old_sha}\trefs/heads/review/app", diff="")):
+            release.ensure_review_branch(Path("/work"), "review/app", new_sha, repo=self.repo)
+        self.assertEqual(len(pushes), 1)
+        self.assertIsNone(pushes[-1][1])
+
+        pushes.clear()
+        with patch.object(release, "owner_token", return_value="fixture-owner-token") as token, \
+             patch.object(release.subprocess, "run", return_value=ok_ancestor), \
+             patch.object(release, "run",
+                          side_effect=make_run(
+                              remote=f"{old_sha}\trefs/heads/review/app",
+                              diff=release.WORKFLOW_PATH)):
+            release.ensure_review_branch(Path("/work"), "review/app", new_sha, repo=self.repo)
+        self.assertEqual(len(pushes), 1)
+        self.assertEqual((pushes[-1][1] or {}).get("GH_TOKEN"), "fixture-owner-token")
+        token.assert_called_once_with(self.repo)
+
+        bad_ancestor = subprocess.CompletedProcess(["git", "merge-base"], 1, "", "")
+        with patch.object(release.subprocess, "run", return_value=bad_ancestor), \
+             patch.object(release, "run",
+                          side_effect=make_run(remote=f"{old_sha}\trefs/heads/review/app")), \
+             self.assertRaisesRegex(ValueError, "not a fast-forward"):
+            release.ensure_review_branch(Path("/work"), "review/app", new_sha, repo=self.repo)
+
+
+class RepairModeAndDeduplicatedEscalationTests(unittest.TestCase):
+    repo = "warelik/osconfig"
+    config = "a" * 40
+    upstream = "b" * 40
+    candidate_sha = "c" * 40
+
+    def test_repair_mode_defaults_to_bot_for_direct_cli_and_validates_before_mutation(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(release.repair_mode(), "bot")
+        with patch.dict(os.environ, {"FORK_REPAIR_MODE": "escalate"}):
+            self.assertEqual(release.repair_mode(), "escalate")
+        with patch.dict(os.environ, {"FORK_REPAIR_MODE": "BOT"}):
+            self.assertEqual(release.repair_mode(), "bot")
+        with patch.dict(os.environ, {
+                "GITHUB_REPOSITORY": self.repo,
+                "GITHUB_SHA": self.config,
+                "FORK_REPAIR_MODE": "sometimes",
+            }, clear=True), \
+             patch.object(release, "api",
+                          side_effect=AssertionError("API called before repair_mode")), \
+             patch.object(release, "pages",
+                          side_effect=AssertionError("pages called before repair_mode")), \
+             patch.object(release, "report_permission_blocker",
+                          side_effect=AssertionError("blocker mutated before repair_mode")):
+            with self.assertRaisesRegex(ValueError, "FORK_REPAIR_MODE"):
+                release.request_fix(Path("/nonexistent-candidate-dir"), "evidence")
+            with self.assertRaisesRegex(ValueError, "FORK_REPAIR_MODE"):
+                release.request_policy_repair("CODEX_REQUEST_TOKEN is missing")
+            with self.assertRaisesRegex(ValueError, "FORK_REPAIR_MODE"):
+                release.request_policy_pr_fix(42, self.candidate_sha, "evidence")
+
+    def test_workflow_copies_forward_escalate_repair_mode_without_broadening_signer_env(self):
+        installed = release.ROOT / ".github/workflows/google-osconfig-agent-inventory.yml"
+        template = release.PATCH_DIR / "workflows/google-osconfig-agent-inventory.yml"
+        self.assertEqual(installed.read_bytes(), template.read_bytes())
+        release.validate_signing_workflow(installed, shared=True)
+        document = release.yaml_module().safe_load(installed.read_text(encoding="utf-8"))
+        self.assertNotIn("env", document)
+        jobs = document["jobs"]
+        self.assertEqual(jobs["candidate-source"]["permissions"].get("actions"), "read")
+        for step in jobs["sign"]["steps"]:
+            self.assertNotIn("FORK_REPAIR_MODE", step.get("env") or {})
+        repair_steps = (
+            ("policy-resume", "Continue any bounded publisher repair or review window"),
+            ("repair-policy-proposal", "Request a separate machine repair for the publisher proposal"),
+            ("repair", "Request a native Codex fix with the failure evidence"),
+            ("repair-publisher", "Request a separate machine repair for publisher and workflow failures"),
+        )
+        for job_name, step_name in repair_steps:
+            with self.subTest(job=job_name):
+                step = next(item for item in jobs[job_name]["steps"]
+                            if item.get("name") == step_name)
+                self.assertEqual(step.get("env", {}).get("FORK_REPAIR_MODE"),
+                                 "${{ vars.FORK_REPAIR_MODE || 'escalate' }}")
+
+    def test_escalate_mode_opens_deduplicated_issues_without_repair_pr_or_bot_wait(self):
+        open_issues = []
+        created_issues = []
+        branch = "review/osconfig-escalate"
+        candidate = {
+            "schema": 1, "repository": self.repo, "upstream_sha": self.upstream,
+            "application_sha": self.candidate_sha, "configuration_sha": self.config,
+            "patchset_sha256": "1" * 64, "recipe_sha256": "2" * 64,
+            "platform": "fedora-44/x86_64",
+        }
+        candidate_id = release.frozen_candidate_identity(candidate)
+        manifest = {
+            "candidate": candidate, "candidateIdentity": candidate_id,
+            "candidatePr": 15, "candidateSha": self.candidate_sha,
+            "candidateBranch": branch, "upstreamCommit": self.upstream,
+            "configSha": self.config,
+        }
+        app_pull = {
+            "number": 15, "state": "open",
+            "base": {"ref": f"review-base/{self.upstream}", "sha": self.upstream,
+                     "repo": {"full_name": self.repo}},
+            "head": {"ref": branch, "sha": self.candidate_sha,
+                     "repo": {"full_name": self.repo}},
+        }
+        policy_pull = {
+            "number": 42, "state": "open",
+            "user": {"login": "warelik", "type": "User"},
+            "body": f'<!-- osconfig-policy-repair:v1 {{"config": "{self.config}", "schema": 1, "seed": "{self.config}"}} -->',
+            "base": {"ref": "master", "sha": self.config, "repo": {"full_name": self.repo}},
+            "head": {"ref": "repair/osconfig-policy-fixture", "sha": self.candidate_sha,
+                     "repo": {"full_name": self.repo}},
+        }
+
+        def fake_api(route, **kwargs):
+            if kwargs.get("method") == "POST" and route == f"repos/{self.repo}/issues":
+                issue = {
+                    "number": 100 + len(created_issues),
+                    "user": {"login": "github-actions[bot]", "type": "Bot"},
+                    **kwargs["data"],
+                }
+                created_issues.append(issue)
+                open_issues.append(issue)
+                return issue
+            if route == f"repos/{self.repo}/pulls/15":
+                return app_pull
+            if route == f"repos/{self.repo}/pulls/42":
+                return policy_pull
+            if route == f"repos/{self.repo}/commits/{release.DEFAULT_BRANCH}":
+                return {"sha": self.config}
+            self.fail(f"Unexpected API call: {route} {kwargs}")
+
+        def fake_pages(route):
+            if route == f"repos/{self.repo}/issues?state=open":
+                return list(open_issues)
+            self.fail(f"Unexpected paginated API call: {route}")
+
+        with tempfile.TemporaryDirectory(prefix="osconfig-escalate-mode-") as temporary:
+            candidate_dir = Path(temporary)
+            (candidate_dir / "candidate-manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8")
+            with patch.dict(os.environ, {
+                    "GITHUB_REPOSITORY": self.repo,
+                    "GITHUB_SHA": self.config,
+                    "FORK_REPAIR_MODE": "escalate",
+                }, clear=False), \
+                 patch.object(release, "api", side_effect=fake_api), \
+                 patch.object(release, "pages", side_effect=fake_pages), \
+                 patch.object(release, "owner_token",
+                              side_effect=AssertionError("Escalate mode must not request Codex")), \
+                 patch.object(release, "open_policy_pull",
+                              side_effect=AssertionError("Escalate mode must not open policy PR")), \
+                 patch.object(release, "create_policy_pull",
+                              side_effect=AssertionError("Escalate mode must not create policy PR")), \
+                 patch.object(release, "request_policy_task",
+                              side_effect=AssertionError("Escalate mode must not request policy task")):
+                injected_evidence = (
+                    "x" * 5000 + "\n```text\n<!-- fork-final-retry:v1 {\"spoof\":1} -->\n"
+                    "RPM Go regression failed"
+                )
+                release.request_fix(candidate_dir, injected_evidence)
+                self.assertEqual(len(created_issues), 1)
+                self.assertEqual(created_issues[0]["assignees"], ["warelik"])
+                first_body = created_issues[0]["body"]
+                self.assertIn("osconfig-repair-escalation:v1 application", first_body)
+                self.assertIn("&lt;!-- fork-final-retry:v1", first_body)
+                self.assertEqual(first_body.count("<!--"), 1)
+
+                pr_only_shadow = {**created_issues[0], "pull_request": {"url": "fixture"}}
+                external_shadow = {
+                    **created_issues[0],
+                    "user": {"login": "external-intruder", "type": "User"},
+                }
+                other_bot_shadow = {
+                    **created_issues[0],
+                    "user": {"login": "other[bot]", "type": "Bot"},
+                }
+                open_issues[:] = [pr_only_shadow, external_shadow, other_bot_shadow]
+                release.request_fix(candidate_dir, "RPM Go regression failed on rerun")
+                self.assertEqual(len(created_issues), 2)
+                release.request_fix(candidate_dir, "RPM Go regression failed on third cron")
+                self.assertEqual(len(created_issues), 2)
+                owner_authored = {
+                    **created_issues[1],
+                    "user": {"login": "warelik", "type": "User"},
+                }
+                open_issues[:] = [owner_authored]
+                release.request_fix(candidate_dir, "RPM Go regression failed with owner issue")
+                self.assertEqual(len(created_issues), 2)
+
+                conflict_run_1 = (
+                    f"Workflow run: https://github.com/{self.repo}/actions/runs/1001\n\n"
+                    f"Failed job: candidate-source (https://github.com/{self.repo}/actions/runs/1001/jobs/5001)\n"
+                    "2026-10-31T00:23:11.1234567Z /tmp/osconfig.abc123: Hunk #1 FAILED at 42."
+                )
+                conflict_run_2 = (
+                    f"Workflow run: https://github.com/{self.repo}/actions/runs/1002\n\n"
+                    f"Failed job: candidate-source (https://github.com/{self.repo}/actions/runs/1002/jobs/5002)\n"
+                    "2026-10-31T06:23:19.9999999Z /tmp/osconfig.xyz987: Hunk #1 FAILED at 42."
+                )
+                distinct_failure = (
+                    f"Workflow run: https://github.com/{self.repo}/actions/runs/1003\n\n"
+                    f"Failed job: candidate-source (https://github.com/{self.repo}/actions/runs/1003/jobs/5003)\n"
+                    "OS Config package stopped: Upstream source archive does not match its SHA-256"
+                )
+                release.request_policy_repair(conflict_run_1)
+                self.assertEqual(len(created_issues), 3)
+                self.assertIn("osconfig-repair-escalation:v1 publisher", created_issues[-1]["body"])
+                self.assertIn("`candidate-source`", created_issues[-1]["body"])
+                release.request_policy_repair(conflict_run_2)
+                self.assertEqual(len(created_issues), 3)
+                release.request_policy_repair(distinct_failure)
+                self.assertEqual(len(created_issues), 4)
+
+                grant_wait = (
+                    f"Workflow run: https://github.com/{self.repo}/actions/runs/1004\n\n"
+                    f"Failed job: final-guard (https://github.com/{self.repo}/actions/runs/1004/jobs/5004)\n"
+                    f"OS Config package stopped: {next(iter(release.FINAL_RETRY_GRANT_REASONS))}"
+                )
+                release.request_policy_repair(grant_wait)
+                self.assertEqual(len(created_issues), 4)
+
+                blocker_category = release.report_permission_blocker(
+                    self.repo, self.config,
+                    "403 Forbidden <!-- spoofed-marker:v1 -->")
+                self.assertEqual(blocker_category, "GitHub Actions permission")
+                self.assertEqual(len(created_issues), 5)
+                blocker_issue = created_issues[-1]
+                self.assertEqual(blocker_issue["body"].count("<!--"), 1)
+                self.assertIn("&lt;!-- spoofed-marker:v1 -->", blocker_issue["body"])
+                open_issues[-1] = {
+                    **blocker_issue,
+                    "user": {"login": "external-intruder", "type": "User"},
+                }
+                release.report_permission_blocker(
+                    self.repo, self.config, "403 Forbidden <!-- spoofed-marker:v1 -->")
+                self.assertEqual(len(created_issues), 6)
+                release.report_permission_blocker(
+                    self.repo, self.config, "403 Forbidden <!-- spoofed-marker:v1 -->")
+                self.assertEqual(len(created_issues), 6)
+
+                release.request_policy_pr_fix(42, self.candidate_sha, "proposal check failed")
+                self.assertEqual(len(created_issues), 7)
+                self.assertIn("osconfig-repair-escalation:v1 policy-proposal",
+                              created_issues[-1]["body"])
+                release.request_policy_pr_fix(42, self.candidate_sha, "proposal check failed rerun")
+                self.assertEqual(len(created_issues), 7)
+
+
 if __name__ == "__main__":
     unittest.main()

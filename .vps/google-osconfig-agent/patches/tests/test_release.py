@@ -4309,5 +4309,26 @@ class NativePolicyRunnerFixtureTests(unittest.TestCase):
             self.assertNotIn("PRIVATE_VALUE_CANARY", report.getvalue())
 
 
+
+
+class StalePolicyRepairAuthorizationTests(unittest.TestCase):
+    def test_owned_stale_policy_repair_uses_existing_authorized_write_credential(self):
+        repo = "warelik/osconfig"
+        pull = {"number": 7, "head": {"ref": release.POLICY_REPAIR_BRANCH + "old",
+                                      "repo": {"full_name": repo}},
+                "user": {"login": "github-actions[bot]"}}
+        for configured in (False, True):
+            with self.subTest(configured=configured), \
+                 patch.dict(os.environ, {"CODEX_REQUEST_TOKEN": "fixture-authorized-write"} if configured else {}, clear=True), \
+                 patch.object(release, "pages", return_value=[pull]), \
+                 patch.object(release, "policy_identity", return_value=None), \
+                 patch.object(release, "api") as write:
+                self.assertIsNone(release.open_policy_pull(repo, "a" * 40))
+                expected = {"method": "PATCH", "data": {"state": "closed"}}
+                if configured:
+                    expected["token"] = "fixture-authorized-write"
+                write.assert_called_once_with(f"repos/{repo}/pulls/7", **expected)
+
+
 if __name__ == "__main__":
     unittest.main()

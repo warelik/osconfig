@@ -34,7 +34,9 @@ import (
 
 	agentendpoint "cloud.google.com/go/osconfig/agentendpoint/apiv1"
 	"github.com/GoogleCloudPlatform/guest-logging-go/logger"
+	"github.com/GoogleCloudPlatform/osconfig/packages"
 	utilmocks "github.com/GoogleCloudPlatform/osconfig/util/mocks"
+	"github.com/golang/mock/gomock"
 	"golang.org/x/oauth2/jws"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc"
@@ -196,7 +198,18 @@ func (s *agentEndpointServiceTestServer) StartNextTask(ctx context.Context, req 
 	case !s.execTaskComplete:
 		return &agentendpointpb.StartNextTaskResponse{Task: &agentendpointpb.Task{TaskType: agentendpointpb.TaskType_EXEC_STEP_TASK, TaskId: "TaskType_EXEC_STEP_TASK"}}, nil
 	case !s.patchTaskComplete:
-		return &agentendpointpb.StartNextTaskResponse{Task: &agentendpointpb.Task{TaskType: agentendpointpb.TaskType_APPLY_PATCHES, TaskId: "TaskType_APPLY_PATCHES"}}, nil
+		return &agentendpointpb.StartNextTaskResponse{Task: &agentendpointpb.Task{
+			TaskType: agentendpointpb.TaskType_APPLY_PATCHES,
+			TaskId:   "TaskType_APPLY_PATCHES",
+			TaskDetails: &agentendpointpb.Task_ApplyPatchesTask{
+				ApplyPatchesTask: &agentendpointpb.ApplyPatchesTask{
+					DryRun: true,
+					PatchConfig: &agentendpointpb.PatchConfig{
+						RebootConfig: agentendpointpb.PatchConfig_NEVER,
+					},
+				},
+			},
+		}}, nil
 	case !s.applyConfigTaskComplete:
 		return &agentendpointpb.StartNextTaskResponse{Task: &agentendpointpb.Task{TaskType: agentendpointpb.TaskType_APPLY_CONFIG_TASK, TaskId: "TaskType_APPLY_CONFIG_TASK"}}, nil
 	default:
@@ -250,6 +263,23 @@ func (*agentEndpointServiceTestServer) ReportInventory(ctx context.Context, req 
 }
 
 func TestWaitForTask(t *testing.T) {
+	previousRunner := packages.GetCommandRunner()
+	previousPtyRunner := packages.GetPtyCommandRunner()
+	previousAptExists := packages.AptExists
+	mockController := gomock.NewController(t)
+	runner := utilmocks.NewMockCommandRunner(mockController)
+	ptyRunner := utilmocks.NewMockCommandRunner(mockController)
+	// Use the existing Debian-detection test seam to avoid host RPM probe commands.
+	runner.EXPECT().Run(gomock.Any(), gomock.Any()).Return(nil, nil, nil).AnyTimes()
+	ptyRunner.EXPECT().Run(gomock.Any(), gomock.Any()).Return(nil, nil, nil).AnyTimes()
+	packages.SetCommandRunner(runner)
+	packages.SetPtyCommandRunner(ptyRunner)
+	packages.AptExists = true
+	t.Cleanup(func() {
+		packages.SetCommandRunner(previousRunner)
+		packages.SetPtyCommandRunner(previousPtyRunner)
+		packages.AptExists = previousAptExists
+	})
 	ctx := context.Background()
 	srv := newAgentEndpointServiceTestServer()
 	tc, err := newTestClient(ctx, srv)

@@ -174,3 +174,5 @@ identity. Modern signed candidates use their recorded identity directly; the
 current six product inputs and RPM recipe are unchanged. A real local-Git
 regression covers exact tree identity, refusal of a missing historical blob,
 and the modern-provenance path without network, compilation or Go tests.
+
+Native review history accepts both plain and backtick-delimited legacy commit prefixes, resolving each to its exact native commit. PR inventories are canonicalized by number; duplicate numbers and actual source changes remain errors.

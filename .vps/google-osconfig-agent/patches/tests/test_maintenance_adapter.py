@@ -58,6 +58,23 @@ class FinalAuthorizationCheckoutTests(unittest.TestCase):
                         )
 
 
+class LegacyCommitPrefixTransportTests(unittest.TestCase):
+    def test_backtick_and_plain_reviewed_prefixes_resolve_to_exact_native_sha(self):
+        prefix = "abcdef1234"
+        source = prefix + "b" * 30
+        records = [{"user": {"login": release.BOT, "type": "Bot"},
+                    "body": body} for body in (
+                        "**Reviewed commit:** `" + prefix + "`",
+                        "Reviewed commit: " + prefix)]
+        with patch.object(release, "api", return_value={"sha": source}) as read:
+            self.assertEqual(release._resolved_review_commits(
+                "warelik/osconfig", [], records), {prefix: source})
+        read.assert_called_once_with("repos/warelik/osconfig/commits/" + prefix)
+        with patch.object(release, "api", return_value={"sha": "f" * 40}):
+            with self.assertRaisesRegex(ValueError, "did not resolve exactly"):
+                release._resolved_review_commits("warelik/osconfig", [], records)
+
+
 class LegacyPublishedSourceIdentityTests(unittest.TestCase):
     def test_legacy_signed_tree_retains_checker_without_changing_current_recipe(self):
         # Real local Git trees reproduce the vps137 omission: its accepted source
@@ -1490,6 +1507,31 @@ class NativeAdapterTests(unittest.TestCase):
             _comments, findings, sources, dispositions = release.load_review_finding_history(
                 self.repo, 91, published_at=REVIEW_HISTORY_CUTOFF)
         self.assertEqual((findings, sources, dispositions), ([], {}, {}))
+
+    def test_reordered_native_inventory_is_stable_and_duplicates_are_refused(self):
+        pull = {"number": 91, "updated_at": "2026-10-19T10:00:00Z", "state": "open",
+                "head": {"sha": "a" * 40, "ref": "review/source",
+                         "repo": {"full_name": self.repo}},
+                "base": {"sha": "b" * 40, "ref": "review-base/source"}}
+        other = {**pull, "number": 92, "updated_at": "2026-10-20T10:00:00Z"}
+        proof = {"variable": {"value": json.dumps({"publication": {
+            "published_at": "2026-10-19T09:00:00Z"}})}}
+        inventories = iter(([other, pull], [pull, other]))
+        def pages(route):
+            return next(inventories) if "/pulls?" in route else []
+        def api(route):
+            return other if route.endswith("/92") else pull
+        core = types.SimpleNamespace(review_history=Mock(return_value={"complete": True}))
+        with (patch.object(release, "pages", side_effect=pages),
+              patch.object(release, "api", side_effect=api),
+              patch.object(release, "_resolved_review_commits", return_value={}),
+              patch.object(release, "lifecycle_module", return_value=core)):
+            self.assertEqual(release.native_review_finding_history(
+                self.repo, {"repository": self.repo}, proof), {"complete": True})
+        self.assertEqual([row["pull"]["number"] for row in core.review_history.call_args.args[1]], [91, 92])
+        with (patch.object(release, "pages", return_value=[pull, pull]),
+              self.assertRaisesRegex(ValueError, "repeated a pull request")):
+            release.native_review_finding_history(self.repo, {"repository": self.repo}, proof)
 
     def test_changed_native_review_inventory_blocks_history_collection(self):
         pull = {"number": 91, "updated_at": "2026-10-19T10:00:00Z", "state": "open",

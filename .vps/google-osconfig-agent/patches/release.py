@@ -31,7 +31,7 @@ BOT = "chatgpt-codex-connector[bot]"
 APP = "chatgpt-codex-connector"
 SHA = re.compile(r"^[0-9a-f]{40}$")
 NATIVE_STATE = re.compile(r"<!-- codex-review-state:v1 (\{.*?\}) -->", re.S)
-REVIEWED = re.compile(r"(?im)^.*?Reviewed commit[^0-9a-f]*([0-9a-f]{7,40})\s*\*{0,2}\s*$")
+REVIEWED = re.compile(r"(?im)^.*?Reviewed commit[^0-9a-f]*`?([0-9a-f]{7,40})`?\s*\*{0,2}\s*$")
 CLEAN_ONLY = re.compile(r"^\s*(?:\*\*)?Codex Review:\s*Didn't find any major issues\.\s*(?:\*\*)?\s*$", re.I)
 FINDING = re.compile(r"\bP[0-3]\b|\b(?:critical|high|medium|low)\s+severity\b", re.I)
 REPAIR_STATE = re.compile(r"<!-- osconfig-fix-cycle:v1 (\{[^\n]+\}) -->")
@@ -1476,18 +1476,15 @@ def native_review_finding_history(repo, candidate, accepted_proof):
                 (head.get("repo") or {}).get("full_name"), pull.get("state"),
                 base.get("sha"), base.get("ref"))
     def inventory():
-        selected, previous = [], None
+        selected, seen = [], set()
         for pull in pages(f"repos/{repo}/pulls?state=all&sort=updated&direction=desc"):
             signature(pull)
-            updated = parse_utc(pull["updated_at"])
-            if previous is not None and updated > previous:
-                raise ValueError("Native review inventory changed while paginating")
-            previous = updated
-            if updated >= cutoff:
+            if pull["number"] in seen:
+                raise ValueError("Native review inventory repeated a pull request while paginating")
+            seen.add(pull["number"])
+            if parse_utc(pull["updated_at"]) >= cutoff:
                 selected.append(pull)
-        if len({pull["number"] for pull in selected}) != len(selected):
-            raise ValueError("Native review inventory repeated a pull request while paginating")
-        return selected
+        return sorted(selected, key=lambda pull: pull["number"])
     initial = inventory()
     records = []
     for summary in initial:

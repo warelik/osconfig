@@ -25,7 +25,7 @@ class RepairInstructionProtocolTests(unittest.TestCase):
         document = release.yaml_module().safe_load((release.ROOT / ".github/workflows/google-osconfig-agent-inventory.yml").read_text())
         steps = document["jobs"]["policy-review"]["steps"]
         command = next(step["run"] for step in steps if "release.py review-pair" in step.get("run", ""))
-        self.assertEqual(shlex.split(command)[-1], "$RUNNER_TEMP/osconfig-policy-candidate")
+        self.assertEqual(shlex.split(command.replace("\\\n", ""))[-1], "$RUNNER_TEMP/osconfig-policy-candidate")
 
     def test_reported_repair_source_is_not_replaced_by_its_review_only_child(self):
         source, context = "e" * 40, "f" * 40
@@ -2970,6 +2970,7 @@ class ExplicitMachineFindingDispositionTests(unittest.TestCase):
         request = {"id": 1, "user": {"login": "owner", "type": "User"},
                    "created_at": "2026-10-17T12:00:00Z", "updated_at": "2026-10-17T12:00:00Z",
                    "body": f"<!-- osconfig-fix-window:v1 {application} 1792238400 -->"}
+        manifest["candidateSha"] = head
         report = {"schema": 1, "source_sha": head,
                   "findings": [{"finding_id": finding["finding_id"],
                                 "status": "fixed", "evidence": evidence}]}

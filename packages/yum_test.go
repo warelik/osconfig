@@ -85,6 +85,32 @@ func TestRemoveYum(t *testing.T) {
 }
 
 func TestYumUpdates(t *testing.T) {
+	t.Run("PackageNamedReplacing", func(t *testing.T) {
+		got := parseYumUpdates([]byte(`Upgrading:
+ replacing x86_64 x86_64 updates 1 M
+   replacing old-package x86_64 1.0-1 updates 1 M
+   replacing x86_64 x86_64 updates 1 M
+ foo noarch 2.0-1 updates 1 M
+Installing:
+ replacing noarch noarch updates 1 M
+   replacing noarch noarch updates 1 M
+Transaction Summary
+`))
+		want := []struct{ name, arch, version string }{
+			{"replacing", "x86_64", "x86_64"},
+			{"foo", "noarch", "2.0-1"},
+			{"replacing", "noarch", "noarch"},
+		}
+		if len(got) != len(want) {
+			t.Fatalf("expected %d package updates, got %v", len(want), got)
+		}
+		for i, expected := range want {
+			if got[i].Name != expected.name || got[i].RawArch != expected.arch || got[i].Version != expected.version {
+				t.Errorf("update %d: got %+v, want %+v", i, got[i], expected)
+			}
+		}
+	})
+
 	data := []byte(`
 	=================================================================================================================================================================================
 	Package                                      Arch                           Version                                              Repository                                Size
@@ -94,6 +120,8 @@ func TestYumUpdates(t *testing.T) {
 	    replacing kernel.x86_64 1.0.0-4
 	Upgrading:
 	  foo                                       noarch                         2.0.0-1                                              BaseOS                                   361 k
+	    replacing                             x86_64                         x86_64                                              updates                                   1 M
+	    replacing                             x86_64                         noarch                                              updates                                   1 M
 	  bar                                       x86_64                         2.0.0-1                                              repo                                      10 M
 	Obsoleting:
 	  baz                                       noarch                         2.0.0-1                                              repo                                      10 M

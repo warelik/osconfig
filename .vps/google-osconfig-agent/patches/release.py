@@ -140,7 +140,7 @@ FINDING_DISPOSITION_INSTRUCTION = (
     "For patch-backed source/tests use the exact patch-carrier path and name the embedded test/snippets. "
     "Fixed requires real code and regression changes. Disproved may cite unchanged exact source and regression "
     "without fake edits. Explain same-application findings whose applicability changed with policy as disproved, "
-    "not as an application fix. Missing evidence leaves the finding unresolved for the next machine repair. "
+    "not as an application fix. If required evidence is missing, leave that finding unresolved for the next machine repair. "
     "During repair use source inspection and bounded mechanical checks only; do not run tests, builds, "
     "dependency installation or application imports. Tests and build run once in final CI after both reviews close."
 )

@@ -15,6 +15,47 @@ import release
 REVIEW_HISTORY_CUTOFF = "2026-10-19T09:00:00Z"
 
 
+class FinalAuthorizationCheckoutTests(unittest.TestCase):
+    def test_final_authorizers_pin_controller_to_run_sha_and_preserve_pair(self):
+        installed = release.ROOT / ".github/workflows/google-osconfig-agent-inventory.yml"
+        template = release.PATCH_DIR / "workflows/google-osconfig-agent-inventory.yml"
+        self.assertEqual(installed.read_bytes(), template.read_bytes())
+        yaml = release.yaml_module()
+        for workflow in (installed, template):
+            with self.subTest(workflow=workflow):
+                document = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+                for job_name in ("final-guard", "policy-final-guard"):
+                    with self.subTest(job=job_name):
+                        steps = document["jobs"][job_name]["steps"]
+                        checkouts = [
+                            step for step in steps
+                            if str(step.get("uses", "")).startswith("actions/checkout@")
+                        ]
+                        controller = [step for step in checkouts
+                                      if "repository" not in (step.get("with") or {})]
+                        private = [step for step in checkouts
+                                   if (step.get("with") or {}).get("repository")
+                                   == "warelik/machine-maintenance"]
+                        self.assertEqual(len(controller), 1)
+                        self.assertEqual(len(private), 1)
+                        self.assertEqual(
+                            (controller[0].get("with") or {}).get("ref"),
+                            "${{ github.sha }}",
+                        )
+                        self.assertIs(
+                            (controller[0].get("with") or {}).get("persist-credentials"),
+                            False,
+                        )
+                        self.assertEqual(
+                            (private[0].get("with") or {}).get("ref"),
+                            "${{ steps.maintenance-pin.outputs.revision }}",
+                        )
+                        self.assertIs(
+                            (private[0].get("with") or {}).get("persist-credentials"),
+                            False,
+                        )
+
+
 class NativeAdapterTests(unittest.TestCase):
     repo = "warelik/osconfig"
 
@@ -107,6 +148,141 @@ class NativeAdapterTests(unittest.TestCase):
         self.assertEqual(patched_numbers, [91, 92])
         cleanup.assert_called_once_with(self.repo, owned_pull_numbers={91, 92})
 
+    def test_close_candidate_accepts_explicit_pair_without_environment_pr_numbers(self):
+        _candidate, candidate_id, full, delta = self.exact_candidate_review_pair()
+        pulls = {91: full, 92: delta}
+        patched = []
+
+        def api(route, method="GET", data=None, **_kwargs):
+            number = int(route.rsplit("/", 1)[-1])
+            if method == "PATCH":
+                patched.append(number)
+                pulls[number] = {**pulls[number], "state": data["state"]}
+            return pulls[number]
+
+        core = types.SimpleNamespace(candidate_identity=Mock(return_value=candidate_id))
+        with (patch.dict("os.environ", {"GITHUB_REPOSITORY": self.repo,
+                                         "CANDIDATE_PR": "", "DELTA_PR": ""}),
+              patch.object(release, "api", side_effect=api),
+              patch.object(release, "lifecycle_module", return_value=core),
+              patch.object(release, "cleanup_review_refs") as cleanup):
+            release.close_candidate(self.review_contexts, pull_numbers=(91, 92))
+
+        self.assertEqual(patched, [91, 92])
+        cleanup.assert_called_once_with(self.repo, owned_pull_numbers={91, 92})
+
+    def test_superseded_cleanup_uses_only_exact_unchanged_stale_application_pair(self):
+        _candidate, candidate_id, full, _delta = self.exact_candidate_review_pair()
+        core = types.SimpleNamespace(candidate_identity=Mock(return_value=candidate_id))
+        with patch.object(release, "pages", return_value=[full]), \
+                patch.object(release, "lifecycle_module", return_value=core), \
+                patch.object(release, "close_candidate") as close:
+            release.cleanup_superseded_application_pairs(
+                self.repo, "4" * 40, "5" * 40, keep_pull_numbers={101, 102})
+        close.assert_called_once_with(pull_numbers=(91, 92))
+
+    def test_superseded_cleanup_retains_current_changed_and_shared_pairs(self):
+        for case in ("current", "changed", "shared"):
+            with self.subTest(case=case):
+                _candidate, candidate_id, full, _delta = self.exact_candidate_review_pair()
+                if case == "current":
+                    keep = {91, 92}
+                    pulls = [full]
+                elif case == "changed":
+                    full["head"]["sha"] = "9" * 40
+                    keep = {101, 102}
+                    pulls = [full]
+                else:
+                    duplicate = {**full, "number": 93}
+                    pulls = [full, duplicate]
+                    keep = {101, 102}
+                core = types.SimpleNamespace(candidate_identity=Mock(return_value=candidate_id))
+                with patch.object(release, "pages", return_value=pulls), \
+                        patch.object(release, "lifecycle_module", return_value=core), \
+                        patch.object(release, "close_candidate") as close:
+                    release.cleanup_superseded_application_pairs(
+                        self.repo, "4" * 40, "5" * 40, keep_pull_numbers=keep)
+                close.assert_not_called()
+
+    def test_superseded_cleanup_retains_candidate_with_active_repair_window(self):
+        candidate, candidate_id, full, _delta = self.exact_candidate_review_pair()
+        start = "2026-10-21T00:00:00Z"
+        cycle = f"{candidate['upstream_sha']}:2" + "2" * 39
+        comment = {
+            "id": 901, "user": {"login": "warelik", "type": "User"},
+            "created_at": "2099-01-01T00:00:00Z",
+            "updated_at": "2099-01-01T00:00:00Z",
+            "body": ("@codex fix\n"
+                     f"<!-- osconfig-fix-cycle:v1 {json.dumps({'cycle': cycle, 'startedAt': start})} -->\n"
+                     f"<!-- osconfig-fix-window:v1 {full['head']['sha']} 4070908800 -->"),
+        }
+
+        def pages(route):
+            return [full] if "pulls?state=open" in route else [comment]
+
+        core = types.SimpleNamespace(candidate_identity=Mock(return_value=candidate_id))
+        with patch.object(release, "pages", side_effect=pages), \
+                patch.object(release, "lifecycle_module", return_value=core), \
+                patch.object(release, "close_candidate") as close:
+            release.cleanup_superseded_application_pairs(
+                self.repo, "4" * 40, "5" * 40, keep_pull_numbers={101, 102})
+        close.assert_not_called()
+
+    def test_superseded_cleanup_retains_candidate_with_active_review_window(self):
+        _candidate, candidate_id, full, _delta = self.exact_candidate_review_pair()
+        comment = {
+            "id": 902, "user": {"login": "warelik", "type": "User"},
+            "created_at": "2099-01-01T00:00:00Z",
+            "updated_at": "2099-01-01T00:00:00Z",
+            "body": "@codex review\n" + release.owner_review_marker(
+                candidate_id, "full", full["head"]["sha"], full["base"]["sha"]),
+        }
+
+        def pages(route):
+            return [full] if "pulls?state=open" in route else [comment]
+
+        core = types.SimpleNamespace(candidate_identity=Mock(return_value=candidate_id))
+        with patch.object(release, "pages", side_effect=pages), \
+                patch.object(release, "lifecycle_module", return_value=core), \
+                patch.object(release, "close_candidate") as close:
+            release.cleanup_superseded_application_pairs(
+                self.repo, "4" * 40, "5" * 40, keep_pull_numbers={101, 102})
+        close.assert_not_called()
+
+    def test_adopt_cli_runs_superseded_cleanup_only_after_successful_adoption(self):
+        manifest = {"candidate": {"configuration_sha": "5" * 40},
+                    "candidatePr": 91, "deltaPr": 92}
+        with tempfile.TemporaryDirectory() as temporary:
+            candidate_dir = Path(temporary)
+            (candidate_dir / "candidate-manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8")
+            with (patch.dict("os.environ", {"GITHUB_REPOSITORY": self.repo}),
+                  patch.object(release.sys, "argv", ["release.py", "adopt", str(candidate_dir),
+                                                       str(candidate_dir)]),
+                  patch.object(release, "adopt") as adopt,
+                  patch.object(release, "api", return_value={"sha": "4" * 40}),
+                  patch.object(release, "cleanup_superseded_application_pairs") as cleanup):
+                release.main()
+        adopt.assert_called_once()
+        cleanup.assert_called_once_with(self.repo, "4" * 40, "5" * 40,
+                                        keep_pull_numbers={91, 92})
+
+    def test_adopt_cli_does_not_cleanup_after_failed_adoption(self):
+        manifest = {"candidate": {"configuration_sha": "5" * 40},
+                    "candidatePr": 91, "deltaPr": 92}
+        with tempfile.TemporaryDirectory() as temporary:
+            candidate_dir = Path(temporary)
+            (candidate_dir / "candidate-manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8")
+            with (patch.dict("os.environ", {"GITHUB_REPOSITORY": self.repo}),
+                  patch.object(release.sys, "argv", ["release.py", "adopt", str(candidate_dir),
+                                                       str(candidate_dir)]),
+                  patch.object(release, "adopt", side_effect=ValueError("adoption failed")),
+                  patch.object(release, "cleanup_superseded_application_pairs") as cleanup,
+                  self.assertRaisesRegex(ValueError, "adoption failed")):
+                release.main()
+        cleanup.assert_not_called()
+
     def test_close_candidate_rejects_mismatched_pair_before_any_closure(self):
         _candidate, candidate_id, full, delta = self.exact_candidate_review_pair()
         delta["body"] = delta["body"].replace(candidate_id, "9" * 64)
@@ -151,6 +327,115 @@ class NativeAdapterTests(unittest.TestCase):
               patch.object(release, "cleanup_review_refs") as cleanup):
             release.close_candidate(self.review_contexts)
         self.assertEqual(patched, [91, 92])
+        cleanup.assert_called_once_with(self.repo, owned_pull_numbers={91, 92})
+
+    def test_close_candidate_rejects_retargeted_application_only_delta_base(self):
+        _candidate, candidate_id, full, delta = self.exact_candidate_review_pair(
+            application_only_delta=True)
+        changed_base = "8" * 40
+        delta["base"] = {**delta["base"], "sha": changed_base,
+                         "ref": f"review-base/{changed_base}"}
+        pulls = {91: full, 92: delta}
+        calls = []
+
+        def api(route, method="GET", data=None, **_kwargs):
+            calls.append((route, method, data))
+            number = int(route.rsplit("/", 1)[-1])
+            if method == "PATCH":
+                pulls[number] = {**pulls[number], "state": data["state"]}
+            return pulls[number]
+
+        core = types.SimpleNamespace(candidate_identity=Mock(return_value=candidate_id))
+        with (patch.dict("os.environ", {"GITHUB_REPOSITORY": self.repo,
+                                         "CANDIDATE_PR": "91", "DELTA_PR": "92"}),
+              patch.object(release, "api", side_effect=api),
+              patch.object(release, "lifecycle_module", return_value=core),
+              patch.object(release, "cleanup_review_refs") as cleanup,
+              self.assertRaisesRegex(ValueError, "one exact candidate manifest")):
+            release.close_candidate(self.review_contexts)
+        self.assertEqual(calls, [
+            (f"repos/{self.repo}/pulls/91", "GET", None),
+            (f"repos/{self.repo}/pulls/92", "GET", None),
+        ])
+        cleanup.assert_not_called()
+
+    def test_close_candidate_rejects_non_application_base_conflicting_with_manifest_marker(self):
+        _candidate, candidate_id, full, delta = self.exact_candidate_review_pair()
+        changed_base = "8" * 40
+        delta["base"] = {**delta["base"], "sha": changed_base,
+                         "ref": f"review-base/{changed_base}"}
+        self.review_contexts["delta"]["base_sha"] = changed_base
+        self.review_contexts["delta"]["base_branch"] = delta["base"]["ref"]
+        pulls = {91: full, 92: delta}
+        calls = []
+
+        def api(route, method="GET", data=None, **_kwargs):
+            calls.append((route, method, data))
+            number = int(route.rsplit("/", 1)[-1])
+            if method == "PATCH":
+                pulls[number] = {**pulls[number], "state": data["state"]}
+            return pulls[number]
+
+        core = types.SimpleNamespace(candidate_identity=Mock(return_value=candidate_id))
+        with (patch.dict("os.environ", {"GITHUB_REPOSITORY": self.repo,
+                                         "CANDIDATE_PR": "91", "DELTA_PR": "92"}),
+              patch.object(release, "api", side_effect=api),
+              patch.object(release, "lifecycle_module", return_value=core),
+              patch.object(release, "cleanup_review_refs") as cleanup,
+              self.assertRaisesRegex(ValueError, "one exact candidate manifest")):
+            release.close_candidate(self.review_contexts)
+        self.assertEqual(calls, [
+            (f"repos/{self.repo}/pulls/91", "GET", None),
+            (f"repos/{self.repo}/pulls/92", "GET", None),
+        ])
+        cleanup.assert_not_called()
+
+    def test_cli_close_recovers_application_only_context_from_immutable_owner_requests(self):
+        _candidate, candidate_id, full, delta = self.exact_candidate_review_pair(
+            application_only_delta=True)
+        pulls = {91: full, 92: delta}
+        calls = []
+
+        def api(route, method="GET", data=None, **_kwargs):
+            calls.append((route, method, data))
+            number = int(route.rsplit("/", 1)[-1])
+            if method == "PATCH":
+                pulls[number] = {**pulls[number], "state": data["state"]}
+            return pulls[number]
+
+        def request_comment(scope, comment_id):
+            context = self.review_contexts[scope]
+            marker = release.owner_review_marker(
+                candidate_id, scope, context["review_sha"], context["base_sha"])
+            timestamp = "2026-10-20T12:00:00Z"
+            return {
+                "id": comment_id,
+                "user": {"login": "warelik", "type": "User"},
+                "created_at": timestamp, "updated_at": timestamp,
+                "body": "@codex review\n\n" + marker,
+            }
+
+        comments = {
+            91: [request_comment("full", 901)],
+            92: [request_comment("delta", 902)],
+        }
+
+        def pages(route):
+            number = int(route.split("/")[-2])
+            return comments[number]
+
+        core = types.SimpleNamespace(candidate_identity=Mock(return_value=candidate_id))
+        with (patch.dict("os.environ", {"GITHUB_REPOSITORY": self.repo,
+                                         "CANDIDATE_PR": "91", "DELTA_PR": "92"}),
+              patch.object(release, "api", side_effect=api),
+              patch.object(release, "pages", side_effect=pages),
+              patch.object(release, "lifecycle_module", return_value=core),
+              patch.object(release, "cleanup_review_refs") as cleanup):
+            release.close_candidate()
+
+        patched_numbers = [int(route.rsplit("/", 1)[-1])
+                           for route, method, _data in calls if method == "PATCH"]
+        self.assertEqual(patched_numbers, [91, 92])
         cleanup.assert_called_once_with(self.repo, owned_pull_numbers={91, 92})
 
     def test_close_candidate_accepts_source_and_baseline_hash_full_ref(self):
@@ -652,6 +937,62 @@ class NativeAdapterTests(unittest.TestCase):
                     release.load_review_finding_history(
                         self.repo, 91, published_at=REVIEW_HISTORY_CUTOFF)
 
+    def test_edited_ordinary_owner_comments_are_ignored_but_matching_protocols_stay_strict(self):
+        ordinary = {
+            "id": 104, "created_at": "2026-10-19T10:00:00Z",
+            "updated_at": "2026-10-19T10:05:00Z",
+            "user": {"login": "warelik", "type": "User"},
+            "body": "Unrelated owner discussion after the publication cutoff.",
+        }
+        opaque_bot = {
+            "id": 105, "created_at": "not-a-timestamp", "updated_at": "also-not-a-timestamp",
+            "user": {"login": release.BOT, "type": "Bot"},
+            "body": "<!-- fork-finding-batch:v1 {truncated -->",
+        }
+        with patch.object(release, "pages", return_value=[ordinary, opaque_bot]):
+            comments, findings, sources, dispositions = release.load_review_finding_history(
+                self.repo, 91, published_at=REVIEW_HISTORY_CUTOFF)
+        self.assertEqual(comments, [ordinary, opaque_bot])
+        self.assertEqual(findings, [])
+        self.assertEqual(sources, {})
+        self.assertEqual(dispositions, {})
+
+        disposition = {
+            "schema": 1, "candidate_id": "c" * 64, "source_sha": "d" * 40,
+            "findings": [{"finding_id": "finding-1", "status": "disproved",
+                          "evidence": "Exact reviewed source disproves this finding."}],
+        }
+        relevant_edited = {
+            **ordinary,
+            "body": release.FINDING_DISPOSITION_PREFIX + " " + json.dumps(
+                disposition, sort_keys=True, separators=(",", ":")) + " -->",
+        }
+        with (patch.object(release, "pages", return_value=[relevant_edited]),
+              self.assertRaisesRegex(ValueError, "Owner-authenticated comment was edited")):
+            release.load_review_finding_history(
+                self.repo, 91, published_at=REVIEW_HISTORY_CUTOFF)
+
+        pre_cutoff_malformed = {
+            **ordinary,
+            "id": 106,
+            "created_at": "2026-10-19T08:00:00Z",
+            "updated_at": "2026-10-19T08:05:00Z",
+            "body": release.FINDING_DISPOSITION_PREFIX + " {truncated -->",
+        }
+        with patch.object(release, "pages", return_value=[pre_cutoff_malformed]):
+            comments, findings, sources, dispositions = release.load_review_finding_history(
+                self.repo, 91, published_at=REVIEW_HISTORY_CUTOFF)
+        self.assertEqual(comments, [pre_cutoff_malformed])
+        self.assertEqual(findings, [])
+        self.assertEqual(sources, {})
+        self.assertEqual(dispositions, {})
+
+        malformed = {**ordinary, "body": release.FINDING_DISPOSITION_PREFIX + " {truncated -->"}
+        with (patch.object(release, "pages", return_value=[malformed]),
+              self.assertRaisesRegex(ValueError, "finding disposition marker envelope is malformed")):
+            release.load_review_finding_history(
+                self.repo, 91, published_at=REVIEW_HISTORY_CUTOFF)
+
     def test_finding_batches_order_source_by_timestamp_then_id_and_union_all_history(self):
         candidate_ids = {"same": "a" * 64, "other": "b" * 64}
         candidates = {
@@ -1085,6 +1426,64 @@ class NativeAdapterTests(unittest.TestCase):
                 release.current_review_baseline(self.repo, old)
         urlopen.assert_not_called()
 
+    def test_postpublication_review_keeps_the_frozen_old_delta_baseline(self):
+        endpoint = f"repos/{self.repo}/actions/variables/FORK_ACCEPTED_BASELINE"
+        old_candidate = {
+            "schema": 1, "repository": self.repo,
+            "upstream_sha": "a" * 40, "application_sha": "b" * 40,
+            "configuration_sha": "c" * 40, "patchset_sha256": "d" * 64,
+            "recipe_sha256": "e" * 64, "platform": "fedora-44/x86_64",
+        }
+        old_publication = {
+            "kind": "signed-repository", "id": 701,
+            "published_at": "2026-10-20T09:00:00Z", "metadata_sha256": "1" * 64,
+        }
+        old_value = json.dumps({
+            "schema": 1, "repository": self.repo, "candidate": old_candidate,
+            "publication": old_publication,
+        }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        old_variable = {
+            "name": "FORK_ACCEPTED_BASELINE", "value": old_value,
+            "created_at": "2026-10-19T08:00:00Z",
+            "updated_at": "2026-10-20T10:00:00Z",
+        }
+        saved = {"endpoint": endpoint, "variable": old_variable}
+        new_candidate = {**old_candidate, "configuration_sha": "f" * 40}
+        new_publication = {
+            "kind": "signed-repository", "id": 702,
+            "published_at": "2026-10-21T12:00:00Z", "metadata_sha256": "2" * 64,
+        }
+        new_value = json.dumps({
+            "schema": 1, "repository": self.repo, "candidate": new_candidate,
+            "publication": new_publication,
+        }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        transition = {"value": new_value, "published_at": new_publication["published_at"]}
+        core = types.SimpleNamespace(candidate_identity=Mock(return_value="c" * 64))
+        advanced_variable = {
+            "name": "FORK_ACCEPTED_BASELINE", "value": new_value,
+            "created_at": old_variable["created_at"],
+            "updated_at": "2026-10-21T12:01:00Z",
+        }
+
+        for native in (old_variable, advanced_variable):
+            with self.subTest(native_value="old" if native is old_variable else "advanced"), \
+                    patch.object(release, "owner_token", return_value="fixture-token"), \
+                    patch.object(release, "api", return_value=native), \
+                    patch.object(release, "lifecycle_module", return_value=core), \
+                    patch.object(release, "urlopen") as urlopen:
+                proof = release.current_review_baseline(
+                    self.repo, saved, signed_transition=transition)
+            self.assertEqual(proof, saved)
+            urlopen.assert_not_called()
+
+        unexpected = {**advanced_variable, "value": new_value + " "}
+        with patch.object(release, "owner_token", return_value="fixture-token"), \
+                patch.object(release, "api", return_value=unexpected), \
+                patch.object(release, "lifecycle_module", return_value=core):
+            with self.assertRaisesRegex(ValueError, "outside the exact publication transition"):
+                release.current_review_baseline(
+                    self.repo, saved, signed_transition=transition)
+
     def test_native_variable_patch_204_requires_exact_readback(self):
         candidate = {"repository": self.repo}
         publication = {"kind": "signed-repository", "id": 31,
@@ -1168,6 +1567,229 @@ class NativeAdapterTests(unittest.TestCase):
                 self.repo, title="review", body=pull["body"], **identity, allow_closed=True)
         self.assertEqual(result["state"], "closed")
         api.assert_not_called()
+
+    def _orphan_source_fixture(self, *, context_message=None, application_parent=None,
+                               application_tree=None, base_ref_sha=None, official_sha=None,
+                               comparison_status="ahead", refs=None,
+                               baseline_upstream="1" * 40, upstream="2" * 40,
+                               ahead_by=None, behind_by=0, total_commits=None,
+                               commits=None):
+        config, baseline_config, baseline_application = "9" * 40, "8" * 40, "7" * 40
+        application_sha, context_sha, tree = "3" * 40, "4" * 40, "5" * 40
+        branch_key = hashlib.sha256((config + "\0" + baseline_config).encode()).hexdigest()
+        branch = f"review/{upstream}-{branch_key}"
+        base_branch = f"review-base/{upstream}"
+        candidate_id = "6" * 64
+        tag, archive_sha = "20261020.01", "a" * 64
+        if ahead_by is None:
+            ahead_by = 1 if comparison_status == "ahead" else 0
+        if total_commits is None:
+            total_commits = ahead_by
+        if commits is None:
+            commits = [{"sha": upstream}] if ahead_by else []
+        source_lock = {"tag": tag, "commit": upstream, "archiveSha256": archive_sha}
+        source_lock_bytes = json.dumps(
+            source_lock, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        refs = ([{"ref": f"refs/heads/{branch}",
+                  "object": {"type": "commit", "sha": context_sha}}]
+                if refs is None else refs)
+        context = {"sha": context_sha, "tree": {"sha": tree},
+                   "parents": [{"sha": application_sha}],
+                   "message": context_message or f"fork-review-context:v1 {candidate_id}"}
+        application = {"sha": application_sha, "tree": {"sha": application_tree or tree},
+                       "parents": [{"sha": application_parent or upstream}]}
+        routes = {
+            f"repos/{self.repo}/git/matching-refs/heads/review": refs,
+            f"repos/{self.repo}/git/ref/heads/{base_branch}": {
+                "ref": f"refs/heads/{base_branch}",
+                "object": {"type": "commit", "sha": base_ref_sha or upstream}},
+            f"repos/{self.repo}/git/commits/{context_sha}": context,
+            f"repos/{self.repo}/git/commits/{application_sha}": application,
+            f"repos/{release.UPSTREAM}/releases/tags/{tag}": {
+                "tag_name": tag, "draft": False, "prerelease": False},
+            f"repos/{release.UPSTREAM}/commits/{tag}": {
+                "sha": official_sha or upstream},
+            f"repos/{release.UPSTREAM}/compare/{baseline_upstream}...{upstream}": {
+                "url": (f"https://api.github.com/repos/{release.UPSTREAM}/compare/"
+                        f"{baseline_upstream}...{upstream}"),
+                "status": comparison_status,
+                "base_commit": {"sha": baseline_upstream},
+                "merge_base_commit": {"sha": baseline_upstream},
+                "ahead_by": ahead_by, "behind_by": behind_by,
+                "total_commits": total_commits, "commits": commits},
+        }
+        baseline = {"candidate": {
+            "configuration_sha": baseline_config,
+            "application_sha": baseline_application,
+            "upstream_sha": baseline_upstream,
+        }}
+        return {"config": config, "baseline": baseline, "branch_key": branch_key,
+                "source_lock": source_lock_bytes, "routes": routes,
+                "source_commit": upstream}
+
+    def _select_orphan_source(self, fixture, *, pull=None):
+        def api(route, **_kwargs):
+            if route not in fixture["routes"]:
+                raise AssertionError(route)
+            return fixture["routes"][route]
+
+        pull_lookup = (patch.object(release, "find_review_pull", side_effect=pull)
+                       if callable(pull)
+                       else patch.object(release, "find_review_pull", return_value=pull))
+        with (patch.object(release, "pages", return_value=[]),
+              patch.object(release, "api", side_effect=api),
+              patch.object(release, "content", return_value=fixture["source_lock"]),
+              pull_lookup):
+            return release.matching_open_application_source(
+                self.repo, fixture["config"], fixture["baseline"])
+
+    def test_orphan_full_review_ref_resumes_exact_forward_source_lock(self):
+        fixture = self._orphan_source_fixture()
+        source = self._select_orphan_source(fixture)
+        self.assertEqual(source["commit"], fixture["source_commit"])
+        self.assertEqual(source["sourceLock"], fixture["source_lock"])
+        self.assertEqual(source["tag"], "20261020.01")
+        self.assertEqual(source["archiveSha256"], "a" * 64)
+        self.assertNotEqual(source["commit"], fixture["baseline"]["candidate"]["upstream_sha"])
+
+    def test_orphan_source_accepts_identical_and_truncated_forward_comparisons(self):
+        identical = self._orphan_source_fixture(
+            baseline_upstream="2" * 40, upstream="2" * 40,
+            comparison_status="identical")
+        self.assertEqual(self._select_orphan_source(identical)["commit"], "2" * 40)
+
+        truncated_ahead = self._orphan_source_fixture(
+            ahead_by=301, total_commits=301,
+            commits=[{} for _ in range(250)])
+        self.assertEqual(self._select_orphan_source(truncated_ahead)["commit"], "2" * 40)
+
+    def test_orphan_source_rejects_inconsistent_native_comparison_counts(self):
+        cases = (
+            {"ahead_by": 301, "total_commits": 300},
+            {"ahead_by": 1, "behind_by": 1, "total_commits": 1},
+            {"comparison_status": "ahead", "ahead_by": 0, "total_commits": 0,
+             "commits": []},
+        )
+        for options in cases:
+            with self.subTest(options=options):
+                fixture = self._orphan_source_fixture(**options)
+                with self.assertRaisesRegex(ValueError, "forward source"):
+                    self._select_orphan_source(fixture)
+
+        fixture = self._orphan_source_fixture()
+        compare_route = f"repos/{release.UPSTREAM}/compare/1{'1' * 39}...2{'2' * 39}"
+        fixture["routes"][compare_route]["url"] = "https://api.github.com/repos/wrong/compare/base...head"
+        with self.assertRaisesRegex(ValueError, "forward source"):
+            self._select_orphan_source(fixture)
+
+        identical_with_commits = self._orphan_source_fixture(
+            baseline_upstream="2" * 40, upstream="2" * 40,
+            comparison_status="identical", commits=[{"sha": "2" * 40}])
+        with self.assertRaisesRegex(ValueError, "forward source"):
+            self._select_orphan_source(identical_with_commits)
+
+    def test_orphan_full_review_ref_rejects_malformed_or_nonforward_source(self):
+        cases = (
+            ("wrong context message", {"context_message": "unbound context"}),
+            ("wrong context tree", {"application_tree": "f" * 40}),
+            ("wrong application parent", {"application_parent": "f" * 40}),
+            ("moved upstream base ref", {"base_ref_sha": "f" * 40}),
+            ("official tag moved", {"official_sha": "f" * 40}),
+            ("upstream behind signed baseline", {"comparison_status": "behind"}),
+        )
+        for label, options in cases:
+            with self.subTest(label=label):
+                fixture = self._orphan_source_fixture(**options)
+                with self.assertRaises(ValueError):
+                    self._select_orphan_source(fixture)
+
+        fixture = self._orphan_source_fixture()
+        source_lock = json.loads(fixture["source_lock"])
+        source_lock["commit"] = "f" * 40
+        fixture["source_lock"] = json.dumps(source_lock).encode("utf-8")
+        with self.assertRaisesRegex(ValueError, "source.lock"):
+            self._select_orphan_source(fixture)
+
+        fixture = self._orphan_source_fixture()
+        fixture["routes"][f"repos/{release.UPSTREAM}/releases/tags/20261020.01"]["prerelease"] = True
+        with self.assertRaisesRegex(ValueError, "stable official release"):
+            self._select_orphan_source(fixture)
+
+    def test_orphan_source_ignores_other_branch_keys_and_rejects_multiple_current_refs(self):
+        fixture = self._orphan_source_fixture()
+        upstream = fixture["source_commit"]
+        other = f"review/{upstream}-" + "f" * 64
+        fixture["routes"][f"repos/{self.repo}/git/matching-refs/heads/review"] = [{
+            "ref": f"refs/heads/{other}",
+            "object": {"type": "commit", "sha": "4" * 40},
+        }]
+        self.assertIsNone(self._select_orphan_source(fixture))
+
+        fixture = self._orphan_source_fixture()
+        refs = fixture["routes"][f"repos/{self.repo}/git/matching-refs/heads/review"]
+        refs.append({"ref": f"refs/heads/review/{'f' * 40}-{fixture['branch_key']}",
+                     "object": {"type": "commit", "sha": "e" * 40}})
+        with self.assertRaisesRegex(ValueError, "Multiple orphan"):
+            self._select_orphan_source(fixture)
+
+    def test_closed_old_full_ref_is_skipped_before_orphan_selection(self):
+        fixture = self._orphan_source_fixture()
+        old_upstream = "f" * 40
+        old_branch = f"review/{old_upstream}-{fixture['branch_key']}"
+        refs = fixture["routes"][f"repos/{self.repo}/git/matching-refs/heads/review"]
+        refs.insert(0, {"ref": f"refs/heads/{old_branch}",
+                        "object": {"type": "commit", "sha": "e" * 40}})
+
+        def pull_lookup(repo, base_branch, head_branch, *, states):
+            if head_branch == old_branch:
+                return {"state": "closed"}
+            return None
+
+        source = self._select_orphan_source(fixture, pull=pull_lookup)
+        self.assertEqual(source["commit"], fixture["source_commit"])
+        self.assertNotIn(
+            f"repos/{self.repo}/git/ref/heads/review-base/{old_upstream}",
+            fixture["routes"])
+
+    def test_open_full_pr_race_and_malformed_current_ref_fail_closed(self):
+        fixture = self._orphan_source_fixture()
+        with self.assertRaisesRegex(ValueError, "appeared during orphan-source selection"):
+            self._select_orphan_source(fixture, pull={"state": "open"})
+
+        fixture = self._orphan_source_fixture()
+        refs = fixture["routes"][f"repos/{self.repo}/git/matching-refs/heads/review"]
+        refs[0]["object"] = {"type": "tree", "sha": "4" * 40}
+        with self.assertRaisesRegex(ValueError, "no exact commit identity"):
+            self._select_orphan_source(fixture)
+
+    def test_orphan_full_review_context_mismatch_refuses_before_ref_writes(self):
+        branch = f"review/{'2' * 40}-{'a' * 64}"
+        expected = "3" * 40
+        calls = []
+
+        def run(*args, **kwargs):
+            calls.append((args, kwargs))
+            return f"{'4' * 40}\trefs/heads/{branch}\n"
+
+        with patch.object(release, "run", side_effect=run):
+            with self.assertRaisesRegex(ValueError, "reconstructed candidate context"):
+                release.verify_unpaired_review_context(Path("unused"), branch, expected)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], (
+            "git", "ls-remote", "--refs", "origin", f"refs/heads/{branch}"))
+
+        with patch.object(release, "run", return_value=(
+                f"{expected}\trefs/heads/{branch}\n")) as run:
+            self.assertTrue(release.verify_unpaired_review_context(
+                Path("unused"), branch, expected))
+        run.assert_called_once_with(
+            "git", "ls-remote", "--refs", "origin", f"refs/heads/{branch}",
+            cwd=Path("unused"))
+
+    def test_closed_review_pr_is_not_reclassified_as_an_orphan(self):
+        fixture = self._orphan_source_fixture()
+        closed = {"state": "closed"}
+        self.assertIsNone(self._select_orphan_source(fixture, pull=closed))
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import ast
 import base64
 import hashlib
 import inspect
@@ -10,7 +11,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import release
@@ -179,6 +181,54 @@ class ClosedPolicyBundleReuseTests(unittest.TestCase):
         self.assertIn("closed_policy_bundle_reuse(", source)
         self.assertIn("if pull is None:", source)
         self.assertIn("if not bundle_reuse:", source)
+
+    def test_prepare_closed_bundle_delta_lookup_uses_native_branch_and_missing_refuses(self):
+        source = inspect.getsource(release.prepare)
+        tree = ast.parse(source)
+        calls = [
+            node.value for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name)
+                    and target.id == "recovered_delta_pull" for target in node.targets)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "find_review_pull"
+        ]
+        self.assertEqual(len(calls), 1)
+        call = calls[0]
+        self.assertEqual(len(call.args), 3)
+        self.assertTrue(all(isinstance(argument, ast.Name) for argument in call.args))
+        fixture_values = {
+            "repo": self.repo,
+            "delta_base": self.baseline,
+            "delta_base_branch": self.delta["base"]["ref"],
+            "delta_branch": self.delta_branch,
+        }
+        lookup_args = [fixture_values[argument.id] for argument in call.args]
+        state_keywords = [keyword.value for keyword in call.keywords
+                          if keyword.arg == "states"]
+        self.assertEqual(len(state_keywords), 1)
+        states = ast.literal_eval(state_keywords[0])
+
+        self.assertEqual(self.full["state"], "closed")
+        self.assertEqual(self.delta["base"]["ref"], f"review-base/{self.baseline}")
+        expected_head = f"{self.repo.split('/')[0]}:{self.delta_branch}"
+
+        def read_native_pull(path):
+            query = parse_qs(urlsplit(path).query)
+            if (query.get("state") == ["closed"]
+                    and query.get("base") == [self.delta["base"]["ref"]]
+                    and query.get("head") == [expected_head]):
+                return [self.delta]
+            return []
+
+        with patch.object(release, "pages", side_effect=read_native_pull):
+            recovered = release.find_review_pull(*lookup_args, states=states)
+        self.assertIs(recovered, self.delta)
+
+        with patch.object(release, "pages", return_value=[]):
+            missing = release.find_review_pull(*lookup_args, states=states)
+        self.assertIsNone(missing)
 
 
 class WorkflowActionPinTests(unittest.TestCase):
@@ -692,6 +742,68 @@ class PolicyWorkflowAndSharedValidationTests(unittest.TestCase):
                               if step.get("id") == "policy-proposal-history-reuse")
         self.assertIn("policy_validation_reuse != 'true'", proposal_step["if"])
         self.assertIn("policy_validation_reuse == 'true'", proposal_reuse["if"])
+
+    def test_reviewed_policy_validation_uses_the_exact_proposal_private_pin(self):
+        installed = release.ROOT / ".github/workflows/google-osconfig-agent-inventory.yml"
+        template = release.PATCH_DIR / "workflows/google-osconfig-agent-inventory.yml"
+        self.assertEqual(installed.read_bytes(), template.read_bytes())
+        document = release.yaml_module().safe_load(installed.read_text(encoding="utf-8"))
+        prepare = document["jobs"]["prepare"]
+        self.assertIn("policy-review", prepare["needs"])
+        self.assertIn("policy-final-guard", prepare["needs"])
+        prepare_if = " ".join(prepare["if"].split())
+        self.assertIn("needs.policy-review.result == 'success'", prepare_if)
+        self.assertIn("needs.policy-review.outputs.ready == 'true'", prepare_if)
+        self.assertIn("needs.policy-final-guard.result == 'success'", prepare_if)
+
+        steps = prepare["steps"]
+        proposal_test = next(step for step in steps if step.get("id") == "policy-proposal")
+        proposal_if = " ".join(proposal_test["if"].split())
+        pin = next(step for step in steps
+                   if step.get("id") == "proposal-maintenance-pin")
+        private_checkout = next(step for step in steps
+                                if step.get("with", {}).get("path") == "machine-maintenance-proposal")
+        receipt = next(step for step in steps
+                       if step.get("name") == "Verify and receipt the reviewed proposal lifecycle source")
+        for step in (pin, private_checkout, receipt):
+            self.assertEqual(" ".join(step["if"].split()), proposal_if)
+
+        pin_source = pin.get("run", "")
+        self.assertIn('proposal_root = pathlib.Path("policy-candidate")', pin_source)
+        self.assertIn(
+            'relative_lock = pathlib.Path(".vps/google-osconfig-agent/patches/maintenance.lock.json")',
+            pin_source)
+        self.assertIn("object_pairs_hook=unique_object", pin.get("run", ""))
+        self.assertIn("for part in relative_lock.parts", pin.get("run", ""))
+        self.assertIn(
+            "path.resolve(strict=True).is_relative_to(proposal_root.resolve())",
+            pin.get("run", ""))
+        self.assertIn("module_sha256", pin.get("run", ""))
+        self.assertNotIn("trusted/.vps/google-osconfig-agent/patches/maintenance.lock.json",
+                         pin.get("run", ""))
+        self.assertEqual(private_checkout.get("with", {}).get("repository"),
+                         "warelik/machine-maintenance")
+        self.assertEqual(private_checkout.get("with", {}).get("ref"),
+                         "${{ steps.proposal-maintenance-pin.outputs.revision }}")
+        self.assertEqual(private_checkout.get("with", {}).get("persist-credentials"), False)
+        self.assertIn("ssh-key", private_checkout.get("with", {}))
+        self.assertEqual(receipt.get("env", {}).get("FORK_MAINTENANCE_ROOT"),
+                         "${{ github.workspace }}/machine-maintenance-proposal")
+        self.assertIn('git -C "$FORK_MAINTENANCE_ROOT" rev-parse HEAD', receipt.get("run", ""))
+        self.assertIn(
+            'git -C "$FORK_MAINTENANCE_ROOT" config --local --get-regexp',
+            receipt.get("run", ""))
+        self.assertIn("hashlib.sha256(source).hexdigest()", receipt.get("run", ""))
+
+        trusted_test = next(step for step in steps
+                            if step.get("name") == "Test trusted release gate after both reviews")
+        self.assertEqual(trusted_test.get("env", {}).get("FORK_MAINTENANCE_ROOT"),
+                         "${{ github.workspace }}/machine-maintenance")
+        self.assertEqual(proposal_test.get("env", {}).get("FORK_MAINTENANCE_ROOT"),
+                         "${{ github.workspace }}/machine-maintenance-proposal")
+
+        positions = [steps.index(step) for step in (pin, private_checkout, receipt, proposal_test)]
+        self.assertEqual(positions, sorted(positions))
 
     def test_workflow_copies_have_unique_yaml_keys_and_exact_resume_permissions(self):
         yaml = release.yaml_module()
@@ -2358,6 +2470,19 @@ class GitHubContentsBase64Tests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "invalid file content"):
                 release.content("owner/repo", "path", "sha")
 
+    def test_native_content_requires_exact_regular_blob_size_and_sha(self):
+        raw = b"source bytes\n"
+        response = {
+            "type": "file", "encoding": "base64",
+            "content": base64.b64encode(raw).decode("ascii"), "size": len(raw),
+            "sha": hashlib.sha1(f"blob {len(raw)}\0".encode() + raw).hexdigest(),
+        }
+        for field, value in (("size", len(raw) + 1), ("sha", "0" * 40)):
+            with self.subTest(field=field), patch.object(
+                    release, "api", return_value=dict(response, **{field: value})), \
+                    self.assertRaisesRegex(ValueError, "size or regular blob SHA"):
+                release.content("owner/repo", "path", "sha")
+
 
 class ExplicitMachineFindingDispositionTests(unittest.TestCase):
     repo = "owner/osconfig"
@@ -2903,6 +3028,7 @@ class FailedJobEvidenceTests(unittest.TestCase):
         self.assertIn("Completed job log unavailable: GitHub job-log request exceeded 45 seconds", evidence)
         self.assertIn(f"{self.repo}/actions/runs/{self.run_id}/jobs/94", evidence)
 
+
     def test_external_log_redirect_drops_the_github_api_token(self):
         handler = release.GitHubJobLogRedirect()
         request = release.Request(
@@ -2921,6 +3047,50 @@ class FailedJobEvidenceTests(unittest.TestCase):
         self.assertIsNone(handler.redirect_request(
             request, None, 302, "Found", {}, "http://logs.example.invalid/plain"
         ))
+
+
+class FinalRetryGrantPolicyRepairTests(unittest.TestCase):
+    repo = "warelik/osconfig"
+    config = "a" * 40
+
+    def evidence(self, reason, job="final-guard"):
+        return (f"Workflow run: https://github.com/{self.repo}/actions/runs/123\n\n"
+                f"Failed job: {job} (https://github.com/{self.repo}/actions/runs/123/jobs/456)\n"
+                f"OS Config package stopped: {reason}")
+
+    def test_only_the_exact_final_guard_retry_grant_refusals_are_classified(self):
+        for reason in release.FINAL_RETRY_GRANT_REASONS:
+            with self.subTest(reason=reason):
+                self.assertTrue(release.final_retry_grant_failure(self.evidence(reason)))
+        self.assertFalse(release.final_retry_grant_failure(
+            self.evidence(next(iter(release.FINAL_RETRY_GRANT_REASONS)), job="build-rpm")))
+        self.assertFalse(release.final_retry_grant_failure(
+            self.evidence("The latest stopped heavy failure needs one unique exact-candidate owner grant later")))
+        timestamped = self.evidence(next(iter(release.FINAL_RETRY_GRANT_REASONS))).replace(
+            "OS Config package stopped:",
+            "2026-10-21T09:33:14.1234567Z OS Config package stopped:")
+        self.assertTrue(release.final_retry_grant_failure(timestamped))
+        duplicate = self.evidence(next(iter(release.FINAL_RETRY_GRANT_REASONS)))
+        self.assertFalse(release.final_retry_grant_failure(
+            duplicate + "\n\nFailed job: publish (https://github.com/example/run)\nOther failure"))
+
+    def test_expected_owner_grant_wait_does_not_open_publisher_repair(self):
+        evidence = self.evidence(next(iter(release.FINAL_RETRY_GRANT_REASONS)))
+        with (patch.dict(os.environ, {"GITHUB_REPOSITORY": self.repo,
+                                      "GITHUB_SHA": self.config}),
+              patch.object(release, "api", return_value={"sha": self.config}),
+              patch.object(release, "report_permission_blocker") as blocker,
+              patch.object(release, "owner_token") as token,
+              patch.object(release, "open_policy_pull") as opened,
+              patch.object(release, "create_policy_pull") as created,
+              patch.object(release, "request_policy_task") as task):
+            release.request_policy_repair(evidence)
+        blocker.assert_not_called()
+        token.assert_not_called()
+        opened.assert_not_called()
+        created.assert_not_called()
+        task.assert_not_called()
+
 
 class PaginationAndApiDiagnosticsTests(unittest.TestCase):
     repo = "warelik/osconfig"
@@ -3343,6 +3513,617 @@ class PolicyLogPrivacyTests(unittest.TestCase):
             returncode=1)
         self.assertEqual(summary,
                          "Policy tests [test_maintenance_adapter.py, test_release.py]: FAIL exit=1")
+
+
+class OpenApplicationSourceContinuityTests(unittest.TestCase):
+    repo = "warelik/osconfig"
+    config = "a" * 40
+    baseline_config = "b" * 40
+    baseline_application = "c" * 40
+    upstream = "d" * 40
+    application = "e" * 40
+    delta_sha = "f" * 40
+    review_source = "1" * 40
+
+    def write_recipe_tree(self, root, source_lock):
+        root = Path(root)
+        for relative in release.PRODUCT_RECIPE_INPUTS:
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(source_lock if relative == "source.lock"
+                             else b"trusted recipe input:" + relative.encode("utf-8"))
+
+    def recipe_sha(self, source_lock):
+        with tempfile.TemporaryDirectory() as temporary:
+            self.write_recipe_tree(temporary, source_lock)
+            return release.recipe_digest(temporary)
+
+    def pair(self):
+        source_lock = (json.dumps({
+            "tag": "20261015.00", "commit": self.upstream,
+            "archiveSha256": "4" * 64,
+        }, indent=2) + "\n").encode("utf-8")
+        candidate = {
+            "schema": 1, "repository": self.repo, "upstream_sha": self.upstream,
+            "application_sha": self.application, "configuration_sha": self.delta_sha,
+            "patchset_sha256": "2" * 64, "recipe_sha256": self.recipe_sha(source_lock),
+            "platform": "fedora-44/x86_64",
+        }
+        candidate_id = release.frozen_candidate_identity(candidate)
+        branch_key = hashlib.sha256(
+            (self.config + "\0" + self.baseline_config).encode()).hexdigest()
+        full_branch = f"review/{self.upstream}-{branch_key}"
+        delta_branch = f"review/changes-{self.delta_sha}"
+        full_state = {
+            "schema": 2, "sourceConfig": self.config, "upstream": self.upstream,
+            "tag": "20261015.00", "archiveSha256": "4" * 64,
+            "seed": self.review_source, "candidate": candidate,
+            "candidateId": candidate_id, "applicationSha": self.application,
+            "reviewSourceSha": self.review_source,
+            "baselineConfig": self.baseline_config, "deltaSha": self.delta_sha,
+            "deltaPr": 102,
+        }
+        full = {
+            "number": 101, "state": "open",
+            "user": {"login": self.repo.split("/", 1)[0], "type": "User"},
+            "base": {"ref": f"review-base/{self.upstream}", "sha": self.upstream,
+                     "repo": {"full_name": self.repo}},
+            "head": {"ref": full_branch, "sha": self.review_source,
+                     "repo": {"full_name": self.repo}},
+            "body": "<!-- osconfig-candidate:v2 "
+                    + json.dumps(full_state, sort_keys=True, separators=(",", ":")) + " -->",
+        }
+        delta = {
+            "number": 102, "state": "open",
+            "base": {"ref": f"review-base/{self.baseline_config}", "sha": self.baseline_config,
+                     "repo": {"full_name": self.repo}},
+            "head": {"ref": delta_branch, "sha": self.delta_sha,
+                     "repo": {"full_name": self.repo}},
+            "body": "<!-- osconfig-delta:v2 " + json.dumps({
+                "candidateId": candidate_id, "candidate": candidate,
+                "sourceConfig": self.config, "baselineConfig": self.baseline_config,
+            }, sort_keys=True, separators=(",", ":")) + " -->",
+        }
+        refs = {
+            f"refs/heads/review-base/{self.upstream}": self.upstream,
+            f"refs/heads/{full_branch}": self.review_source,
+            f"refs/heads/review-base/{self.baseline_config}": self.baseline_config,
+            f"refs/heads/{delta_branch}": self.delta_sha,
+        }
+        return full, delta, refs, source_lock
+
+    def check(self, pulls, delta, refs, source_lock):
+        def read_api(path, **_kwargs):
+            delta_path = f"repos/{self.repo}/pulls/102"
+            if path == delta_path:
+                return delta
+            prefix = f"repos/{self.repo}/git/ref/heads/"
+            if path.startswith(prefix):
+                name = "refs/heads/" + path[len(prefix):]
+                return {"ref": name, "object": {"type": "commit", "sha": refs[name]}}
+            raise AssertionError(f"Unexpected API path: {path}")
+
+        def read_content(repo, path, ref):
+            if (repo, path, ref) != (self.repo, release.PREFIX + "source.lock", self.application):
+                raise AssertionError("Candidate lock was not read from its exact application commit")
+            if source_lock is None:
+                raise AssertionError("No source lock was expected for this nonmatching PR")
+            return source_lock
+
+        class Core:
+            @staticmethod
+            def candidate_identity(value):
+                return release.frozen_candidate_identity(value)
+
+        with patch.object(release, "pages", return_value=pulls), \
+                patch.object(release, "api", side_effect=read_api), \
+                patch.object(release, "content", side_effect=read_content), \
+                patch.object(release, "find_review_pull", return_value=delta), \
+                patch.object(release, "_orphan_application_source", return_value=None), \
+                patch.object(release, "lifecycle_module", return_value=Core):
+            result = release.matching_open_application_source(
+                self.repo, self.config,
+                {"candidate": {"configuration_sha": self.baseline_config,
+                               "application_sha": self.baseline_application,
+                               "upstream_sha": self.upstream}})
+        return result
+
+    def test_pending_pair_holds_its_exact_source_when_latest_can_advance(self):
+        full, delta, refs, source_lock = self.pair()
+        self.assertEqual(self.check([full], delta, refs, source_lock), {
+            "tag": "20261015.00", "commit": self.upstream, "archiveSha256": "4" * 64,
+            "sourceLock": source_lock,
+        })
+
+    def test_held_raw_source_lock_preserves_candidate_recipe_identity(self):
+        full, delta, refs, source_lock = self.pair()
+        held = self.check([full], delta, refs, source_lock)
+        candidate = json.loads(release.CANDIDATE_MARKER.search(full["body"]).group(1))["candidate"]
+        self.assertEqual(held["sourceLock"], source_lock)
+        with tempfile.TemporaryDirectory() as temporary:
+            self.write_recipe_tree(temporary, held["sourceLock"])
+            recipe_root = Path(temporary)
+            self.assertEqual(release.recipe_digest(recipe_root), candidate["recipe_sha256"])
+            source_lock_path = recipe_root / "source.lock"
+            sorted_lock = json.dumps(json.loads(source_lock.decode("utf-8")),
+                                     sort_keys=True, separators=(",", ":")).encode() + b"\n"
+            self.assertNotEqual(sorted_lock, source_lock)
+            source_lock_path.write_bytes(sorted_lock)
+            self.assertNotEqual(release.recipe_digest(recipe_root), candidate["recipe_sha256"])
+            source_lock_path.write_bytes(held["sourceLock"])
+            self.assertEqual(release.recipe_digest(recipe_root), candidate["recipe_sha256"])
+
+    def test_existing_manual_candidate_id_branch_is_also_held(self):
+        full, delta, refs, source_lock = self.pair()
+        identity = json.loads(release.CANDIDATE_MARKER.search(full["body"]).group(1))
+        old_branch = full["head"]["ref"]
+        full["head"]["ref"] = f"review/{self.upstream}-{identity['candidateId']}"
+        refs.pop(f"refs/heads/{old_branch}")
+        refs[f"refs/heads/{full['head']['ref']}"] = self.review_source
+        self.assertEqual(self.check([full], delta, refs, source_lock), {
+            "tag": "20261015.00", "commit": self.upstream, "archiveSha256": "4" * 64,
+            "sourceLock": source_lock,
+        })
+
+    def test_no_pair_selects_latest_and_stale_config_or_baseline_does_not_hold(self):
+        self.assertIsNone(self.check([], None, {}, None))
+        for field, stale in (("sourceConfig", "5" * 40),
+                             ("baselineConfig", "6" * 40)):
+            with self.subTest(field=field):
+                full, delta, refs, source_lock = self.pair()
+                identity_text = release.CANDIDATE_MARKER.search(full["body"]).group(1)
+                identity = json.loads(identity_text)
+                identity[field] = stale
+                full["body"] = "<!-- osconfig-candidate:v2 " + json.dumps(
+                    identity, sort_keys=True, separators=(",", ":")) + " -->"
+                old_config = stale if field == "sourceConfig" else self.config
+                old_baseline = stale if field == "baselineConfig" else self.baseline_config
+                old_key = hashlib.sha256((old_config + "\0" + old_baseline).encode()).hexdigest()
+                full["head"]["ref"] = f"review/{self.upstream}-{old_key}"
+                self.assertIsNone(self.check([full], delta, refs, source_lock))
+
+    def test_current_candidate_rejects_malformed_duplicate_and_changed_refs(self):
+        full, delta, refs, source_lock = self.pair()
+        malformed = dict(full, body=full["body"] + "\n" + full["body"])
+        with self.assertRaisesRegex(ValueError, "unique identity marker"):
+            self.check([malformed], delta, refs, source_lock)
+
+        duplicate = dict(full, number=103)
+        with self.assertRaisesRegex(ValueError, "Multiple open OS Config candidate pairs"):
+            self.check([full, duplicate], delta, refs, source_lock)
+
+        changed_refs = dict(refs)
+        changed_refs[f"refs/heads/{full['head']['ref']}"] = "9" * 40
+        with self.assertRaisesRegex(ValueError, "full review PR or refs changed"):
+            self.check([full], delta, changed_refs, source_lock)
+
+    def test_foreign_or_unauthorized_malformed_candidate_prs_are_ignored_before_native_reads(self):
+        full, _delta, _refs, _source_lock = self.pair()
+        foreign = dict(full, body="<!-- osconfig-candidate:v2 {malformed")
+        foreign["head"] = dict(full["head"], repo={"full_name": "fork/osconfig"})
+        unauthorized = dict(full, body="")
+        unauthorized["user"] = {"login": "other-user", "type": "User"}
+
+        with patch.object(release, "pages", return_value=[foreign, unauthorized]), \
+                patch.object(release, "api") as native_api, \
+                patch.object(release, "content") as native_content, \
+                patch.object(release, "find_review_pull") as delta_lookup, \
+                patch.object(release, "_orphan_application_source", return_value=None), \
+                patch.object(release, "lifecycle_module") as lifecycle:
+            result = release.matching_open_application_source(
+                self.repo, self.config,
+                {"candidate": {"configuration_sha": self.baseline_config,
+                               "application_sha": self.baseline_application,
+                               "upstream_sha": self.upstream}})
+        self.assertIsNone(result)
+        native_api.assert_not_called()
+        native_content.assert_not_called()
+        delta_lookup.assert_not_called()
+        lifecycle.assert_not_called()
+
+
+class ApplicationSourceContinuityWorkflowTests(unittest.TestCase):
+    def test_source_pair_is_checked_before_latest_and_locked_recipe_is_staged_verbatim(self):
+        path = release.ROOT / release.WORKFLOW_PATH
+        document = release.yaml_module().safe_load(path.read_text(encoding="utf-8"))
+        steps = document["jobs"]["candidate-source"]["steps"]
+        preflight = next(index for index, step in enumerate(steps)
+                         if step.get("id") == "source-preflight")
+        latest = next(index for index, step in enumerate(steps)
+                      if step.get("name") == "Resolve latest upstream release")
+        held = next(step for step in steps
+                    if step.get("name") == "Prepare the exact held upstream source")
+        self.assertLess(preflight, latest)
+        self.assertIn("application-source-preflight", steps[preflight]["run"])
+        self.assertIn("steps.source-preflight.outputs.held != 'true'", steps[latest]["if"])
+        self.assertIn("steps.source-preflight.outputs.held == 'true'", held["if"])
+        self.assertIn("install -m 700 .vps/google-osconfig-agent/patches/prepare-source.sh", held["run"])
+        self.assertIn("cmp -- .vps/google-osconfig-agent/patches/prepare-source.sh", held["run"])
+        self.assertIn("SOURCE_LOCK_BASE64", held["env"])
+        self.assertIn("base64.b64decode", held["run"])
+        self.assertIn("stream.write(source_lock)", held["run"])
+        self.assertIn("bash \"$locked_tool/prepare-source.sh\" --locked", held["run"])
+
+
+class NativeFinalHistoryReservationActorTests(unittest.TestCase):
+    repo = "warelik/osconfig"
+    current_candidate = {"candidate": "current"}
+    prior_candidate = {"candidate": "prior"}
+    current_id = "a" * 64
+    prior_id = "b" * 64
+    workflow_sha = "c" * 40
+
+    def reservation(self, actor, *, malformed=False, comment_id=51):
+        final_value = {
+            "schema": 1, "candidate_id": self.prior_id,
+            "run_id": 701, "run_attempt": 1, "workflow_sha": self.workflow_sha,
+        }
+        candidate_marker = (
+            "<!-- fork-candidate:v1 "
+            + json.dumps(self.prior_candidate, sort_keys=True, separators=(",", ":"))
+            + " -->"
+        )
+        final_marker = ("<!-- fork-final:v1 {malformed} -->" if malformed else
+                        "<!-- fork-final:v1 "
+                        + json.dumps(final_value, sort_keys=True, separators=(",", ":"))
+                        + " -->")
+        return {
+            "id": comment_id,
+            "user": actor,
+            "issue_url": f"https://api.github.com/repos/{self.repo}/issues/18",
+            "created_at": "2026-10-20T12:01:00Z",
+            "updated_at": "2026-10-20T12:01:00Z",
+            "body": candidate_marker + "\n" + final_marker,
+        }
+
+    def retry_grant(self, actor, *, malformed=False, comment_id=71):
+        marker = {
+            "schema": 1, "candidate_id": self.current_id,
+            "previous_run_id": 701, "previous_run_attempt": 1,
+        }
+        body = ("<!-- fork-final-retry:v1 {malformed} -->" if malformed else
+                "<!-- fork-final-retry:v1 "
+                + json.dumps(marker, sort_keys=True, separators=(",", ":")) + " -->")
+        return {
+            "id": comment_id,
+            "user": actor,
+            "issue_url": f"https://api.github.com/repos/{self.repo}/issues/17",
+            "created_at": "2026-10-20T12:01:00Z",
+            "updated_at": "2026-10-20T12:01:00Z",
+            "body": body,
+        }
+
+    def gather(self, comments, *, runs=(), jobs=()):
+        def read_pages(path):
+            if path == f"repos/{self.repo}/issues/comments":
+                return comments
+            if path.endswith("/jobs"):
+                return list(jobs)
+            raise AssertionError(f"Unexpected paginated route: {path}")
+
+        def read_api(path):
+            if path == f"repos/{self.repo}/actions/runs/701/attempts/1":
+                return {
+                    "id": 701, "run_attempt": 1,
+                    "updated_at": "2026-10-20T12:03:00Z",
+                    "head_sha": self.workflow_sha,
+                }
+            raise AssertionError(f"Unexpected API route: {path}")
+
+        class Core:
+            @staticmethod
+            def candidate_identity(candidate):
+                if candidate == self.current_candidate:
+                    return self.current_id
+                if candidate == self.prior_candidate:
+                    return self.prior_id
+                raise AssertionError("Unexpected candidate identity input")
+
+        with patch.object(release, "lifecycle_module", return_value=Core), \
+                patch.object(release, "pages", side_effect=read_pages), \
+                patch.object(release, "native_workflow_runs", return_value=list(runs)), \
+                patch.object(release, "api", side_effect=read_api), \
+                patch.dict(os.environ, {"CANDIDATE_PR": "17"}):
+            return release.native_final_history(
+                self.repo, self.current_candidate,
+                {"published_at": "2026-10-20T12:00:00Z"},
+                current_run_id=999, current_run_attempt=1)
+
+    def test_untrusted_valid_duplicate_and_malformed_reservations_do_not_enter_history(self):
+        attacker = {"login": "public-user", "type": "User"}
+        comments = [
+            self.reservation(attacker, comment_id=51),
+            self.reservation(attacker, comment_id=52),
+            self.reservation(attacker, malformed=True, comment_id=53),
+        ]
+        history = self.gather(comments)
+        self.assertTrue(history["complete"])
+        self.assertEqual(history["attempts"], [])
+
+    def test_malformed_trusted_reservation_makes_native_history_incomplete(self):
+        trusted_bot = {"login": "github-actions[bot]", "type": "Bot"}
+        history = self.gather([self.reservation(trusted_bot, malformed=True)])
+        self.assertFalse(history["complete"])
+        self.assertEqual(history["attempts"], [])
+
+    def test_untrusted_retry_grant_markers_are_ignored_before_parsing(self):
+        attacker = {"login": "public-user", "type": "User"}
+        history = self.gather([
+            self.retry_grant(attacker, comment_id=71),
+            self.retry_grant(attacker, malformed=True, comment_id=72),
+        ])
+        self.assertTrue(history["complete"])
+        self.assertEqual(history["grants"], [])
+
+    def test_owner_retry_grant_is_counted_and_malformed_owner_grant_fails_closed(self):
+        owner = {"login": "warelik", "type": "User"}
+        accepted = self.gather([self.retry_grant(owner)])
+        self.assertTrue(accepted["complete"])
+        self.assertEqual([grant["id"] for grant in accepted["grants"]], [71])
+
+        malformed = self.gather([self.retry_grant(owner, malformed=True)])
+        self.assertFalse(malformed["complete"])
+        self.assertEqual(malformed["grants"], [])
+
+    def test_trusted_historical_reservation_still_counts_its_exact_attempt(self):
+        trusted_bot = {"login": "github-actions[bot]", "type": "Bot"}
+        jobs = [
+            {"id": 7011, "name": "build-rpm", "status": "completed",
+             "conclusion": "success", "started_at": "2026-10-20T12:01:30Z",
+             "completed_at": "2026-10-20T12:02:00Z", "steps": [{"name": "Build"}]},
+            {"id": 7012, "name": "sign", "status": "completed",
+             "conclusion": "success", "started_at": "2026-10-20T12:02:00Z",
+             "completed_at": "2026-10-20T12:03:00Z", "steps": [{"name": "Sign"}]},
+        ]
+        history = self.gather(
+            [self.reservation(trusted_bot)],
+            runs=[{"id": 701, "run_attempt": 1,
+                   "updated_at": "2026-10-20T12:03:00Z"}],
+            jobs=jobs)
+        self.assertTrue(history["complete"])
+        self.assertEqual(len(history["attempts"]), 1)
+        attempt = history["attempts"][0]
+        self.assertEqual(attempt["candidate_id"], self.prior_id)
+        self.assertEqual((attempt["run"]["id"], attempt["run"]["run_attempt"]), (701, 1))
+        self.assertEqual(attempt["reservation"]["id"], 51)
+        self.assertEqual([job["name"] for job in attempt["jobs"]], ["build-rpm", "sign"])
+
+
+class CurrentFinalReservationActorTests(unittest.TestCase):
+    repo = "warelik/osconfig"
+    candidate = {"candidate": "current"}
+    candidate_id = "a" * 64
+    workflow_sha = "c" * 40
+
+    def comment(self, actor, *, malformed=False, comment_id=81):
+        candidate_marker = (
+            "<!-- fork-candidate:v1 "
+            + json.dumps(self.candidate, sort_keys=True, separators=(",", ":"))
+            + " -->"
+        )
+        final = {
+            "schema": 1, "candidate_id": self.candidate_id,
+            "run_id": 701, "run_attempt": 2, "workflow_sha": self.workflow_sha,
+        }
+        final_marker = ("<!-- fork-final:v1 {malformed} -->" if malformed else
+                        "<!-- fork-final:v1 "
+                        + json.dumps(final, sort_keys=True, separators=(",", ":"))
+                        + " -->")
+        return {"id": comment_id, "user": actor,
+                "body": candidate_marker + "\n" + final_marker}
+
+    def read(self, comments):
+        class Core:
+            @staticmethod
+            def candidate_identity(value):
+                if value == self.candidate:
+                    return self.candidate_id
+                raise AssertionError("Unexpected final-reservation candidate")
+
+        with patch.object(release, "lifecycle_module", return_value=Core), \
+                patch.object(release, "pages", return_value=comments):
+            return release.current_final_reservation(
+                self.repo, 17, self.candidate, 701, 2, self.workflow_sha)
+
+    def test_public_markers_cannot_shadow_or_malformed_fail_current_reservation(self):
+        outsider = {"login": "public-user", "type": "User"}
+        self.assertIsNone(self.read([self.comment(outsider)]))
+        self.assertIsNone(self.read([self.comment(outsider, malformed=True)]))
+        workflow_bot = {"login": "github-actions[bot]", "type": "Bot"}
+        trusted = self.comment(workflow_bot, comment_id=83)
+        self.assertIs(self.read([
+            self.comment(outsider),
+            self.comment(outsider, malformed=True, comment_id=82),
+            trusted,
+        ]), trusted)
+
+    def test_malformed_trusted_current_reservation_fails_closed(self):
+        workflow_bot = {"login": "github-actions[bot]", "type": "Bot"}
+        with self.assertRaisesRegex(ValueError, "Trusted current final reservation metadata is malformed"):
+            self.read([self.comment(workflow_bot, malformed=True)])
+        valid = self.comment(workflow_bot, comment_id=83)
+        with self.assertRaisesRegex(ValueError, "Trusted current final reservation metadata is malformed"):
+            self.read([self.comment(workflow_bot, malformed=True), valid])
+        with self.assertRaisesRegex(ValueError, "duplicate final reservations"):
+            self.read([valid, self.comment(workflow_bot, comment_id=84)])
+
+    def test_exact_trusted_current_reservation_still_matches(self):
+        workflow_bot = {"login": "github-actions[bot]", "type": "Bot"}
+        comment = self.comment(workflow_bot)
+        self.assertIs(self.read([comment]), comment)
+
+
+class PostPublicationAdoptionTests(unittest.TestCase):
+    repo = "warelik/osconfig"
+
+    def manifest(self):
+        candidate = {
+            "schema": 1, "repository": self.repo,
+            "upstream_sha": "a" * 40, "application_sha": "b" * 40,
+            "configuration_sha": "c" * 40, "patchset_sha256": "d" * 64,
+            "recipe_sha256": "e" * 64, "platform": "fedora-44/x86_64",
+        }
+        old_baseline = {
+            "repository": self.repo, "candidate": {**candidate, "configuration_sha": "f" * 40},
+        }
+        config, full_sha = "1" * 40, "2" * 40
+        return {
+            "candidate": candidate,
+            "candidateApplicationSha": candidate["application_sha"],
+            "candidateIdentity": "3" * 64,
+            "upstreamCommit": candidate["upstream_sha"],
+            "candidateSha": full_sha,
+            "configSha": config,
+            "upstreamArchiveSha256": "4" * 64,
+            "patchSha256": "5" * 64,
+            "specSha256": "6" * 64,
+            "acceptedBaselineProof": {
+                "variable": {"value": json.dumps(old_baseline)},
+            },
+            "reviewContexts": {
+                "full": {"review_sha": full_sha},
+                "delta": {"review_sha": candidate["configuration_sha"]},
+            },
+        }
+
+    def test_postpublication_transition_is_enabled_only_after_exact_signed_manifest(self):
+        manifest = self.manifest()
+        config = manifest["configSha"]
+        published = {
+            key: manifest[key] for key in (
+                "candidateSha", "upstreamCommit", "upstreamArchiveSha256",
+                "patchSha256", "specSha256",
+            )
+        }
+        settings = {
+            "github_owner": "warelik", "github_repo": "osconfig",
+            "signing_fingerprint": "A" * 40,
+        }
+        events = []
+        signed = Mock(side_effect=lambda *_args: events.append("signed") or published)
+        transition = Mock(side_effect=lambda *_args: (
+            events.append("transition") or (
+                "exact-native-value",
+                {"published_at": "2026-10-21T12:00:00Z"},
+                "7" * 64,
+            )
+        ))
+        pair = {"state": "ready", "complete": True}
+        pair_check = Mock(side_effect=lambda *_args, **_kwargs:
+                          events.append("review") or ({}, {}, pair))
+        with tempfile.TemporaryDirectory(prefix="osconfig-postpublication-review-") as temporary:
+            candidate_dir = Path(temporary)
+            (candidate_dir / "candidate-manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8")
+            with patch.dict(os.environ, {
+                    "GITHUB_REPOSITORY": self.repo,
+                    "OSCONFIG_RPM_SIGNING_FINGERPRINT": "A" * 40,
+                }, clear=False), \
+                    patch.object(release, "repository_settings", return_value=settings), \
+                    patch.object(release, "api", return_value={"sha": config}), \
+                    patch.object(release, "verify_manifest_files", signed), \
+                    patch.object(release, "accepted_baseline_checkpoint", transition), \
+                    patch.object(release, "review_pair_status", pair_check):
+                result = release.verify_candidate_artifact(
+                    candidate_dir, Path(temporary) / "pages", allow_default_advanced=True)
+        self.assertEqual(events, ["signed", "transition", "review"])
+        self.assertEqual(pair_check.call_args.kwargs["signed_transition"], {
+            "value": "exact-native-value", "published_at": "2026-10-21T12:00:00Z",
+        })
+        self.assertEqual(result[0], self.repo)
+
+        bad_published = {**published, "candidateSha": "8" * 40}
+        signed.reset_mock(side_effect=True, return_value=True)
+        signed.side_effect = lambda *_args: events.append("signed-bad") or bad_published
+        transition.reset_mock()
+        pair_check.reset_mock()
+        events.clear()
+        with tempfile.TemporaryDirectory(prefix="osconfig-postpublication-wrong-manifest-") as temporary:
+            candidate_dir = Path(temporary)
+            (candidate_dir / "candidate-manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8")
+            with patch.dict(os.environ, {
+                    "GITHUB_REPOSITORY": self.repo,
+                    "OSCONFIG_RPM_SIGNING_FINGERPRINT": "A" * 40,
+                }, clear=False), \
+                    patch.object(release, "repository_settings", return_value=settings), \
+                    patch.object(release, "api", return_value={"sha": config}), \
+                    patch.object(release, "verify_manifest_files", signed), \
+                    patch.object(release, "accepted_baseline_checkpoint", transition), \
+                    patch.object(release, "review_pair_status", pair_check):
+                with self.assertRaisesRegex(ValueError, "does not identify the exact reviewed candidate"):
+                    release.verify_candidate_artifact(
+                        candidate_dir, Path(temporary) / "pages", allow_default_advanced=True)
+        self.assertEqual(events, ["signed-bad"])
+        transition.assert_not_called()
+        pair_check.assert_not_called()
+
+
+class AlreadyAdoptedProductInputTests(unittest.TestCase):
+    repo = "warelik/osconfig"
+
+    def run_adopt(self, *, mismatched_path=None):
+        package_evr = next(
+            line.partition("=")[2]
+            for line in (release.ROOT / release.REPOSITORY_CONF).read_text(encoding="utf-8").splitlines()
+            if line.startswith("minimum_evr=")
+        )
+        manifest = {"configSha": "a" * 40, "candidatePr": 71, "deltaPr": 72,
+                    "reviewContexts": {"full": {}, "delta": {}}}
+        latest = "b" * 40
+        settings = {"minimum_evr": package_evr}
+        published = {"packageEvr": package_evr}
+        files = {}
+        with tempfile.TemporaryDirectory(prefix="osconfig-already-adopted-inputs-") as temporary:
+            root = Path(temporary)
+            candidate_dir = root / "candidate"
+            candidate_dir.mkdir()
+            for relative in (*release.PRODUCT_BUILD_INPUTS, "source.lock"):
+                payload = f"candidate bytes for {relative}\n".encode("utf-8")
+                (candidate_dir / Path(relative).name).write_bytes(payload)
+                files[release.PREFIX + relative] = payload
+            config_lines = (release.ROOT / release.REPOSITORY_CONF).read_text(
+                encoding="utf-8").splitlines()
+            minimum = [index for index, line in enumerate(config_lines)
+                       if line.startswith("minimum_evr=")]
+            self.assertEqual(len(minimum), 1)
+            config_lines[minimum[0]] = f"minimum_evr={package_evr}"
+            files[release.REPOSITORY_CONF] = ("\n".join(config_lines) + "\n").encode()
+            if mismatched_path is not None:
+                files[mismatched_path] = b"different package input\n"
+
+            def content(repo, path, revision):
+                self.assertEqual((repo, revision), (self.repo, release.DEFAULT_BRANCH))
+                return files[path]
+
+            advanced = Mock()
+            closed = Mock()
+            with patch.dict(os.environ, {"GITHUB_REPOSITORY": self.repo}, clear=False), \
+                    patch.object(release, "verify_candidate_artifact",
+                                 return_value=(self.repo, manifest, settings, "A" * 40,
+                                               published, latest)), \
+                    patch.object(release, "api", return_value={"sha": latest}), \
+                    patch.object(release, "content", side_effect=content), \
+                    patch.object(release, "owner_token", return_value="fixture-token"), \
+                    patch.object(release, "advance_accepted_baseline", advanced), \
+                    patch.object(release, "close_candidate", closed):
+                if mismatched_path is None:
+                    release.adopt(candidate_dir, root / "pages")
+                else:
+                    with self.assertRaisesRegex(
+                            ValueError, "Default branch advanced with different package state"):
+                        release.adopt(candidate_dir, root / "pages")
+            return advanced, closed
+
+    def test_already_adopted_acceptance_checks_all_six_signed_package_inputs(self):
+        advanced, closed = self.run_adopt()
+        advanced.assert_called_once()
+        closed.assert_called_once()
+        for relative in (*release.PRODUCT_BUILD_INPUTS, "source.lock"):
+            with self.subTest(path=relative):
+                advanced, closed = self.run_adopt(mismatched_path=release.PREFIX + relative)
+                advanced.assert_not_called()
+                closed.assert_not_called()
 
 
 if __name__ == "__main__":

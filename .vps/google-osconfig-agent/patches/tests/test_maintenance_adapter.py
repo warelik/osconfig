@@ -1,6 +1,8 @@
 """Native identity and private-bundle integration boundaries."""
 import hashlib
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import types
@@ -54,6 +56,95 @@ class FinalAuthorizationCheckoutTests(unittest.TestCase):
                             (private[0].get("with") or {}).get("persist-credentials"),
                             False,
                         )
+
+
+class LegacyPublishedSourceIdentityTests(unittest.TestCase):
+    def test_legacy_signed_tree_retains_checker_without_changing_current_recipe(self):
+        # Real local Git trees reproduce the vps137 omission: its accepted source
+        # contains the former checker as well as today's six product inputs.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            origin = root / "signed-source"
+            origin.mkdir()
+            original_run = release.run
+            environment = {
+                "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_AUTHOR_NAME": "github-actions[bot]",
+                "GIT_AUTHOR_EMAIL": "41898282+github-actions[bot]@users.noreply.github.com",
+                "GIT_COMMITTER_NAME": "github-actions[bot]",
+                "GIT_COMMITTER_EMAIL": "41898282+github-actions[bot]@users.noreply.github.com",
+                "GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z",
+                "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z",
+            }
+            with patch.dict(os.environ, environment):
+                original_run("git", "init", str(origin))
+                original_run("git", "config", "core.hooksPath", "/dev/null", cwd=origin)
+                source = origin / "main.go"
+                source.write_text("package main\nconst version = 0\n")
+                original_run("git", "add", "main.go", cwd=origin)
+                original_run("git", "commit", "-m", "upstream fixture", cwd=origin)
+                upstream = original_run("git", "rev-parse", "HEAD", cwd=origin)
+                self.assertEqual(len(release.FULL_PRODUCT_PATHS), 6)
+                for relative in release.FULL_PRODUCT_PATHS:
+                    path = origin / relative
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("fixture recipe input\n")
+                    if relative.endswith(".sh"):
+                        path.chmod(0o755)
+                patch_path = origin / release.PATCH_REL
+                patch_path.write_text(
+                    "--- a/main.go\n+++ b/main.go\n@@ -1,2 +1,2 @@\n"
+                    " package main\n-const version = 0\n+const version = 1\n")
+                checker = origin / release.PREFIX / "check-upstream.sh"
+                checker.write_text("#!/bin/sh\nexit 0\n")
+                checker.chmod(0o755)
+                source.write_text("package main\nconst version = 1\n")
+                original_run("git", "add", ".", cwd=origin)
+                original_run("git", "commit", "-m", "signed legacy source", cwd=origin)
+                signed = original_run("git", "rev-parse", "HEAD", cwd=origin)
+                tree = original_run("git", "rev-parse", "HEAD^{tree}", cwd=origin)
+                expected = original_run(
+                    "git", "commit-tree", tree, "-p", upstream, cwd=origin,
+                    input="OS Config assembled application source\n")
+                manifest = {
+                    "upstreamCommit": upstream, "candidateSha": signed,
+                    "configSha": "c" * 40, "upstreamArchiveSha256": "d" * 64,
+                    "patchSha256": release.digest(patch_path),
+                    "specSha256": release.digest(origin / release.PREFIX /
+                                                  "rpm/google-osconfig-agent.spec"),
+                }
+                core = types.SimpleNamespace(
+                    candidate_identity=lambda value: hashlib.sha256(
+                        json.dumps(value, sort_keys=True).encode()).hexdigest(),
+                    patch_digest=lambda entries: hashlib.sha256(entries[0][1]).hexdigest())
+
+                def local_transport(*args, **kwargs):
+                    if args[:3] == ("git", "remote", "add"):
+                        args = (*args[:4], str(origin))
+                    return original_run(*args, **kwargs)
+
+                with (patch.object(release, "run", side_effect=local_transport),
+                      patch.object(release, "lifecycle_module", return_value=core)):
+                    candidate = release.published_candidate_identity(
+                        "warelik/osconfig", manifest, root / "reconstructed")
+                    self.assertEqual(candidate["application_sha"], expected)
+                    self.assertEqual(candidate["configuration_sha"], manifest["configSha"])
+                    reconstructed = root / "reconstructed/published-baseline-source"
+                    self.assertEqual(original_run("git", "rev-parse", expected + "^{tree}",
+                                                  cwd=reconstructed), tree)
+                    original_run("git", "rm", release.PREFIX + "check-upstream.sh", cwd=origin)
+                    original_run("git", "commit", "-m", "incomplete legacy fixture", cwd=origin)
+                    missing = {**manifest, "candidateSha": original_run(
+                        "git", "rev-parse", "HEAD", cwd=origin)}
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        release.published_candidate_identity(
+                            "warelik/osconfig", missing, root / "missing-checker")
+                    modern = {"candidate": candidate,
+                              "candidateIdentity": core.candidate_identity(candidate)}
+                    with patch.object(release, "run", side_effect=AssertionError(
+                            "Modern signed identity must not reconstruct a legacy tree")):
+                        self.assertEqual(release.published_candidate_identity(
+                            "warelik/osconfig", modern, root / "modern"), candidate)
 
 
 class NativeAdapterTests(unittest.TestCase):

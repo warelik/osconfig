@@ -3642,7 +3642,12 @@ def published_candidate_identity(repo, published, work_root):
     run("git", "fetch", "--depth=1", "origin", candidate_sha, cwd=repo_work)
     if run("git", "rev-parse", "FETCH_HEAD", cwd=repo_work) != candidate_sha:
         raise ValueError("Fetched signed candidate commit differs from its manifest")
-    run("git", "checkout", candidate_sha, "--", *FULL_PRODUCT_PATHS, cwd=repo_work)
+    # The signed vps137 source predates the six-input application split. Its
+    # accepted assembled tree also retained this exact historical checker.
+    # Restore that blob only while reconstructing the legacy publication;
+    # current application and RPM recipe inputs remain unchanged.
+    legacy_paths = (*FULL_PRODUCT_PATHS, PREFIX + "check-upstream.sh")
+    run("git", "checkout", candidate_sha, "--", *legacy_paths, cwd=repo_work)
     patch_path = repo_work / PATCH_REL
     if digest(patch_path) != published["patchSha256"]:
         raise ValueError("Reconstructed production patch differs from its signed digest")
@@ -3651,7 +3656,7 @@ def published_candidate_identity(repo, published, work_root):
     assemble_review_source(repo_work, upstream, patch_path)
     source_files = run("git", "diff", "--name-only", upstream, "--", "*.go",
                        cwd=repo_work).splitlines()
-    run("git", "add", "-A", "--", *FULL_PRODUCT_PATHS, *source_files, cwd=repo_work)
+    run("git", "add", "-A", "--", *legacy_paths, *source_files, cwd=repo_work)
     check_cached_whitespace(repo_work)
     tree = run("git", "write-tree", cwd=repo_work)
     env = dict(os.environ)

@@ -162,3 +162,15 @@ the actual isolated policy check passes the native parser protection case too.
 Review comments use their original reviewed commit identity because GitHub can
 relocate an older inline comment to a newer head; a fresh clean review is still
 required for the changed commit.
+
+### Reconstructing the signed vps137 baseline
+
+The legacy signed publication has no embedded ABI candidate. Its accepted
+assembled source also contains the historical `check-upstream.sh` blob from
+`candidateSha`; omitting that file produces a different application commit even
+when all Go files and six current product inputs match. Legacy reconstruction
+retains that exact historical blob and mode, recovering the accepted source
+identity. Modern signed candidates use their recorded identity directly; the
+current six product inputs and RPM recipe are unchanged. A real local-Git
+regression covers exact tree identity, refusal of a missing historical blob,
+and the modern-provenance path without network, compilation or Go tests.

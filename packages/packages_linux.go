@@ -228,8 +228,12 @@ func enrichDebPkgInfoWithPurl(pkgs []*PkgInfo, shortname string, version string)
 
 func enrichRpmPkgInfoWithPurl(pkgs []*PkgInfo, shortname string, version string) []*PkgInfo {
 	for i, pkg := range pkgs {
+		purlArch := pkg.Arch
+		if purlArch == noarch {
+			purlArch = "noarch"
+		}
 		qualifiersMap := map[string]string{
-			"arch":   pkg.Arch,
+			"arch":   purlArch,
 			"distro": version, // For RPM, accepted distro format is version (eg. distro=9.1)
 		}
 		pkgs[i].Purl = packageurl.NewPackageURL(pkg.Type, shortname, pkg.Name, pkg.Version, packageurl.QualifiersFromMap(qualifiersMap), "").ToString()

@@ -1931,5 +1931,19 @@ class NativeAdapterTests(unittest.TestCase):
         self.assertIsNone(self._select_orphan_source(fixture, pull=closed))
 
 
+
+
+class FinalReservationPermissionTests(unittest.TestCase):
+    def test_each_native_reservation_job_can_comment_on_its_review_pr(self):
+        import re
+        root = Path(release.__file__).resolve().parents[3]
+        text = (root / '.github/workflows/google-osconfig-agent-inventory.yml').read_text()
+        for job in ['final-guard', 'policy-final-guard']:
+            block = re.search(r"(?ms)^  " + re.escape(job) + r":\s*\n.*?(?=^  [A-Za-z0-9_-]+:\s*$|\Z)", text)
+            self.assertIsNotNone(block)
+            self.assertRegex(block[0], r"(?m)^      pull-requests: write$")
+            self.assertNotRegex(block[0], r"(?m)^      contents: write$")
+
+
 if __name__ == "__main__":
     unittest.main()

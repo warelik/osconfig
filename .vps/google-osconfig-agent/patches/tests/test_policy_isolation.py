@@ -477,6 +477,7 @@ raise SystemExit(2)
                 work_root = Path(work_root)
                 self.assertTrue(work_root.is_dir())
                 (work_root / "source-fixture").write_text("temporary checkout", encoding="utf-8")
+                (work_root / "published-baseline-source").mkdir()
                 return dict(candidate)
 
             def create_delta(*_args, **_kwargs):

@@ -2030,6 +2030,33 @@ class PolicyJobCutoffTests(unittest.TestCase):
         history = self.history_with_policy_job("2026-10-19T10:01:00Z")
         self.assertFalse(history["complete"])
 
+    def test_retry_grant_from_before_cutoff_keeps_history_complete(self):
+        # A grant issued for a previous candidate before the baseline was
+        # published is outside this cycle's accounting window: its candidate
+        # has no post-cutoff reservation to bind it to a PR, and it must not
+        # poison completeness for every later candidate.
+        candidate = {"repository": self.repo, "upstream_sha": "1" * 40,
+                     "application_sha": "2" * 40, "configuration_sha": "3" * 40}
+        grant = "<!-- fork-final-retry:v1 " + json.dumps({
+            "schema": 1, "candidate_id": "d" * 64,
+            "previous_run_id": 700, "previous_run_attempt": 1,
+        }, sort_keys=True, separators=(",", ":")) + " -->"
+        comment = {
+            "id": 55, "created_at": "2026-10-19T09:58:00Z",
+            "updated_at": "2026-10-19T09:58:00Z",
+            "issue_url": f"https://api.github.com/repos/{self.repo}/issues/77",
+            "user": {"login": "warelik", "type": "User"}, "body": grant,
+        }
+        core = types.SimpleNamespace(candidate_identity=Mock(return_value="c" * 64))
+        with patch.dict("os.environ", {"CANDIDATE_PR": "91"}), \
+                patch.object(release, "lifecycle_module", return_value=core), \
+                patch.object(release, "pages", return_value=[comment]), \
+                patch.object(release, "native_workflow_runs", return_value=[]):
+            history = release.native_final_history(
+                self.repo, candidate, {"published_at": "2026-10-19T10:00:00Z"}, 999, 1)
+        self.assertTrue(history["complete"])
+        self.assertEqual(history["grants"], [])
+
     def test_initial_unpublished_fork_verifies_pages_absence_and_creates_variable_on_adopt(self):
         import io
         from urllib.error import HTTPError, URLError

@@ -3042,6 +3042,9 @@ def native_final_history(repo, current_candidate, baseline, current_run_id,
         if "<!-- fork-final-retry:v1" not in body:
             continue
         try:
+            grant_created = parse_utc(comment.get("created_at", ""))
+            if not (grant_created >= cutoff if initial_baseline else grant_created > cutoff):
+                continue
             marker = _marker_value(FINAL_RETRY_MARKER, body, "final retry grant")
             issue_match = re.search(r"/issues/([1-9][0-9]*)$", comment.get("issue_url") or "")
             required = {"schema", "candidate_id", "previous_run_id", "previous_run_attempt"}
@@ -3057,10 +3060,8 @@ def native_final_history(repo, current_candidate, baseline, current_run_id,
                     or candidate_pr_by_id.get(marker["candidate_id"]) != int(issue_match.group(1))):
                 complete = False
                 continue
-            grant_created = parse_utc(comment.get("created_at", ""))
-            if grant_created >= cutoff if initial_baseline else grant_created > cutoff:
-                grants.append({key: value for key, value in comment.items()
-                               if key in {"id", "user", "body", "created_at", "updated_at"}})
+            grants.append({key: value for key, value in comment.items()
+                           if key in {"id", "user", "body", "created_at", "updated_at"}})
         except (TypeError, ValueError):
             complete = False
 

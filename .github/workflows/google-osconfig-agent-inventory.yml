@@ -25,9 +25,10 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  prepare:
+  candidate-source:
     if: >-
       github.event_name != 'pull_request_target' &&
+      (github.event_name != 'workflow_dispatch' || inputs.policy_pr == '') &&
       (github.event_name != 'issue_comment' ||
        (github.event.issue.pull_request &&
         github.event.comment.user.login == 'chatgpt-codex-connector[bot]' &&
@@ -38,44 +39,112 @@ jobs:
       contents: write
       pull-requests: write
       issues: write
+      deployments: read
     outputs:
-      exists: ${{ steps.candidate.outputs.candidate_exists }}
+      exists: ${{ steps.preflight.outputs.blocked != 'true' && steps.candidate.outputs.candidate_exists == 'true' }}
       sha: ${{ steps.candidate.outputs.candidate_sha }}
       pr: ${{ steps.candidate.outputs.candidate_pr }}
       branch: ${{ steps.candidate.outputs.candidate_branch }}
       upstream: ${{ steps.candidate.outputs.upstream_commit }}
       patch: ${{ steps.candidate.outputs.patch_sha }}
+      candidate_id: ${{ steps.candidate.outputs.candidate_id }}
+      delta_pr: ${{ steps.candidate.outputs.delta_pr }}
+      delta_branch: ${{ steps.candidate.outputs.delta_branch }}
+      configuration_sha: ${{ steps.candidate.outputs.configuration_sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: master
           persist-credentials: false
-      - name: Install declared workflow parser dependency
-        run: |
-          python3 -m pip install --isolated --disable-pip-version-check --no-input --no-cache-dir \
-            --only-binary=:all: --no-deps --require-hashes --index-url https://pypi.org/simple \
-            --target "$RUNNER_TEMP/osconfig-policy-deps" \
-            -r .vps/google-osconfig-agent/patches/requirements-policy.txt
-      - name: Test trusted release gate
+      - name: Keep one active application or publisher candidate
+        id: preflight
         env:
-          PYTHONPATH: ${{ runner.temp }}/osconfig-policy-deps
-        run: python3 -B -m unittest discover -s .vps/google-osconfig-agent/patches/tests -p 'test_*.py' -v
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B .vps/google-osconfig-agent/patches/release.py candidate-preflight .
+      - name: Read the exact private lifecycle revision
+        if: steps.preflight.outputs.blocked != 'true'
+        id: maintenance-pin
+        run: |
+          python3 -B - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, re
+          lock = json.load(open(".vps/google-osconfig-agent/patches/maintenance.lock.json", encoding="utf-8"))
+          revision = lock.get("revision", "")
+          assert re.fullmatch(r"[0-9a-f]{40}", revision)
+          print(f"revision={revision}")
+          PY
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        if: steps.preflight.outputs.blocked != 'true'
+        with:
+          repository: warelik/machine-maintenance
+          ref: ${{ steps.maintenance-pin.outputs.revision }}
+          path: machine-maintenance
+          ssh-key: ${{ secrets.MAINTENANCE_READ_KEY }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Verify and receipt the exact read-only lifecycle source
+        if: steps.preflight.outputs.blocked != 'true'
+        env:
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
+        run: |
+          printf '/machine-maintenance/\n' >> .git/info/exclude
+          test "$(git -C "$FORK_MAINTENANCE_ROOT" rev-parse HEAD)" = "${{ steps.maintenance-pin.outputs.revision }}"
+          if git -C "$FORK_MAINTENANCE_ROOT" config --local --get-regexp 'http\..*\.extraheader|core\.sshcommand' >/dev/null; then
+            echo 'Private lifecycle checkout retained Git authentication' >&2
+            exit 1
+          fi
+          python3 -B - "$FORK_MAINTENANCE_ROOT/.maintenance-source.json" \
+            "${{ steps.maintenance-pin.outputs.revision }}" <<'PY'
+          import json, sys
+          with open(sys.argv[1], "w", encoding="utf-8") as stream:
+              json.dump({"repository": "warelik/machine-maintenance", "revision": sys.argv[2]}, stream)
+              stream.write("\n")
+          PY
+      - name: Hold the exact source for an open application review pair
+        if: steps.preflight.outputs.blocked != 'true'
+        id: source-preflight
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+          OSCONFIG_RPM_SIGNING_FINGERPRINT: ${{ vars.OSCONFIG_RPM_SIGNING_FINGERPRINT }}
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
+        run: python3 -B .vps/google-osconfig-agent/patches/release.py application-source-preflight .
       - name: Resolve latest upstream release
+        if: steps.preflight.outputs.blocked != 'true' && steps.source-preflight.outputs.held != 'true'
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: bash .vps/google-osconfig-agent/patches/prepare-source.sh --latest "$RUNNER_TEMP/osconfig-source"
+      - name: Prepare the exact held upstream source
+        if: steps.preflight.outputs.blocked != 'true' && steps.source-preflight.outputs.held == 'true'
+        env:
+          SOURCE_LOCK_BASE64: ${{ steps.source-preflight.outputs.source_lock_base64 }}
+        run: |
+          locked_tool="$RUNNER_TEMP/osconfig-locked-source-tool"
+          mkdir -m 700 "$locked_tool"
+          install -m 700 .vps/google-osconfig-agent/patches/prepare-source.sh "$locked_tool/prepare-source.sh"
+          cmp -- .vps/google-osconfig-agent/patches/prepare-source.sh "$locked_tool/prepare-source.sh"
+          python3 - "$locked_tool/source.lock" <<'PY'
+          import base64, os, sys
+          source_lock = base64.b64decode(os.environ["SOURCE_LOCK_BASE64"], validate=True)
+          if len(source_lock) > 4096:
+              raise SystemExit("Candidate source.lock exceeds its exact-source bound")
+          with open(sys.argv[1], "xb") as stream:
+              stream.write(source_lock)
+          PY
+          bash "$locked_tool/prepare-source.sh" --locked "$RUNNER_TEMP/osconfig-source"
       - name: Prepare exact-source native Codex review PR
+        if: steps.preflight.outputs.blocked != 'true'
         id: candidate
         env:
           GH_TOKEN: ${{ github.token }}
           CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
           OSCONFIG_RPM_SIGNING_FINGERPRINT: ${{ vars.OSCONFIG_RPM_SIGNING_FINGERPRINT }}
           OSCONFIG_SOURCE_DIR: ${{ runner.temp }}/osconfig-source
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
         run: |
           python3 -B .vps/google-osconfig-agent/patches/release.py prepare \
             "$RUNNER_TEMP/osconfig-candidate"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: steps.candidate.outputs.candidate_exists == 'true'
+        if: steps.preflight.outputs.blocked != 'true' && steps.candidate.outputs.candidate_exists == 'true'
         with:
           name: google-osconfig-agent-candidate
           path: ${{ runner.temp }}/osconfig-candidate/inputs
@@ -83,7 +152,9 @@ jobs:
           retention-days: 3
 
   policy-resume:
-    if: github.event_name != 'pull_request_target'
+    if: >-
+      github.event_name != 'pull_request_target' &&
+      (github.event_name != 'workflow_dispatch' || inputs.policy_pr == '')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -95,13 +166,50 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: master
+          path: trusted
           persist-credentials: false
+      - name: Read the exact private lifecycle revision
+        id: maintenance-pin
+        run: |
+          python3 -B - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, re
+          lock = json.load(open("trusted/.vps/google-osconfig-agent/patches/maintenance.lock.json", encoding="utf-8"))
+          revision = lock.get("revision", "")
+          assert re.fullmatch(r"[0-9a-f]{40}", revision)
+          print(f"revision={revision}")
+          PY
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: warelik/machine-maintenance
+          ref: ${{ steps.maintenance-pin.outputs.revision }}
+          path: machine-maintenance
+          ssh-key: ${{ secrets.MAINTENANCE_READ_KEY }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Verify and receipt the exact read-only lifecycle source
+        env:
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
+        run: |
+          printf '/machine-maintenance/\n' >> trusted/.git/info/exclude
+          test "$(git -C "$FORK_MAINTENANCE_ROOT" rev-parse HEAD)" = "${{ steps.maintenance-pin.outputs.revision }}"
+          if git -C "$FORK_MAINTENANCE_ROOT" config --local --get-regexp 'http\..*\.extraheader|core\.sshcommand' >/dev/null; then
+            echo 'Private lifecycle checkout retained Git authentication' >&2
+            exit 1
+          fi
+          python3 -B - "$FORK_MAINTENANCE_ROOT/.maintenance-source.json" \
+            "${{ steps.maintenance-pin.outputs.revision }}" <<'PY'
+          import json, sys
+          with open(sys.argv[1], "w", encoding="utf-8") as stream:
+              json.dump({"repository": "warelik/machine-maintenance", "revision": sys.argv[2]}, stream)
+              stream.write("\n")
+          PY
       - name: Continue any bounded publisher repair or review window
         env:
           GH_TOKEN: ${{ github.token }}
           CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
           POLICY_PR_NUMBER: ${{ inputs.policy_pr }}
-        run: python3 -B .vps/google-osconfig-agent/patches/release.py policy-resume .
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
+        run: python3 -B trusted/.vps/google-osconfig-agent/patches/release.py policy-resume .
 
   policy-check:
     if: >-
@@ -111,15 +219,19 @@ jobs:
        startsWith(github.event.pull_request.head.ref, 'repair/osconfig-policy-')) ||
       (github.event_name == 'workflow_dispatch' && inputs.policy_pr != '')
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 20
     permissions:
-      contents: read
-      pull-requests: read
+      contents: write
+      issues: write
+      pull-requests: write
     outputs:
       changed: ${{ steps.check.outputs.policy_candidate_changed }}
       pr: ${{ steps.identity.outputs.pr }}
       head: ${{ steps.identity.outputs.head }}
       config: ${{ steps.identity.outputs.config }}
+      candidate_id: ${{ steps.check.outputs.candidate_id }}
+      candidate_pr: ${{ steps.check.outputs.candidate_pr }}
+      delta_pr: ${{ steps.check.outputs.delta_pr }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -147,31 +259,64 @@ jobs:
               assert re.fullmatch(r"[0-9]+" if key == "pr" else r"[0-9a-f]{40}",value)
               print(f"{key}={value}")
           PY
+      - name: Read the exact private lifecycle revision
+        id: maintenance-pin
+        run: |
+          python3 -B - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, re
+          lock = json.load(open("trusted/.vps/google-osconfig-agent/patches/maintenance.lock.json", encoding="utf-8"))
+          revision = lock.get("revision", "")
+          assert re.fullmatch(r"[0-9a-f]{40}", revision)
+          print(f"revision={revision}")
+          PY
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: warelik/machine-maintenance
+          ref: ${{ steps.maintenance-pin.outputs.revision }}
+          path: machine-maintenance
+          ssh-key: ${{ secrets.MAINTENANCE_READ_KEY }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Verify and receipt the exact read-only lifecycle source
+        env:
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
+        run: |
+          printf '/machine-maintenance/\n' >> trusted/.git/info/exclude
+          test "$(git -C "$FORK_MAINTENANCE_ROOT" rev-parse HEAD)" = "${{ steps.maintenance-pin.outputs.revision }}"
+          if git -C "$FORK_MAINTENANCE_ROOT" config --local --get-regexp 'http\..*\.extraheader|core\.sshcommand' >/dev/null; then
+            echo 'Private lifecycle checkout retained Git authentication' >&2
+            exit 1
+          fi
+          python3 -B - "$FORK_MAINTENANCE_ROOT/.maintenance-source.json" \
+            "${{ steps.maintenance-pin.outputs.revision }}" <<'PY'
+          import json, sys
+          with open(sys.argv[1], "w", encoding="utf-8") as stream:
+              json.dump({"repository": "warelik/machine-maintenance", "revision": sys.argv[2]}, stream)
+              stream.write("\n")
+          PY
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ steps.identity.outputs.head }}
           path: candidate
           persist-credentials: false
           fetch-depth: 0
-      - name: Verify the exact proposal has complete ancestry
-        env:
-          POLICY_BASE_SHA: ${{ steps.identity.outputs.config }}
-          POLICY_HEAD_SHA: ${{ steps.identity.outputs.head }}
-        run: git -C candidate merge-base --is-ancestor "$POLICY_BASE_SHA" "$POLICY_HEAD_SHA"
-      - name: Install independent policy bootstrap parser
-        run: |
-          python3 -m pip install --isolated --disable-pip-version-check --no-input --no-cache-dir \
-            --only-binary=:all: --no-deps --require-hashes --index-url https://pypi.org/simple \
-            --target "$RUNNER_TEMP/osconfig-policy-bootstrap" \
-            -r trusted/.vps/google-osconfig-agent/patches/requirements-policy-bootstrap.txt
-      - name: Run trusted policy baseline; parse proposed Python and lint the proposed workflow
+      - name: Prepare exact paired policy and assembled-application review contexts
         id: check
         env:
           GH_TOKEN: ${{ github.token }}
+          CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+          OSCONFIG_RPM_SIGNING_FINGERPRINT: ${{ vars.OSCONFIG_RPM_SIGNING_FINGERPRINT }}
           POLICY_PR_NUMBER: ${{ steps.identity.outputs.pr }}
           POLICY_HEAD_SHA: ${{ steps.identity.outputs.head }}
-          PYTHONPATH: ${{ runner.temp }}/osconfig-policy-bootstrap
-        run: python3 -B trusted/.vps/google-osconfig-agent/patches/release.py policy-check candidate
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
+        run: python3 -B trusted/.vps/google-osconfig-agent/patches/release.py prepare-policy candidate
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.check.outputs.policy_candidate_changed == 'true'
+        with:
+          name: google-osconfig-agent-policy-candidate
+          path: candidate/inputs
+          if-no-files-found: error
+          retention-days: 3
 
   policy-review:
     needs: policy-check
@@ -180,64 +325,162 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
-      issues: write
+      issues: read
       pull-requests: read
     outputs:
-      ready: ${{ steps.review.outputs.policy_review_ready }}
-      reason: ${{ steps.review.outputs.policy_review_reason }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: master
-          persist-credentials: false
-      - name: Request and require exact-SHA native Codex review
-        id: review
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
-          POLICY_PR_NUMBER: ${{ needs.policy-check.outputs.pr }}
-          POLICY_HEAD_SHA: ${{ needs.policy-check.outputs.head }}
-        run: python3 -B .vps/google-osconfig-agent/patches/release.py policy-review .
-
-  adopt-policy:
-    needs: [policy-check, policy-review]
-    if: >-
-      needs.policy-check.result == 'success' && needs.policy-check.outputs.changed == 'true' &&
-      needs.policy-review.result == 'success' && needs.policy-review.outputs.ready == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    permissions:
-      contents: write
-      pull-requests: write
-      issues: write
-      actions: write
+      ready: ${{ steps.review.outputs.review_ready }}
+      reason: ${{ steps.review.outputs.review_reason }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: master
           path: trusted
           persist-credentials: false
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Read the exact private lifecycle revision
+        id: maintenance-pin
+        run: |
+          python3 -B - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, re
+          lock = json.load(open("trusted/.vps/google-osconfig-agent/patches/maintenance.lock.json", encoding="utf-8"))
+          revision = lock.get("revision", "")
+          assert re.fullmatch(r"[0-9a-f]{40}", revision)
+          print(f"revision={revision}")
+          PY
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ needs.policy-check.outputs.head }}
-          path: candidate
+          repository: warelik/machine-maintenance
+          ref: ${{ steps.maintenance-pin.outputs.revision }}
+          path: machine-maintenance
+          ssh-key: ${{ secrets.MAINTENANCE_READ_KEY }}
           persist-credentials: false
-      - name: Recheck exact review and selectively adopt only allowlisted policy files
+          fetch-depth: 1
+      - name: Verify and receipt the exact read-only lifecycle source
+        env:
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
+        run: |
+          printf '/machine-maintenance/\n' >> trusted/.git/info/exclude
+          test "$(git -C "$FORK_MAINTENANCE_ROOT" rev-parse HEAD)" = "${{ steps.maintenance-pin.outputs.revision }}"
+          if git -C "$FORK_MAINTENANCE_ROOT" config --local --get-regexp 'http\..*\.extraheader|core\.sshcommand' >/dev/null; then
+            echo 'Private lifecycle checkout retained Git authentication' >&2
+            exit 1
+          fi
+          python3 -B - "$FORK_MAINTENANCE_ROOT/.maintenance-source.json" \
+            "${{ steps.maintenance-pin.outputs.revision }}" <<'PY'
+          import json, sys
+          with open(sys.argv[1], "w", encoding="utf-8") as stream:
+              json.dump({"repository": "warelik/machine-maintenance", "revision": sys.argv[2]}, stream)
+              stream.write("\n")
+          PY
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: google-osconfig-agent-policy-candidate
+          path: ${{ runner.temp }}/osconfig-policy-candidate
+      - name: Require the exact independent full and delta policy reviews
+        id: review
         env:
           GH_TOKEN: ${{ github.token }}
-          POLICY_PR_NUMBER: ${{ needs.policy-check.outputs.pr }}
-          POLICY_HEAD_SHA: ${{ needs.policy-check.outputs.head }}
-        run: python3 -B trusted/.vps/google-osconfig-agent/patches/release.py adopt-policy candidate
+          CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
+        run: python3 -B trusted/.vps/google-osconfig-agent/patches/release.py review-pair \
+          "$RUNNER_TEMP/osconfig-policy-candidate"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: google-osconfig-agent-policy-review-pair
+          path: ${{ runner.temp }}/osconfig-policy-candidate/review-pair.json
+          if-no-files-found: ignore
+          retention-days: 3
+
+  policy-final-guard:
+    needs: [policy-check, policy-review]
+    if: >-
+      needs.policy-check.result == 'success' && needs.policy-check.outputs.changed == 'true' &&
+      needs.policy-review.result == 'success' && needs.policy-review.outputs.ready == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+      actions: read
+      deployments: read
+    outputs:
+      decision: ${{ steps.authorize.outputs.final_decision }}
+      candidate_id: ${{ steps.authorize.outputs.final_candidate_id }}
+      run_id: ${{ steps.authorize.outputs.final_run_id }}
+      run_attempt: ${{ steps.authorize.outputs.final_run_attempt }}
+      workflow_sha: ${{ steps.authorize.outputs.final_workflow_sha }}
+      validated_bundle: ${{ steps.authorize.outputs.validated_bundle }}
+      policy_validation_reuse: ${{ steps.authorize.outputs.policy_validation_reuse }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+      - name: Read the exact private lifecycle revision
+        id: maintenance-pin
+        run: |
+          python3 -B - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, re
+          lock = json.load(open("trusted/.vps/google-osconfig-agent/patches/maintenance.lock.json", encoding="utf-8"))
+          revision = lock.get("revision", "")
+          assert re.fullmatch(r"[0-9a-f]{40}", revision)
+          print(f"revision={revision}")
+          PY
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: warelik/machine-maintenance
+          ref: ${{ steps.maintenance-pin.outputs.revision }}
+          path: machine-maintenance
+          ssh-key: ${{ secrets.MAINTENANCE_READ_KEY }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Verify and receipt the exact read-only lifecycle source
+        env:
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
+        run: |
+          printf '/machine-maintenance/\n' >> trusted/.git/info/exclude
+          test "$(git -C "$FORK_MAINTENANCE_ROOT" rev-parse HEAD)" = "${{ steps.maintenance-pin.outputs.revision }}"
+          if git -C "$FORK_MAINTENANCE_ROOT" config --local --get-regexp 'http\..*\.extraheader|core\.sshcommand' >/dev/null; then
+            echo 'Private lifecycle checkout retained Git authentication' >&2
+            exit 1
+          fi
+          python3 -B - "$FORK_MAINTENANCE_ROOT/.maintenance-source.json" \
+            "${{ steps.maintenance-pin.outputs.revision }}" <<'PY'
+          import json, sys
+          with open(sys.argv[1], "w", encoding="utf-8") as stream:
+              json.dump({"repository": "warelik/machine-maintenance", "revision": sys.argv[2]}, stream)
+              stream.write("\n")
+          PY
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: google-osconfig-agent-policy-candidate
+          path: ${{ runner.temp }}/osconfig-policy-candidate
+      - name: Authorize one final policy-only validation on the exact review pair
+        id: authorize
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+          CANDIDATE_PR: ${{ needs.policy-check.outputs.candidate_pr }}
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
+        run: python3 -B trusted/.vps/google-osconfig-agent/patches/release.py authorize-final \
+          "$RUNNER_TEMP/osconfig-policy-candidate"
 
   repair-policy-proposal:
-    needs: [policy-check, policy-review, adopt-policy]
+    needs: [policy-check, policy-review, policy-final-guard, prepare, adopt-policy]
     if: >-
       always() &&
+      needs.policy-check.outputs.pr != '' &&
+      needs.policy-check.outputs.head != '' &&
       ((needs.policy-check.result == 'failure') ||
-       (needs.policy-review.result == 'failure') ||
-       (needs.policy-review.result == 'success' && needs.policy-review.outputs.ready == 'false' &&
-        needs.policy-review.outputs.reason != 'Waiting for Codex; no completed exact-SHA review') ||
-       (needs.adopt-policy.result == 'failure'))
+       (needs.policy-check.outputs.changed == 'true' &&
+        ((needs.policy-review.result == 'failure') ||
+         (needs.policy-review.result == 'success' && needs.policy-review.outputs.ready == 'false' &&
+          needs.policy-review.outputs.reason != 'Both distinct exact-source review lists must complete before repair') ||
+         (needs.policy-final-guard.result == 'failure') ||
+         (needs.prepare.result == 'failure') ||
+         (needs.adopt-policy.result == 'failure'))))
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -263,39 +506,111 @@ jobs:
             "$POLICY_PR_NUMBER" "$POLICY_HEAD_SHA" "$RUNNER_TEMP/policy-failure.log"
 
   build-rpm:
-    needs: prepare
-    if: needs.prepare.outputs.exists == 'true'
+    needs: [candidate-source, review, final-guard, prepare]
+    if: >-
+      needs.candidate-source.outputs.exists == 'true' &&
+      needs.review.result == 'success' && needs.review.outputs.ready == 'true' &&
+      needs.final-guard.result == 'success' && needs.final-guard.outputs.decision == 'allow' &&
+      needs.final-guard.outputs.candidate_id == needs.candidate-source.outputs.candidate_id &&
+      needs.final-guard.outputs.run_id == github.run_id &&
+      needs.final-guard.outputs.run_attempt == github.run_attempt &&
+      needs.final-guard.outputs.workflow_sha == github.sha &&
+      needs.prepare.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     container: fedora:44
     permissions:
       contents: read
+      issues: read
+      pull-requests: read
     outputs:
       failure_class: ${{ steps.classify.outputs.failure_class }}
     steps:
+      - name: Check the frozen native run attempt before checkout or Fedora tools
+        id: preflight
+        env:
+          EXPECTED_RUN_ID: ${{ needs.final-guard.outputs.run_id }}
+          EXPECTED_RUN_ATTEMPT: ${{ needs.final-guard.outputs.run_attempt }}
+          EXPECTED_WORKFLOW_SHA: ${{ needs.final-guard.outputs.workflow_sha }}
+          EXPECTED_CANDIDATE_ID: ${{ needs.final-guard.outputs.candidate_id }}
+          EXPECTED_DECISION: ${{ needs.final-guard.outputs.decision }}
+          SOURCE_CANDIDATE_ID: ${{ needs.candidate-source.outputs.candidate_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_DECISION" == allow ]]
+          [[ "$EXPECTED_RUN_ID" == "$GITHUB_RUN_ID" ]]
+          [[ "$EXPECTED_RUN_ATTEMPT" == "$GITHUB_RUN_ATTEMPT" ]]
+          [[ "$EXPECTED_WORKFLOW_SHA" == "$GITHUB_SHA" ]]
+          [[ "$EXPECTED_CANDIDATE_ID" == "$SOURCE_CANDIDATE_ID" ]]
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: master
           persist-credentials: false
+      - name: Read the exact private lifecycle revision
+        id: maintenance-pin
+        run: |
+          python3 -B - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, re
+          lock = json.load(open(".vps/google-osconfig-agent/patches/maintenance.lock.json", encoding="utf-8"))
+          revision = lock.get("revision", "")
+          assert re.fullmatch(r"[0-9a-f]{40}", revision)
+          print(f"revision={revision}")
+          PY
+      - name: Install private checkout transport tools
+        run: dnf -y install git openssh-clients
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: warelik/machine-maintenance
+          ref: ${{ steps.maintenance-pin.outputs.revision }}
+          path: machine-maintenance
+          ssh-key: ${{ secrets.MAINTENANCE_READ_KEY }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Verify and receipt the exact read-only lifecycle source
+        env:
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
+        run: |
+          printf '/machine-maintenance/\n' >> .git/info/exclude
+          test "$(git -C "$FORK_MAINTENANCE_ROOT" rev-parse HEAD)" = "${{ steps.maintenance-pin.outputs.revision }}"
+          if git -C "$FORK_MAINTENANCE_ROOT" config --local --get-regexp 'http\..*\.extraheader|core\.sshcommand' >/dev/null; then
+            echo 'Private lifecycle checkout retained Git authentication' >&2
+            exit 1
+          fi
+          python3 -B - "$FORK_MAINTENANCE_ROOT/.maintenance-source.json" \
+            "${{ steps.maintenance-pin.outputs.revision }}" <<'PY'
+          import json, sys
+          with open(sys.argv[1], "w", encoding="utf-8") as stream:
+              json.dump({"repository": "warelik/machine-maintenance", "revision": sys.argv[2]}, stream)
+              stream.write("\n")
+          PY
       - name: Install Fedora build tools
         id: tools
-        run: dnf -y install golang rpm-build go-rpm-macros go-vendor-tools systemd systemd-rpm-macros git jq tar bzip2 gzip
+        run: dnf -y install golang rpm-build go-rpm-macros go-vendor-tools systemd systemd-rpm-macros git jq tar bzip2 gzip gh python3
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: google-osconfig-agent-candidate
           path: ${{ runner.temp }}/osconfig-candidate
-      - name: Prepare the exact upstream source tree
-        id: source_setup
-        run: |
-          mkdir "$RUNNER_TEMP/osconfig-upstream"
-          tar -xzf "$RUNNER_TEMP/osconfig-candidate/source.tar.gz" \
-            --strip-components=1 -C "$RUNNER_TEMP/osconfig-upstream"
-      - name: Apply and test the application patch
-        id: source_test
+      - name: Verify this exact native run attempt before the one build and test pass
         env:
-          UPSTREAM_SOURCE_DIR: ${{ runner.temp }}/osconfig-upstream
-          UPSTREAM_PATCH_FILE: ${{ runner.temp }}/osconfig-candidate/osconfig-inventory.patch
-        run: bash .vps/google-osconfig-agent/patches/check-upstream.sh
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_PR: ${{ needs.candidate-source.outputs.pr }}
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
+        run: |
+          python3 -B .vps/google-osconfig-agent/patches/release.py verify-final-run \
+            "$RUNNER_TEMP/osconfig-candidate" \
+            "${{ needs.final-guard.outputs.run_id }}" \
+            "${{ needs.final-guard.outputs.run_attempt }}" \
+            "${{ needs.final-guard.outputs.workflow_sha }}" \
+            "${{ needs.final-guard.outputs.candidate_id }}"
+      - name: Remove private lifecycle checkout before candidate build code
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "$GITHUB_WORKSPACE" && "$GITHUB_WORKSPACE" != "/" ]]
+          private_root="$GITHUB_WORKSPACE/machine-maintenance"
+          rm -rf -- "$private_root"
+          [[ ! -e "$private_root" && ! -L "$private_root" ]]
       - name: Build the Fedora RPM
         id: package_build
         env:
@@ -303,6 +618,13 @@ jobs:
         run: |
           bash "$RUNNER_TEMP/osconfig-candidate/build-rpm.sh" \
             "$RUNNER_TEMP/osconfig-candidate" "$RUNNER_TEMP/osconfig-built"
+      - name: Record the exact native build artifact identity
+        id: provenance
+        env:
+          EXPECTED_CANDIDATE_ID: ${{ needs.final-guard.outputs.candidate_id }}
+        run: |
+          python3 -B .vps/google-osconfig-agent/patches/release.py \
+            write-build-provenance "$RUNNER_TEMP/osconfig-candidate" "$RUNNER_TEMP/osconfig-built"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         id: artifact
         with:
@@ -315,25 +637,32 @@ jobs:
         if: always()
         env:
           TOOLS_OUTCOME: ${{ steps.tools.outcome }}
-          SETUP_OUTCOME: ${{ steps.source_setup.outcome }}
-          TEST_OUTCOME: ${{ steps.source_test.outcome }}
           BUILD_OUTCOME: ${{ steps.package_build.outcome }}
           ARTIFACT_OUTCOME: ${{ steps.artifact.outcome }}
+          PREFLIGHT_OUTCOME: ${{ steps.preflight.outcome }}
+          PROVENANCE_OUTCOME: ${{ steps.provenance.outcome }}
+          BUILD_JOB_STATUS: ${{ job.status }}
         run: |
-          if [[ "$TOOLS_OUTCOME" == failure || "$SETUP_OUTCOME" == failure || "$ARTIFACT_OUTCOME" == failure ]]; then
+          if [[ "$PREFLIGHT_OUTCOME" == failure || "$TOOLS_OUTCOME" == failure ||
+                "$PROVENANCE_OUTCOME" == failure || "$ARTIFACT_OUTCOME" == failure ]]; then
             echo 'failure_class=publisher' >> "$GITHUB_OUTPUT"
-          elif [[ "$TEST_OUTCOME" == failure || "$BUILD_OUTCOME" == failure ]]; then
+          elif [[ "$BUILD_OUTCOME" == failure ]]; then
             echo 'failure_class=application' >> "$GITHUB_OUTPUT"
+          elif [[ "$BUILD_JOB_STATUS" == failure ]]; then
+            echo 'failure_class=publisher' >> "$GITHUB_OUTPUT"
           else
             echo 'failure_class=none' >> "$GITHUB_OUTPUT"
           fi
 
   review:
-    needs: [prepare, build-rpm]
-    if: needs.prepare.outputs.exists == 'true' && needs.build-rpm.result == 'success'
+    needs: candidate-source
+    if: needs.candidate-source.outputs.exists == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     permissions:
       contents: read
+      pull-requests: read
+      issues: read
     outputs:
       ready: ${{ steps.gate.outputs.review_ready }}
       reason: ${{ steps.gate.outputs.review_reason }}
@@ -342,25 +671,572 @@ jobs:
         with:
           ref: master
           persist-credentials: false
+      - name: Read the exact private lifecycle revision
+        id: maintenance-pin
+        run: |
+          python3 -B - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, re
+          lock = json.load(open(".vps/google-osconfig-agent/patches/maintenance.lock.json", encoding="utf-8"))
+          revision = lock.get("revision", "")
+          assert re.fullmatch(r"[0-9a-f]{40}", revision)
+          print(f"revision={revision}")
+          PY
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: warelik/machine-maintenance
+          ref: ${{ steps.maintenance-pin.outputs.revision }}
+          path: machine-maintenance
+          ssh-key: ${{ secrets.MAINTENANCE_READ_KEY }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Verify and receipt the exact read-only lifecycle source
+        env:
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
+        run: |
+          printf '/machine-maintenance/\n' >> .git/info/exclude
+          test "$(git -C "$FORK_MAINTENANCE_ROOT" rev-parse HEAD)" = "${{ steps.maintenance-pin.outputs.revision }}"
+          if git -C "$FORK_MAINTENANCE_ROOT" config --local --get-regexp 'http\..*\.extraheader|core\.sshcommand' >/dev/null; then
+            echo 'Private lifecycle checkout retained Git authentication' >&2
+            exit 1
+          fi
+          python3 -B - "$FORK_MAINTENANCE_ROOT/.maintenance-source.json" \
+            "${{ steps.maintenance-pin.outputs.revision }}" <<'PY'
+          import json, sys
+          with open(sys.argv[1], "w", encoding="utf-8") as stream:
+              json.dump({"repository": "warelik/machine-maintenance", "revision": sys.argv[2]}, stream)
+              stream.write("\n")
+          PY
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: google-osconfig-agent-candidate
           path: ${{ runner.temp }}/osconfig-candidate
-      - name: Require native Codex review of this tested SHA
+      - name: Require the exact independent full and delta native Codex reviews
         id: gate
         env:
           GH_TOKEN: ${{ github.token }}
+          CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
         run: |
-          python3 -B .vps/google-osconfig-agent/patches/release.py review \
+          python3 -B .vps/google-osconfig-agent/patches/release.py review-pair \
+            "$RUNNER_TEMP/osconfig-candidate"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: google-osconfig-agent-review-pair
+          path: ${{ runner.temp }}/osconfig-candidate/review-pair.json
+          if-no-files-found: ignore
+          retention-days: 3
+
+  final-guard:
+    needs: [candidate-source, review]
+    if: >-
+      needs.candidate-source.outputs.exists == 'true' &&
+      needs.review.result == 'success' && needs.review.outputs.ready == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+      actions: read
+      deployments: read
+    outputs:
+      decision: ${{ steps.authorize.outputs.final_decision }}
+      candidate_id: ${{ steps.authorize.outputs.final_candidate_id }}
+      run_id: ${{ steps.authorize.outputs.final_run_id }}
+      run_attempt: ${{ steps.authorize.outputs.final_run_attempt }}
+      workflow_sha: ${{ steps.authorize.outputs.final_workflow_sha }}
+      reuse_run_id: ${{ steps.authorize.outputs.reuse_run_id }}
+      reuse_run_attempt: ${{ steps.authorize.outputs.reuse_run_attempt }}
+      reuse_workflow_sha: ${{ steps.authorize.outputs.reuse_workflow_sha }}
+      reuse_legacy_attempt_one: ${{ steps.authorize.outputs.reuse_legacy_attempt_one }}
+      policy_validation_reuse: ${{ steps.authorize.outputs.policy_validation_reuse }}
+      validated_bundle: ${{ steps.authorize.outputs.validated_bundle }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Read the exact private lifecycle revision
+        id: maintenance-pin
+        run: |
+          python3 -B - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, re
+          lock = json.load(open(".vps/google-osconfig-agent/patches/maintenance.lock.json", encoding="utf-8"))
+          revision = lock.get("revision", "")
+          assert re.fullmatch(r"[0-9a-f]{40}", revision)
+          print(f"revision={revision}")
+          PY
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: warelik/machine-maintenance
+          ref: ${{ steps.maintenance-pin.outputs.revision }}
+          path: machine-maintenance
+          ssh-key: ${{ secrets.MAINTENANCE_READ_KEY }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Verify and receipt the exact read-only lifecycle source
+        env:
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
+        run: |
+          printf '/machine-maintenance/\n' >> .git/info/exclude
+          test "$(git -C "$FORK_MAINTENANCE_ROOT" rev-parse HEAD)" = "${{ steps.maintenance-pin.outputs.revision }}"
+          if git -C "$FORK_MAINTENANCE_ROOT" config --local --get-regexp 'http\..*\.extraheader|core\.sshcommand' >/dev/null; then
+            echo 'Private lifecycle checkout retained Git authentication' >&2
+            exit 1
+          fi
+          python3 -B - "$FORK_MAINTENANCE_ROOT/.maintenance-source.json" \
+            "${{ steps.maintenance-pin.outputs.revision }}" <<'PY'
+          import json, sys
+          with open(sys.argv[1], "w", encoding="utf-8") as stream:
+              json.dump({"repository": "warelik/machine-maintenance", "revision": sys.argv[2]}, stream)
+              stream.write("\n")
+          PY
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: google-osconfig-agent-candidate
+          path: ${{ runner.temp }}/osconfig-candidate
+      - name: Reserve and authorize only the exact final candidate
+        id: authorize
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+          OSCONFIG_RPM_SIGNING_FINGERPRINT: ${{ vars.OSCONFIG_RPM_SIGNING_FINGERPRINT }}
+          CANDIDATE_PR: ${{ needs.candidate-source.outputs.pr }}
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
+        run: |
+          python3 -B .vps/google-osconfig-agent/patches/release.py authorize-final \
             "$RUNNER_TEMP/osconfig-candidate"
 
-  repair:
-    needs: [prepare, build-rpm, review]
+  prepare:
+    name: policy-validation
+    needs: [candidate-source, review, final-guard, policy-check, policy-review, policy-final-guard]
     if: >-
-      always() && needs.prepare.outputs.exists == 'true' &&
+      always() &&
+      ((needs.candidate-source.outputs.exists == 'true' &&
+        needs.review.result == 'success' && needs.review.outputs.ready == 'true' &&
+        needs.final-guard.result == 'success' &&
+      (needs.final-guard.outputs.decision == 'allow' ||
+       needs.final-guard.outputs.decision == 'policy-only' ||
+       needs.final-guard.outputs.decision == 'already-validated') &&
+      needs.final-guard.outputs.candidate_id == needs.candidate-source.outputs.candidate_id &&
+      needs.final-guard.outputs.run_id == github.run_id &&
+      needs.final-guard.outputs.run_attempt == github.run_attempt &&
+      needs.final-guard.outputs.workflow_sha == github.sha) ||
+       (needs.policy-check.outputs.changed == 'true' &&
+        needs.policy-review.result == 'success' && needs.policy-review.outputs.ready == 'true' &&
+        needs.policy-final-guard.result == 'success' &&
+        needs.policy-final-guard.outputs.decision == 'policy-only' &&
+        needs.policy-final-guard.outputs.candidate_id == needs.policy-check.outputs.candidate_id &&
+        needs.policy-final-guard.outputs.run_id == github.run_id &&
+        needs.policy-final-guard.outputs.run_attempt == github.run_attempt &&
+        needs.policy-final-guard.outputs.workflow_sha == github.sha))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      actions: read
+    outputs:
+      exists: ${{ needs.candidate-source.outputs.exists == 'true' || needs.policy-check.outputs.changed == 'true' }}
+      policy_validated: ${{ steps.policy.outputs.policy_validated || steps.policy-reuse.outputs.policy_validated || steps.policy-proposal.outputs.policy_validated || steps.policy-proposal-reuse.outputs.policy_validated || steps.policy-proposal-history-reuse.outputs.policy_validated }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Read the exact private lifecycle revision
+        id: maintenance-pin
+        run: |
+          python3 -B - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, re
+          lock = json.load(open(".vps/google-osconfig-agent/patches/maintenance.lock.json", encoding="utf-8"))
+          revision = lock.get("revision", "")
+          assert re.fullmatch(r"[0-9a-f]{40}", revision)
+          print(f"revision={revision}")
+          PY
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: warelik/machine-maintenance
+          ref: ${{ steps.maintenance-pin.outputs.revision }}
+          path: machine-maintenance
+          ssh-key: ${{ secrets.MAINTENANCE_READ_KEY }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Verify and receipt the exact read-only lifecycle source
+        env:
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
+        run: |
+          printf '/machine-maintenance/\n' >> .git/info/exclude
+          test "$(git -C "$FORK_MAINTENANCE_ROOT" rev-parse HEAD)" = "${{ steps.maintenance-pin.outputs.revision }}"
+          if git -C "$FORK_MAINTENANCE_ROOT" config --local --get-regexp 'http\..*\.extraheader|core\.sshcommand' >/dev/null; then
+            echo 'Private lifecycle checkout retained Git authentication' >&2
+            exit 1
+          fi
+          python3 -B - "$FORK_MAINTENANCE_ROOT/.maintenance-source.json" \
+            "${{ steps.maintenance-pin.outputs.revision }}" <<'PY'
+          import json, sys
+          with open(sys.argv[1], "w", encoding="utf-8") as stream:
+              json.dump({"repository": "warelik/machine-maintenance", "revision": sys.argv[2]}, stream)
+              stream.write("\n")
+          PY
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.policy-check.outputs.changed == 'true'
+        with:
+          ref: ${{ needs.policy-check.outputs.head }}
+          path: policy-candidate
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.candidate-source.outputs.exists == 'true'
+        with:
+          name: google-osconfig-agent-candidate
+          path: ${{ runner.temp }}/osconfig-candidate
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.policy-check.outputs.changed == 'true'
+        with:
+          name: google-osconfig-agent-policy-candidate
+          path: ${{ runner.temp }}/osconfig-policy-candidate
+      - name: Verify the normal candidate and current native run attempt
+        if: needs.candidate-source.outputs.exists == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_PR: ${{ needs.candidate-source.outputs.pr }}
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
+        run: |
+          python3 -B .vps/google-osconfig-agent/patches/release.py verify-final-run \
+            "$RUNNER_TEMP/osconfig-candidate" \
+            "${{ needs.final-guard.outputs.run_id }}" \
+            "${{ needs.final-guard.outputs.run_attempt }}" \
+            "${{ needs.final-guard.outputs.workflow_sha }}" \
+            "${{ needs.final-guard.outputs.candidate_id }}"
+      - name: Verify the policy proposal and current native run attempt
+        if: needs.policy-check.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_PR: ${{ needs.policy-check.outputs.candidate_pr }}
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
+        run: |
+          python3 -B .vps/google-osconfig-agent/patches/release.py verify-final-run \
+            "$RUNNER_TEMP/osconfig-policy-candidate" \
+            "${{ needs.policy-final-guard.outputs.run_id }}" \
+            "${{ needs.policy-final-guard.outputs.run_attempt }}" \
+            "${{ needs.policy-final-guard.outputs.workflow_sha }}" \
+            "${{ needs.policy-final-guard.outputs.candidate_id }}"
+      - name: Install declared workflow parser dependency
+        if: >-
+          (needs.candidate-source.outputs.exists == 'true' &&
+           needs.final-guard.outputs.validated_bundle != 'true' &&
+           needs.final-guard.outputs.policy_validation_reuse != 'true') ||
+          (needs.policy-check.outputs.changed == 'true' &&
+           needs.policy-final-guard.outputs.validated_bundle != 'true' &&
+           needs.policy-final-guard.outputs.policy_validation_reuse != 'true')
+        run: |
+          python3 -m pip install --isolated --disable-pip-version-check --no-input --no-cache-dir \
+            --only-binary=:all: --no-deps --require-hashes --index-url https://pypi.org/simple \
+            --target "$RUNNER_TEMP/osconfig-policy-deps" \
+            -r .vps/google-osconfig-agent/patches/requirements-policy.txt
+      - name: Test trusted release gate after both reviews
+        id: policy
+        if: >-
+          needs.candidate-source.outputs.exists == 'true' &&
+          needs.final-guard.outputs.validated_bundle != 'true' &&
+          needs.final-guard.outputs.policy_validation_reuse != 'true'
+        env:
+          PYTHONPATH: ${{ runner.temp }}/osconfig-policy-deps
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
+        run: |
+          python3 -B .vps/google-osconfig-agent/patches/release.py policy-tests \
+            "$GITHUB_WORKSPACE/.vps/google-osconfig-agent/patches/tests"
+          echo 'policy_validated=true' >> "$GITHUB_OUTPUT"
+      - name: Reuse exact private bundle policy validation
+        id: policy-reuse
+        if: >-
+          needs.candidate-source.outputs.exists == 'true' &&
+          (needs.final-guard.outputs.validated_bundle == 'true' ||
+           needs.final-guard.outputs.policy_validation_reuse == 'true')
+        run: echo 'policy_validated=true' >> "$GITHUB_OUTPUT"
+      - name: Read the reviewed proposal's exact private lifecycle pin
+        id: proposal-maintenance-pin
+        if: >-
+          needs.policy-check.outputs.changed == 'true' &&
+          needs.policy-final-guard.outputs.validated_bundle != 'true' &&
+          needs.policy-final-guard.outputs.policy_validation_reuse != 'true'
+        run: |
+          python3 -B - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, pathlib, re
+
+          def unique_object(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise ValueError("duplicate proposal private lock key")
+                  result[key] = value
+              return result
+
+          proposal_root = pathlib.Path("policy-candidate")
+          relative_lock = pathlib.Path(".vps/google-osconfig-agent/patches/maintenance.lock.json")
+          if proposal_root.is_symlink() or not proposal_root.is_dir():
+              raise SystemExit("reviewed proposal checkout is missing or unsafe")
+          path = proposal_root
+          for part in relative_lock.parts:
+              path = path / part
+              if path.is_symlink():
+                  raise SystemExit("reviewed proposal private lock path contains a symlink")
+          if (not path.is_file() or path.stat().st_size > 4096
+                  or not path.resolve(strict=True).is_relative_to(proposal_root.resolve())):
+              raise SystemExit("reviewed proposal has no bounded regular private lock")
+          lock = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
+          if (not isinstance(lock, dict)
+                  or set(lock) != {"schema", "repository", "revision", "module_sha256", "api_version"}
+                  or type(lock.get("schema")) is not int or lock["schema"] != 1
+                  or lock.get("repository") != "warelik/machine-maintenance"
+                  or not isinstance(lock.get("revision"), str)
+                  or not re.fullmatch(r"[0-9a-f]{40}", lock["revision"])
+                  or not isinstance(lock.get("module_sha256"), str)
+                  or not re.fullmatch(r"[0-9a-f]{64}", lock["module_sha256"])
+                  or type(lock.get("api_version")) is not int or lock["api_version"] != 1):
+              raise SystemExit("reviewed proposal private lock has an invalid exact identity")
+          print(f"revision={lock['revision']}")
+          print(f"module_sha256={lock['module_sha256']}")
+          PY
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        if: >-
+          needs.policy-check.outputs.changed == 'true' &&
+          needs.policy-final-guard.outputs.validated_bundle != 'true' &&
+          needs.policy-final-guard.outputs.policy_validation_reuse != 'true'
+        with:
+          repository: warelik/machine-maintenance
+          ref: ${{ steps.proposal-maintenance-pin.outputs.revision }}
+          path: machine-maintenance-proposal
+          ssh-key: ${{ secrets.MAINTENANCE_READ_KEY }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Verify and receipt the reviewed proposal lifecycle source
+        if: >-
+          needs.policy-check.outputs.changed == 'true' &&
+          needs.policy-final-guard.outputs.validated_bundle != 'true' &&
+          needs.policy-final-guard.outputs.policy_validation_reuse != 'true'
+        env:
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance-proposal
+          PROPOSAL_MAINTENANCE_REVISION: ${{ steps.proposal-maintenance-pin.outputs.revision }}
+          PROPOSAL_MAINTENANCE_MODULE_SHA256: ${{ steps.proposal-maintenance-pin.outputs.module_sha256 }}
+        run: |
+          set -euo pipefail
+          printf '/machine-maintenance-proposal/\n' >> .git/info/exclude
+          test "$(git -C "$FORK_MAINTENANCE_ROOT" rev-parse HEAD)" = "$PROPOSAL_MAINTENANCE_REVISION"
+          if git -C "$FORK_MAINTENANCE_ROOT" config --local --get-regexp 'http\..*\.extraheader|core\.sshcommand' >/dev/null; then
+            echo 'Proposal private lifecycle checkout retained Git authentication' >&2
+            exit 1
+          fi
+          python3 -B - "$FORK_MAINTENANCE_ROOT" "$PROPOSAL_MAINTENANCE_REVISION" \
+            "$PROPOSAL_MAINTENANCE_MODULE_SHA256" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import re
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          revision, expected_sha256 = sys.argv[2:]
+          module = root / "fork_lifecycle.py"
+          receipt = root / ".maintenance-source.json"
+          if (not root.is_absolute() or root.is_symlink() or not root.is_dir()
+                  or module.is_symlink() or not module.is_file() or module.stat().st_size > 262144
+                  or receipt.is_symlink() or receipt.exists()):
+              raise SystemExit("proposal private source checkout is unsafe or already receipted")
+          if (not re.fullmatch(r"[0-9a-f]{40}", revision)
+                  or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256)):
+              raise SystemExit("proposal private source outputs are malformed")
+          source = module.read_bytes()
+          if hashlib.sha256(source).hexdigest() != expected_sha256:
+              raise SystemExit("proposal private source differs from its reviewed lock checksum")
+          receipt.write_text(json.dumps({
+              "repository": "warelik/machine-maintenance", "revision": revision,
+          }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+          PY
+      - name: Sandbox and test the proposed publisher policy after both reviews
+        id: policy-proposal
+        if: >-
+          needs.policy-check.outputs.changed == 'true' &&
+          needs.policy-final-guard.outputs.validated_bundle != 'true' &&
+          needs.policy-final-guard.outputs.policy_validation_reuse != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          POLICY_PR_NUMBER: ${{ needs.policy-check.outputs.pr }}
+          POLICY_HEAD_SHA: ${{ needs.policy-check.outputs.head }}
+          PYTHONPATH: ${{ runner.temp }}/osconfig-policy-deps
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance-proposal
+        run: |
+          python3 -B .vps/google-osconfig-agent/patches/release.py policy-validate-shared policy-candidate
+          echo 'policy_validated=true' >> "$GITHUB_OUTPUT"
+      - name: Reuse exact verified private policy bundle for the proposal
+        id: policy-proposal-reuse
+        if: >-
+          needs.policy-check.outputs.changed == 'true' &&
+          needs.policy-final-guard.outputs.validated_bundle == 'true'
+        run: echo 'policy_validated=true' >> "$GITHUB_OUTPUT"
+      - name: Reuse exact prior policy validation for the proposal
+        id: policy-proposal-history-reuse
+        if: >-
+          needs.policy-check.outputs.changed == 'true' &&
+          needs.policy-final-guard.outputs.validated_bundle != 'true' &&
+          needs.policy-final-guard.outputs.policy_validation_reuse == 'true'
+        run: echo 'policy_validated=true' >> "$GITHUB_OUTPUT"
+
+  adopt-policy:
+    needs: [policy-check, policy-review, policy-final-guard, prepare]
+    if: >-
+      needs.policy-check.outputs.changed == 'true' &&
+      needs.policy-review.result == 'success' && needs.policy-review.outputs.ready == 'true' &&
+      needs.policy-final-guard.result == 'success' &&
+      needs.policy-final-guard.outputs.decision == 'policy-only' &&
+      needs.policy-final-guard.outputs.candidate_id == needs.policy-check.outputs.candidate_id &&
+      needs.policy-final-guard.outputs.run_id == github.run_id &&
+      needs.policy-final-guard.outputs.run_attempt == github.run_attempt &&
+      needs.policy-final-guard.outputs.workflow_sha == github.sha &&
+      needs.prepare.result == 'success' && needs.prepare.outputs.policy_validated == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: master
+          path: trusted
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.policy-check.outputs.head }}
+          path: proposal
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Read the exact private lifecycle revision
+        id: maintenance-pin
+        run: |
+          python3 -B - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, re
+          lock = json.load(open("trusted/.vps/google-osconfig-agent/patches/maintenance.lock.json", encoding="utf-8"))
+          revision = lock.get("revision", "")
+          assert re.fullmatch(r"[0-9a-f]{40}", revision)
+          print(f"revision={revision}")
+          PY
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: warelik/machine-maintenance
+          ref: ${{ steps.maintenance-pin.outputs.revision }}
+          path: machine-maintenance
+          ssh-key: ${{ secrets.MAINTENANCE_READ_KEY }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Verify and receipt the exact read-only lifecycle source
+        env:
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
+        run: |
+          printf '/machine-maintenance/\n' >> trusted/.git/info/exclude
+          test "$(git -C "$FORK_MAINTENANCE_ROOT" rev-parse HEAD)" = "${{ steps.maintenance-pin.outputs.revision }}"
+          if git -C "$FORK_MAINTENANCE_ROOT" config --local --get-regexp 'http\..*\.extraheader|core\.sshcommand' >/dev/null; then
+            echo 'Private lifecycle checkout retained Git authentication' >&2
+            exit 1
+          fi
+          python3 -B - "$FORK_MAINTENANCE_ROOT/.maintenance-source.json" \
+            "${{ steps.maintenance-pin.outputs.revision }}" <<'PY'
+          import json, sys
+          with open(sys.argv[1], "w", encoding="utf-8") as stream:
+              json.dump({"repository": "warelik/machine-maintenance", "revision": sys.argv[2]}, stream)
+              stream.write("\n")
+          PY
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: google-osconfig-agent-policy-candidate
+          path: ${{ runner.temp }}/osconfig-policy-candidate
+      - name: Adopt only exact reviewed policy blobs without starting a second cycle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+          POLICY_PR_NUMBER: ${{ needs.policy-check.outputs.pr }}
+          POLICY_HEAD_SHA: ${{ needs.policy-check.outputs.head }}
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
+        run: python3 -B trusted/.vps/google-osconfig-agent/patches/release.py adopt-policy-pair \
+          "$RUNNER_TEMP/osconfig-policy-candidate" "$GITHUB_WORKSPACE/proposal"
+
+  close-policy-only-candidate:
+    needs: [candidate-source, review, final-guard, prepare]
+    if: >-
+      needs.candidate-source.outputs.exists == 'true' &&
+      needs.review.result == 'success' && needs.review.outputs.ready == 'true' &&
+      needs.final-guard.result == 'success' && needs.final-guard.outputs.decision == 'policy-only' &&
+      needs.final-guard.outputs.candidate_id == needs.candidate-source.outputs.candidate_id &&
+      needs.final-guard.outputs.run_id == github.run_id &&
+      needs.final-guard.outputs.run_attempt == github.run_attempt &&
+      needs.final-guard.outputs.workflow_sha == github.sha &&
+      needs.prepare.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: master
+          path: trusted
+          persist-credentials: false
+      - name: Read the exact private lifecycle revision
+        id: maintenance-pin
+        run: |
+          python3 -B - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, re
+          lock = json.load(open("trusted/.vps/google-osconfig-agent/patches/maintenance.lock.json", encoding="utf-8"))
+          revision = lock.get("revision", "")
+          assert re.fullmatch(r"[0-9a-f]{40}", revision)
+          print(f"revision={revision}")
+          PY
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: warelik/machine-maintenance
+          ref: ${{ steps.maintenance-pin.outputs.revision }}
+          path: machine-maintenance
+          ssh-key: ${{ secrets.MAINTENANCE_READ_KEY }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Verify and receipt the exact read-only lifecycle source
+        env:
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
+        run: |
+          printf '/machine-maintenance/\n' >> trusted/.git/info/exclude
+          test "$(git -C "$FORK_MAINTENANCE_ROOT" rev-parse HEAD)" = "${{ steps.maintenance-pin.outputs.revision }}"
+          if git -C "$FORK_MAINTENANCE_ROOT" config --local --get-regexp 'http\..*\.extraheader|core\.sshcommand' >/dev/null; then
+            echo 'Private lifecycle checkout retained Git authentication' >&2
+            exit 1
+          fi
+          python3 -B - "$FORK_MAINTENANCE_ROOT/.maintenance-source.json" \
+            "${{ steps.maintenance-pin.outputs.revision }}" <<'PY'
+          import json, sys
+          with open(sys.argv[1], "w", encoding="utf-8") as stream:
+              json.dump({"repository": "warelik/machine-maintenance", "revision": sys.argv[2]}, stream)
+              stream.write("\n")
+          PY
+      - name: Close the reviewed temporary contexts after policy-only validation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_PR: ${{ needs.candidate-source.outputs.pr }}
+          DELTA_PR: ${{ needs.candidate-source.outputs.delta_pr }}
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
+        run: python3 -B trusted/.vps/google-osconfig-agent/patches/release.py close .
+
+  repair:
+    needs: [candidate-source, build-rpm, review]
+    if: >-
+      always() && needs.candidate-source.outputs.exists == 'true' &&
       (needs.build-rpm.outputs.failure_class == 'application' ||
        (needs.review.result == 'success' && needs.review.outputs.ready == 'false' &&
-        needs.review.outputs.reason != 'Waiting for Codex; no completed exact-SHA review'))
+        needs.review.outputs.reason != 'Waiting for Codex; no completed exact-SHA review' &&
+        needs.review.outputs.reason != 'Both distinct exact-source review lists must complete before repair'))
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -377,6 +1253,11 @@ jobs:
         with:
           name: google-osconfig-agent-candidate
           path: ${{ runner.temp }}/osconfig-candidate
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.review.result == 'success'
+        with:
+          name: google-osconfig-agent-review-pair
+          path: ${{ runner.temp }}/osconfig-review
       - name: Request a native Codex fix with the failure evidence
         env:
           GH_TOKEN: ${{ github.token }}
@@ -385,19 +1266,25 @@ jobs:
         run: |
           python3 -B .vps/google-osconfig-agent/patches/release.py failed-job-evidence \
             "$GITHUB_RUN_ID" "$RUNNER_TEMP/failing-jobs.log"
-          { printf 'Review state: %s\n\n' "$REVIEW_REASON"; cat "$RUNNER_TEMP/failing-jobs.log"; } \
+          { printf 'Review state: %s\n\n' "$REVIEW_REASON"; \
+            cat "$RUNNER_TEMP/osconfig-review/review-pair.json" 2>/dev/null || true; \
+            cat "$RUNNER_TEMP/failing-jobs.log"; } \
             > "$RUNNER_TEMP/osconfig-failure-evidence.txt"
           python3 -B .vps/google-osconfig-agent/patches/release.py repair \
             "$RUNNER_TEMP/osconfig-candidate" "$RUNNER_TEMP/osconfig-failure-evidence.txt"
 
   repair-publisher:
-    needs: [prepare, build-rpm, review, sign, publish, adopt, policy-resume]
+    needs: [candidate-source, prepare, build-rpm, review, final-guard, sign, recover-validated,
+            publish, adopt, policy-resume]
     if: >-
       always() &&
-      (needs.prepare.result == 'failure' ||
+      (needs.candidate-source.result == 'failure' || needs.prepare.result == 'failure' ||
        needs.build-rpm.outputs.failure_class == 'publisher' ||
+       (needs.build-rpm.result == 'failure' && needs.build-rpm.outputs.failure_class != 'application') ||
        needs.review.result == 'failure' ||
-       needs.sign.result == 'failure' || needs.publish.result == 'failure' ||
+       needs.final-guard.result == 'failure' ||
+       needs.sign.result == 'failure' || needs.recover-validated.result == 'failure' ||
+       needs.publish.result == 'failure' ||
        needs.adopt.result == 'failure' || needs.policy-resume.result == 'failure')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -423,40 +1310,295 @@ jobs:
             "$RUNNER_TEMP/publisher-failure.log"
 
   sign:
-    needs: [prepare, build-rpm, review]
+    needs: [candidate-source, review, final-guard, prepare, build-rpm]
     if: >-
       needs.prepare.outputs.exists == 'true' && needs.build-rpm.result == 'success' &&
-      needs.review.result == 'success' && needs.review.outputs.ready == 'true'
+      needs.review.result == 'success' && needs.review.outputs.ready == 'true' &&
+      needs.candidate-source.outputs.exists == 'true' &&
+      needs.final-guard.result == 'success' && needs.final-guard.outputs.decision == 'allow' &&
+      needs.final-guard.outputs.candidate_id == needs.candidate-source.outputs.candidate_id &&
+      needs.final-guard.outputs.run_id == github.run_id &&
+      needs.final-guard.outputs.run_attempt == github.run_attempt &&
+      needs.final-guard.outputs.workflow_sha == github.sha &&
+      needs.prepare.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     container: fedora:44
     permissions:
       contents: read
+      issues: read
+      pull-requests: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check the frozen native run attempt before checkout or signing tools
+        env:
+          EXPECTED_RUN_ID: ${{ needs.final-guard.outputs.run_id }}
+          EXPECTED_RUN_ATTEMPT: ${{ needs.final-guard.outputs.run_attempt }}
+          EXPECTED_WORKFLOW_SHA: ${{ needs.final-guard.outputs.workflow_sha }}
+          EXPECTED_CANDIDATE_ID: ${{ needs.final-guard.outputs.candidate_id }}
+          EXPECTED_DECISION: ${{ needs.final-guard.outputs.decision }}
+          SOURCE_CANDIDATE_ID: ${{ needs.candidate-source.outputs.candidate_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_DECISION" == allow ]]
+          [[ "$EXPECTED_RUN_ID" == "$GITHUB_RUN_ID" ]]
+          [[ "$EXPECTED_RUN_ATTEMPT" == "$GITHUB_RUN_ATTEMPT" ]]
+          [[ "$EXPECTED_WORKFLOW_SHA" == "$GITHUB_SHA" ]]
+          [[ "$EXPECTED_CANDIDATE_ID" == "$SOURCE_CANDIDATE_ID" ]]
+      - name: Check out the exact trusted workflow source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Read the exact private lifecycle revision
+        id: maintenance-pin
+        run: |
+          python3 -B - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, re
+          lock = json.load(open(".vps/google-osconfig-agent/patches/maintenance.lock.json", encoding="utf-8"))
+          revision = lock.get("revision", "")
+          assert re.fullmatch(r"[0-9a-f]{40}", revision)
+          print(f"revision={revision}")
+          PY
+      - name: Install private checkout transport tools
+        run: dnf -y install git openssh-clients
+      - name: Check out the exact private lifecycle source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: warelik/machine-maintenance
+          ref: ${{ steps.maintenance-pin.outputs.revision }}
+          path: machine-maintenance
+          ssh-key: ${{ secrets.MAINTENANCE_READ_KEY }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Verify and receipt the exact read-only lifecycle source
+        env:
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
+        run: |
+          printf '/machine-maintenance/\n' >> .git/info/exclude
+          test "$(git -C "$FORK_MAINTENANCE_ROOT" rev-parse HEAD)" = "${{ steps.maintenance-pin.outputs.revision }}"
+          if git -C "$FORK_MAINTENANCE_ROOT" config --local --get-regexp 'http\..*\.extraheader|core\.sshcommand' >/dev/null; then
+            echo 'Private lifecycle checkout retained Git authentication' >&2
+            exit 1
+          fi
+          python3 -B - "$FORK_MAINTENANCE_ROOT/.maintenance-source.json" \
+            "${{ steps.maintenance-pin.outputs.revision }}" <<'PY'
+          import json, sys
+          with open(sys.argv[1], "w", encoding="utf-8") as stream:
+              json.dump({"repository": "warelik/machine-maintenance", "revision": sys.argv[2]}, stream)
+              stream.write("\n")
+          PY
       - name: Install RPM signing tools
         run: dnf -y install rpm-sign createrepo_c gnupg2 rpm jq coreutils findutils
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - name: Download the exact built RPM
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: google-osconfig-agent-built-rpm
           path: ${{ runner.temp }}/osconfig-built
+      - name: Download the exact candidate source artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: google-osconfig-agent-candidate
+          path: ${{ runner.temp }}/osconfig-candidate
+      - name: Verify this exact native run and built RPM receipt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_PR: ${{ needs.candidate-source.outputs.pr }}
+          EXPECTED_CANDIDATE_ID: ${{ needs.final-guard.outputs.candidate_id }}
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
+        run: |
+          python3 -B .vps/google-osconfig-agent/patches/release.py verify-final-run \
+            "$RUNNER_TEMP/osconfig-candidate" \
+            "${{ needs.final-guard.outputs.run_id }}" \
+            "${{ needs.final-guard.outputs.run_attempt }}" \
+            "${{ needs.final-guard.outputs.workflow_sha }}" \
+            "${{ needs.final-guard.outputs.candidate_id }}"
+          python3 -B .vps/google-osconfig-agent/patches/release.py verify-build-provenance \
+            "$RUNNER_TEMP/osconfig-candidate" "$RUNNER_TEMP/osconfig-built" \
+            "${{ needs.final-guard.outputs.run_id }}" \
+            "${{ needs.final-guard.outputs.run_attempt }}" \
+            "${{ needs.final-guard.outputs.workflow_sha }}" \
+            "${{ needs.final-guard.outputs.candidate_id }}"
       - name: Check signing and verifier rejection with disposable keys
         run: bash .vps/google-osconfig-agent/patches/tests/signing.sh "$RUNNER_TEMP/osconfig-built"
       - name: Sign and verify RPM and RPM-MD metadata
         env:
           OSCONFIG_RPM_SIGNING_PRIVATE_KEY: ${{ secrets.OSCONFIG_RPM_SIGNING_PRIVATE_KEY }}
           OSCONFIG_RPM_SIGNING_FINGERPRINT: ${{ vars.OSCONFIG_RPM_SIGNING_FINGERPRINT }}
-          EXPECTED_CANDIDATE_SHA: ${{ needs.prepare.outputs.sha }}
-          EXPECTED_UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream }}
-          EXPECTED_PATCH_SHA: ${{ needs.prepare.outputs.patch }}
+          EXPECTED_CANDIDATE_SHA: ${{ needs.candidate-source.outputs.sha }}
+          EXPECTED_UPSTREAM_SHA: ${{ needs.candidate-source.outputs.upstream }}
+          EXPECTED_PATCH_SHA: ${{ needs.candidate-source.outputs.patch }}
         run: |
           bash .vps/google-osconfig-agent/patches/sign-repo.sh \
             "$RUNNER_TEMP/osconfig-built" "$RUNNER_TEMP/osconfig-pages"
           bash .vps/google-osconfig-agent/patches/verify-repo.sh \
             "$RUNNER_TEMP/osconfig-built" "$RUNNER_TEMP/osconfig-pages"
+      - name: Upload the signed RPM repository
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: google-osconfig-agent-pages
+          path: ${{ runner.temp }}/osconfig-pages/rpm
+          if-no-files-found: error
+          retention-days: 3
+      - name: Record the exact native signature artifact identity
+        env:
+          EXPECTED_CANDIDATE_ID: ${{ needs.final-guard.outputs.candidate_id }}
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
+        run: |
+          python3 -B .vps/google-osconfig-agent/patches/release.py \
+            write-signature-proof "$RUNNER_TEMP/osconfig-candidate" \
+            "$RUNNER_TEMP/osconfig-built" "$RUNNER_TEMP/osconfig-pages/rpm" \
+            "$RUNNER_TEMP/osconfig-final-proof"
+      - name: Upload exact native signature provenance
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: google-osconfig-agent-final-proof
+          path: ${{ runner.temp }}/osconfig-final-proof
+          if-no-files-found: error
+          retention-days: 3
+
+  recover-validated:
+    needs: [candidate-source, review, final-guard, prepare]
+    if: >-
+      needs.candidate-source.outputs.exists == 'true' &&
+      needs.review.result == 'success' && needs.review.outputs.ready == 'true' &&
+      needs.final-guard.result == 'success' &&
+      needs.final-guard.outputs.decision == 'already-validated' &&
+      needs.final-guard.outputs.candidate_id == needs.candidate-source.outputs.candidate_id &&
+      needs.final-guard.outputs.run_id == github.run_id &&
+      needs.final-guard.outputs.run_attempt == github.run_attempt &&
+      needs.final-guard.outputs.workflow_sha == github.sha &&
+      needs.prepare.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container: fedora:44
+    permissions:
+      actions: read
+      contents: read
+      issues: read
+      pull-requests: read
+    steps:
+      - name: Check the frozen metadata-continuation attempt
+        env:
+          EXPECTED_RUN_ID: ${{ needs.final-guard.outputs.run_id }}
+          EXPECTED_RUN_ATTEMPT: ${{ needs.final-guard.outputs.run_attempt }}
+          EXPECTED_WORKFLOW_SHA: ${{ needs.final-guard.outputs.workflow_sha }}
+          EXPECTED_CANDIDATE_ID: ${{ needs.final-guard.outputs.candidate_id }}
+          SOURCE_CANDIDATE_ID: ${{ needs.candidate-source.outputs.candidate_id }}
+          REUSE_RUN_ID: ${{ needs.final-guard.outputs.reuse_run_id }}
+          REUSE_RUN_ATTEMPT: ${{ needs.final-guard.outputs.reuse_run_attempt }}
+          REUSE_WORKFLOW_SHA: ${{ needs.final-guard.outputs.reuse_workflow_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_RUN_ID" == "$GITHUB_RUN_ID" ]]
+          [[ "$EXPECTED_RUN_ATTEMPT" == "$GITHUB_RUN_ATTEMPT" ]]
+          [[ "$EXPECTED_WORKFLOW_SHA" == "$GITHUB_SHA" ]]
+          [[ "$EXPECTED_CANDIDATE_ID" == "$SOURCE_CANDIDATE_ID" ]]
+          [[ "$REUSE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$REUSE_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+          [[ "$REUSE_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Read the exact private lifecycle revision
+        id: maintenance-pin
+        run: |
+          python3 -B - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, re
+          lock = json.load(open(".vps/google-osconfig-agent/patches/maintenance.lock.json", encoding="utf-8"))
+          revision = lock.get("revision", "")
+          assert re.fullmatch(r"[0-9a-f]{40}", revision)
+          print(f"revision={revision}")
+          PY
+      - name: Install private checkout transport tools
+        run: dnf -y install git openssh-clients
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: warelik/machine-maintenance
+          ref: ${{ steps.maintenance-pin.outputs.revision }}
+          path: machine-maintenance
+          ssh-key: ${{ secrets.MAINTENANCE_READ_KEY }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Verify and receipt the exact read-only lifecycle source
+        env:
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
+        run: |
+          printf '/machine-maintenance/\n' >> .git/info/exclude
+          test "$(git -C "$FORK_MAINTENANCE_ROOT" rev-parse HEAD)" = "${{ steps.maintenance-pin.outputs.revision }}"
+          if git -C "$FORK_MAINTENANCE_ROOT" config --local --get-regexp 'http\..*\.extraheader|core\.sshcommand' >/dev/null; then
+            echo 'Private lifecycle checkout retained Git authentication' >&2
+            exit 1
+          fi
+          python3 -B - "$FORK_MAINTENANCE_ROOT/.maintenance-source.json" \
+            "${{ steps.maintenance-pin.outputs.revision }}" <<'PY'
+          import json, sys
+          with open(sys.argv[1], "w", encoding="utf-8") as stream:
+              json.dump({"repository": "warelik/machine-maintenance", "revision": sys.argv[2]}, stream)
+              stream.write("\n")
+          PY
+      - name: Install RPM verification tools
+        run: dnf -y install rpm-sign createrepo_c gnupg2 rpm jq coreutils findutils
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: google-osconfig-agent-candidate
+          path: ${{ runner.temp }}/osconfig-candidate
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: google-osconfig-agent-built-rpm
+          path: ${{ runner.temp }}/osconfig-built
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.final-guard.outputs.reuse_run_id }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: google-osconfig-agent-pages
+          path: ${{ runner.temp }}/osconfig-pages/rpm
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.final-guard.outputs.reuse_run_id }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        continue-on-error: true
+        with:
+          name: google-osconfig-agent-final-proof
+          path: ${{ runner.temp }}/osconfig-final-proof
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.final-guard.outputs.reuse_run_id }}
+          github-token: ${{ github.token }}
+      - name: Verify exact prior run-attempt artifacts and signed metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+          CANDIDATE_PR: ${{ needs.candidate-source.outputs.pr }}
+          OSCONFIG_RPM_SIGNING_FINGERPRINT: ${{ vars.OSCONFIG_RPM_SIGNING_FINGERPRINT }}
+          EXPECTED_CANDIDATE_SHA: ${{ needs.candidate-source.outputs.sha }}
+          EXPECTED_UPSTREAM_SHA: ${{ needs.candidate-source.outputs.upstream }}
+          EXPECTED_PATCH_SHA: ${{ needs.candidate-source.outputs.patch }}
+          EXPECTED_CANDIDATE_ID: ${{ needs.final-guard.outputs.candidate_id }}
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
+        run: |
+          python3 -B .vps/google-osconfig-agent/patches/release.py verify-final-run \
+            "$RUNNER_TEMP/osconfig-candidate" \
+            "${{ needs.final-guard.outputs.run_id }}" \
+            "${{ needs.final-guard.outputs.run_attempt }}" \
+            "${{ needs.final-guard.outputs.workflow_sha }}" \
+            "${{ needs.final-guard.outputs.candidate_id }}"
+          python3 -B .vps/google-osconfig-agent/patches/release.py verify-reusable-artifacts \
+            "$RUNNER_TEMP/osconfig-candidate" "$RUNNER_TEMP/osconfig-built" \
+            "$RUNNER_TEMP/osconfig-pages/rpm" "$RUNNER_TEMP/osconfig-final-proof" \
+            "${{ needs.final-guard.outputs.reuse_run_id }}" \
+            "${{ needs.final-guard.outputs.reuse_run_attempt }}" \
+            "${{ needs.final-guard.outputs.reuse_workflow_sha }}" \
+            "${{ needs.final-guard.outputs.candidate_id }}" \
+            "${{ needs.final-guard.outputs.reuse_legacy_attempt_one }}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: google-osconfig-agent-built-rpm
+          path: ${{ runner.temp }}/osconfig-built
+          if-no-files-found: error
+          retention-days: 3
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: google-osconfig-agent-pages
@@ -465,15 +1607,30 @@ jobs:
           retention-days: 3
 
   publish:
-    needs: [prepare, review, sign]
+    needs: [candidate-source, review, final-guard, prepare, sign, recover-validated]
     if: >-
-      needs.prepare.outputs.exists == 'true' && needs.review.result == 'success' &&
-      needs.review.outputs.ready == 'true' && needs.sign.result == 'success'
+      always() && !cancelled() &&
+      needs.candidate-source.outputs.exists == 'true' &&
+      (needs.final-guard.outputs.decision == 'allow' ||
+       needs.final-guard.outputs.decision == 'already-validated') &&
+      needs.prepare.result == 'success' &&
+      needs.final-guard.outputs.candidate_id == needs.candidate-source.outputs.candidate_id &&
+      needs.final-guard.outputs.run_id == github.run_id &&
+      needs.final-guard.outputs.run_attempt == github.run_attempt &&
+      needs.final-guard.outputs.workflow_sha == github.sha &&
+      needs.review.result == 'success' &&
+      needs.review.outputs.ready == 'true' &&
+      ((needs.final-guard.outputs.decision == 'allow' && needs.sign.result == 'success') ||
+       (needs.final-guard.outputs.decision == 'already-validated' &&
+        needs.recover-validated.result == 'success'))
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     permissions:
       contents: read
       pages: write
       id-token: write
+      pull-requests: read
+      issues: read
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -482,6 +1639,41 @@ jobs:
         with:
           ref: master
           persist-credentials: false
+      - name: Read the exact private lifecycle revision
+        id: maintenance-pin
+        run: |
+          python3 -B - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, re
+          lock = json.load(open(".vps/google-osconfig-agent/patches/maintenance.lock.json", encoding="utf-8"))
+          revision = lock.get("revision", "")
+          assert re.fullmatch(r"[0-9a-f]{40}", revision)
+          print(f"revision={revision}")
+          PY
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: warelik/machine-maintenance
+          ref: ${{ steps.maintenance-pin.outputs.revision }}
+          path: machine-maintenance
+          ssh-key: ${{ secrets.MAINTENANCE_READ_KEY }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Verify and receipt the exact read-only lifecycle source
+        env:
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
+        run: |
+          printf '/machine-maintenance/\n' >> .git/info/exclude
+          test "$(git -C "$FORK_MAINTENANCE_ROOT" rev-parse HEAD)" = "${{ steps.maintenance-pin.outputs.revision }}"
+          if git -C "$FORK_MAINTENANCE_ROOT" config --local --get-regexp 'http\..*\.extraheader|core\.sshcommand' >/dev/null; then
+            echo 'Private lifecycle checkout retained Git authentication' >&2
+            exit 1
+          fi
+          python3 -B - "$FORK_MAINTENANCE_ROOT/.maintenance-source.json" \
+            "${{ steps.maintenance-pin.outputs.revision }}" <<'PY'
+          import json, sys
+          with open(sys.argv[1], "w", encoding="utf-8") as stream:
+              json.dump({"repository": "warelik/machine-maintenance", "revision": sys.argv[2]}, stream)
+              stream.write("\n")
+          PY
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: google-osconfig-agent-candidate
@@ -497,11 +1689,20 @@ jobs:
       - name: Recheck exact review and signed repository before publication
         env:
           GH_TOKEN: ${{ github.token }}
+          CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+          CANDIDATE_PR: ${{ needs.candidate-source.outputs.pr }}
           OSCONFIG_RPM_SIGNING_FINGERPRINT: ${{ vars.OSCONFIG_RPM_SIGNING_FINGERPRINT }}
-          EXPECTED_CANDIDATE_SHA: ${{ needs.prepare.outputs.sha }}
-          EXPECTED_UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream }}
-          EXPECTED_PATCH_SHA: ${{ needs.prepare.outputs.patch }}
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
+          EXPECTED_CANDIDATE_SHA: ${{ needs.candidate-source.outputs.sha }}
+          EXPECTED_UPSTREAM_SHA: ${{ needs.candidate-source.outputs.upstream }}
+          EXPECTED_PATCH_SHA: ${{ needs.candidate-source.outputs.patch }}
         run: |
+          python3 -B .vps/google-osconfig-agent/patches/release.py verify-final-run \
+            "$RUNNER_TEMP/osconfig-candidate" \
+            "${{ needs.final-guard.outputs.run_id }}" \
+            "${{ needs.final-guard.outputs.run_attempt }}" \
+            "${{ needs.final-guard.outputs.workflow_sha }}" \
+            "${{ needs.final-guard.outputs.candidate_id }}"
           sudo apt-get update
           sudo apt-get install -y gnupg jq rpm
           bash .vps/google-osconfig-agent/patches/verify-repo.sh "$RUNNER_TEMP/osconfig-built" "$RUNNER_TEMP/osconfig-pages"
@@ -518,20 +1719,65 @@ jobs:
         id: deployment
         uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5
   adopt:
-    needs: [prepare, review, publish]
+    needs: [candidate-source, review, final-guard, prepare, publish]
     if: >-
-      needs.prepare.outputs.exists == 'true' && needs.review.result == 'success' &&
+      needs.candidate-source.outputs.exists == 'true' &&
+      (needs.final-guard.outputs.decision == 'allow' ||
+       needs.final-guard.outputs.decision == 'already-validated') &&
+      needs.prepare.result == 'success' &&
+      needs.final-guard.outputs.candidate_id == needs.candidate-source.outputs.candidate_id &&
+      needs.final-guard.outputs.run_id == github.run_id &&
+      needs.final-guard.outputs.run_attempt == github.run_attempt &&
+      needs.final-guard.outputs.workflow_sha == github.sha &&
+      needs.review.result == 'success' &&
       needs.review.outputs.ready == 'true' && needs.publish.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: write
       pull-requests: write
+      issues: read
+      deployments: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: master
           persist-credentials: false
+      - name: Read the exact private lifecycle revision
+        id: maintenance-pin
+        run: |
+          python3 -B - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, re
+          lock = json.load(open(".vps/google-osconfig-agent/patches/maintenance.lock.json", encoding="utf-8"))
+          revision = lock.get("revision", "")
+          assert re.fullmatch(r"[0-9a-f]{40}", revision)
+          print(f"revision={revision}")
+          PY
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: warelik/machine-maintenance
+          ref: ${{ steps.maintenance-pin.outputs.revision }}
+          path: machine-maintenance
+          ssh-key: ${{ secrets.MAINTENANCE_READ_KEY }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Verify and receipt the exact read-only lifecycle source
+        env:
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
+        run: |
+          printf '/machine-maintenance/\n' >> .git/info/exclude
+          test "$(git -C "$FORK_MAINTENANCE_ROOT" rev-parse HEAD)" = "${{ steps.maintenance-pin.outputs.revision }}"
+          if git -C "$FORK_MAINTENANCE_ROOT" config --local --get-regexp 'http\..*\.extraheader|core\.sshcommand' >/dev/null; then
+            echo 'Private lifecycle checkout retained Git authentication' >&2
+            exit 1
+          fi
+          python3 -B - "$FORK_MAINTENANCE_ROOT/.maintenance-source.json" \
+            "${{ steps.maintenance-pin.outputs.revision }}" <<'PY'
+          import json, sys
+          with open(sys.argv[1], "w", encoding="utf-8") as stream:
+              json.dump({"repository": "warelik/machine-maintenance", "revision": sys.argv[2]}, stream)
+              stream.write("\n")
+          PY
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: google-osconfig-agent-candidate
@@ -547,11 +1793,20 @@ jobs:
       - name: Verify publication and persist the exact source, patch and required EVR
         env:
           GH_TOKEN: ${{ github.token }}
+          CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+          CANDIDATE_PR: ${{ needs.candidate-source.outputs.pr }}
           OSCONFIG_RPM_SIGNING_FINGERPRINT: ${{ vars.OSCONFIG_RPM_SIGNING_FINGERPRINT }}
-          EXPECTED_CANDIDATE_SHA: ${{ needs.prepare.outputs.sha }}
-          EXPECTED_UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream }}
-          EXPECTED_PATCH_SHA: ${{ needs.prepare.outputs.patch }}
+          FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
+          EXPECTED_CANDIDATE_SHA: ${{ needs.candidate-source.outputs.sha }}
+          EXPECTED_UPSTREAM_SHA: ${{ needs.candidate-source.outputs.upstream }}
+          EXPECTED_PATCH_SHA: ${{ needs.candidate-source.outputs.patch }}
         run: |
+          python3 -B .vps/google-osconfig-agent/patches/release.py verify-final-run \
+            "$RUNNER_TEMP/osconfig-candidate" \
+            "${{ needs.final-guard.outputs.run_id }}" \
+            "${{ needs.final-guard.outputs.run_attempt }}" \
+            "${{ needs.final-guard.outputs.workflow_sha }}" \
+            "${{ needs.final-guard.outputs.candidate_id }}"
           sudo apt-get update
           sudo apt-get install -y gnupg jq rpm
           bash .vps/google-osconfig-agent/patches/verify-repo.sh "$RUNNER_TEMP/osconfig-built" "$RUNNER_TEMP/osconfig-pages"

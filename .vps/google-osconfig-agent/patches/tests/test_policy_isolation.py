@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
@@ -436,6 +437,122 @@ raise SystemExit(2)
         self.assertIn("review_ready=false", output)
         self.assertIn("Codex reported a finding on this exact SHA", output)
 
+    def assert_policy_candidate_source_cleanup(self, *, fail_at_delta=False):
+        with tempfile.TemporaryDirectory(prefix="osconfig-policy-source-test-") as temporary:
+            candidate_dir = Path(temporary) / "candidate"
+            candidate_dir.mkdir()
+            pull = self.policy_pull()
+            candidate = {
+                "schema": 1, "repository": self.repo,
+                "upstream_sha": "d" * 40, "application_sha": "e" * 40,
+                "configuration_sha": "f" * 40, "patchset_sha256": "1" * 64,
+                "recipe_sha256": "2" * 64, "platform": "fedora-44/x86_64",
+            }
+            published = {
+                "upstreamTag": "v1.2.3", "upstreamArchiveSha256": "3" * 64,
+                "patchSha256": "4" * 64, "specSha256": "5" * 64,
+            }
+            settings = {"github_owner": "warelik", "github_repo": "osconfig",
+                        "signing_fingerprint": "A1B2C3D4"}
+            source_roots = []
+            real_temporary_directory = release.tempfile.TemporaryDirectory
+
+            def tracked_temporary_directory(*args, **kwargs):
+                manager = real_temporary_directory(*args, **kwargs)
+                source_roots.append(Path(manager.name))
+                return manager
+
+            def api(path, **_kwargs):
+                if path == f"repos/{self.repo}/pulls/42":
+                    return pull
+                if path == f"repos/{self.repo}/actions/variables/FORK_ACCEPTED_BASELINE":
+                    return {"name": "FORK_ACCEPTED_BASELINE", "value": "{}"}
+                raise AssertionError(path)
+
+            def candidate_identity(value):
+                canonical = json.dumps(value, sort_keys=True, separators=(",", ":"))
+                return release.hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+            def published_identity(_repo, _published, work_root):
+                work_root = Path(work_root)
+                self.assertTrue(work_root.is_dir())
+                (work_root / "source-fixture").write_text("temporary checkout", encoding="utf-8")
+                return dict(candidate)
+
+            def create_delta(*_args, **_kwargs):
+                if fail_at_delta:
+                    raise RuntimeError("fixture delta snapshot failed")
+                return "6" * 40, f"review-base/{candidate['configuration_sha']}"
+
+            ensure_pull = iter(({"number": 71}, {"number": 72}))
+            review_result = ({}, {}, {"state": "ready", "complete": True})
+            with ExitStack() as stack:
+                stack.enter_context(patch.dict(os.environ, {
+                    "GITHUB_REPOSITORY": self.repo,
+                    "GITHUB_SHA": self.config_sha,
+                    "POLICY_PR_NUMBER": "42",
+                    "POLICY_HEAD_SHA": self.candidate_sha,
+                    "OSCONFIG_RPM_SIGNING_FINGERPRINT": settings["signing_fingerprint"],
+                }, clear=True))
+                stack.enter_context(patch.object(
+                    release.tempfile, "TemporaryDirectory",
+                    side_effect=tracked_temporary_directory))
+                stack.enter_context(patch.object(release, "api", side_effect=api))
+                stack.enter_context(patch.object(
+                    release, "policy_changes", return_value=[release.PREFIX + "release.py"]))
+                stack.enter_context(patch.object(release, "repository_settings", return_value=settings))
+                stack.enter_context(patch.object(release, "published_manifest", return_value=published))
+                stack.enter_context(patch.object(
+                    release, "owner_token", return_value="fixture-owner-token"))
+                stack.enter_context(patch.object(release, "lifecycle_module", return_value=type(
+                    "LifecycleFixture", (), {"candidate_identity": staticmethod(candidate_identity)})()))
+                stack.enter_context(patch.object(
+                    release, "verified_pages_baseline",
+                    return_value={"published_at": "2026-10-01T00:00:00Z"}))
+                stack.enter_context(patch.object(
+                    release, "published_candidate_identity", side_effect=published_identity))
+                stack.enter_context(patch.object(
+                    release, "accepted_baseline_proof", return_value={"fixture": True}))
+                stack.enter_context(patch.object(release, "run", return_value=""))
+                stack.enter_context(patch.object(release, "ensure_review_base"))
+                stack.enter_context(patch.object(
+                    release, "create_delta_snapshot", side_effect=create_delta))
+                stack.enter_context(patch.object(
+                    release, "create_application_review_context", return_value="7" * 40))
+                stack.enter_context(patch.object(release, "ensure_review_branch"))
+                stack.enter_context(patch.object(
+                    release, "ensure_review_pull",
+                    side_effect=lambda *_args, **_kwargs: next(ensure_pull)))
+                stack.enter_context(patch.object(
+                    release, "load_review_finding_history", return_value=([], [], {}, {})))
+                stack.enter_context(patch.object(
+                    release, "create_review_finding_dispositions"))
+                stack.enter_context(patch.object(release, "record_policy_pair_context"))
+                stack.enter_context(patch.object(release, "request_lifecycle_review"))
+                stack.enter_context(patch.object(
+                    release, "review_pair_status", return_value=review_result))
+                stack.enter_context(patch.object(
+                    release, "complete_machine_finding_dispositions",
+                    return_value=review_result))
+                stack.enter_context(patch.object(release, "record_review_finding_batch"))
+                stack.enter_context(patch.object(release, "output"))
+                if fail_at_delta:
+                    with self.assertRaisesRegex(RuntimeError, "fixture delta snapshot failed"):
+                        release.prepare_policy_candidate(candidate_dir)
+                else:
+                    release.prepare_policy_candidate(candidate_dir)
+
+            self.assertEqual(len(source_roots), 1)
+            self.assertFalse(source_roots[0].exists())
+            self.assertEqual((candidate_dir / "inputs" / "candidate-manifest.json").is_file(),
+                             not fail_at_delta)
+
+    def test_prepare_policy_candidate_removes_temporary_source_after_success(self):
+        self.assert_policy_candidate_source_cleanup()
+
+    def test_prepare_policy_candidate_removes_temporary_source_after_failure(self):
+        self.assert_policy_candidate_source_cleanup(fail_at_delta=True)
+
     def policy_repair_history(self, head, *, created_at, started_at):
         old = int(datetime.now(timezone.utc).timestamp()) - 10800
         state = json.dumps({"config": self.config_sha, "startedAt": started_at}, sort_keys=True)
@@ -827,7 +944,16 @@ class PolicyGateIsolationTests(unittest.TestCase):
             for host_environment in container_host_environments:
                 self.assertEqual(host_environment.get("HOME"), os.environ.get("HOME"))
                 self.assertEqual(host_environment.get("XDG_DATA_HOME"), os.environ.get("XDG_DATA_HOME"))
-            self.assertNotIn(str(candidate), " ".join(docker_commands[0]))
+            for command in docker_commands:
+                mount_specs = [command[index + 1] for index, value in enumerate(command[:-1])
+                               if value == "--mount"]
+                self.assertFalse(any(spec.startswith(f"type=bind,source={candidate},")
+                                    or f",source={candidate}/" in spec
+                                    for spec in mount_specs))
+                self.assertNotIn(str(candidate / release.PREFIX / "release.py"), [
+                    argument for argument in command
+                    if not argument.startswith("OSCONFIG_POLICY_CANDIDATE_RELEASE=")
+                ])
             download = next(command for command in docker_commands if "download" in command)
             self.assertIn("https://pypi.org/simple", download)
             self.assertIn("--only-binary=:all:", download)

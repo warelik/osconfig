@@ -19,6 +19,25 @@ import maintenance
 import release
 
 
+class RepairInstructionProtocolTests(unittest.TestCase):
+    def test_task_example_is_not_a_receipt_but_actual_malformed_receipt_still_blocks(self):
+        base = {"id": 1, "created_at": "2026-10-24T00:00:00Z",
+                "updated_at": "2026-10-24T00:00:00Z",
+                "user": {"login": "warelik", "type": "User"}}
+        task = {**base, "body": "Coding task. " + release.FINDING_DISPOSITION_INSTRUCTION}
+        with patch.object(release, "pages", return_value=[task]):
+            self.assertEqual(release.load_review_finding_history(
+                "warelik/osconfig", 115, published_at="2026-10-23T00:00:00Z")[1:],
+                ([], {}, {}))
+        self.assertNotIn(release.FINDING_DISPOSITION_PREFIX,
+                         release._owner_protocol_comment_body("warelik", task))
+        broken = {**base, "body": task["body"] + '\n<!-- fork-review-disposition:v1 {"schema":1} -->'}
+        with patch.object(release, "pages", return_value=[broken]):
+            with self.assertRaisesRegex(ValueError, "disposition is malformed"):
+                release.load_review_finding_history(
+                    "warelik/osconfig", 115, published_at="2026-10-23T00:00:00Z")
+
+
 class ExactShaReviewTests(unittest.TestCase):
     sha = "a" * 40
     requested = "2026-10-17T12:00:00Z"

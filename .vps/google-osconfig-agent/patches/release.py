@@ -1743,6 +1743,7 @@ def _owner_protocol_comment_body(owner, comment, *, cutoff=None):
         body = ""
     if not isinstance(body, str):
         raise ValueError("Owner-authenticated comment body is malformed")
+    body = body.replace(FINDING_DISPOSITION_INSTRUCTION, "")
     user = comment.get("user") or {}
     if user.get("login") != owner or user.get("type") != "User":
         return body
@@ -1791,6 +1792,9 @@ def load_review_finding_history(repo, pull_number, *, published_at=None):
             body = ""
         if not isinstance(body, str):
             raise ValueError("Owner-authenticated finding comment body is malformed")
+        # The exact trusted coding-task instructions contain a proposal example,
+        # not an authoritative owner disposition. Actual receipts remain strict.
+        body = body.replace(FINDING_DISPOSITION_INSTRUCTION, "")
         created_at, updated_at = comment.get("created_at"), comment.get("updated_at")
         parsed_times = None
         if isinstance(created_at, str) and isinstance(updated_at, str):

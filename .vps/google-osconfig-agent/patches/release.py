@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """GitHub-native exact-SHA review and package adoption for the OS Config fix."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import ast
 import base64
 import binascii
@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from urllib.parse import quote, urlencode, urlsplit
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
@@ -29,6 +30,8 @@ UPSTREAM = "GoogleCloudPlatform/osconfig"
 DEFAULT_BRANCH = "master"
 BOT = "chatgpt-codex-connector[bot]"
 APP = "chatgpt-codex-connector"
+REVIEW_MODES = {"bot", "owner", "none"}
+OWNER_ACCEPTANCE_AUTHORIZATION_SHA256 = "3343e4d2dfc5a06b529fe32b352bfc0b798539c8454d02f60d9cae3ccd5cc7b0"
 SHA = re.compile(r"^[0-9a-f]{40}$")
 NATIVE_STATE = re.compile(r"<!-- codex-review-state:v1 (\{.*?\}) -->", re.S)
 REVIEWED = re.compile(r"(?im)^.*?Reviewed commit[^0-9a-f]*`?([0-9a-f]{7,40})`?\s*\*{0,2}\s*$")
@@ -831,6 +834,55 @@ def review_gate(sha, requested_at, reviews, inline, comments, resolve):
     return False, WAITING
 
 
+def review_mode():
+    mode = os.environ.get("FORK_REVIEW_MODE", "bot").strip().lower()
+    if mode not in REVIEW_MODES:
+        raise ValueError("FORK_REVIEW_MODE must be bot, owner or none")
+    return mode
+
+
+def review_trigger_prefix():
+    if review_mode() not in {"bot", "owner"}:
+        return ""
+    trigger = os.environ.get("FORK_REVIEW_TRIGGER", "@codex review").strip()
+    return trigger + "\n\n" if trigger else ""
+
+
+def _owner_acceptance_body(candidate, scope, number, request, review_sha, base_sha):
+    value = {
+        "schema": 1,
+        "authorization_sha256": OWNER_ACCEPTANCE_AUTHORIZATION_SHA256,
+        "repository": candidate["repository"],
+        "pr": number,
+        "request_id": request["id"],
+        "scope": scope,
+        "review_sha": review_sha,
+        "base_sha": base_sha,
+        "candidate_id": lifecycle_module().candidate_identity(candidate),
+    }
+    return ("<!-- machine-maintenance-owner-acceptance:v1 "
+            + json.dumps(value, separators=(",", ":")) + " -->")
+
+
+def _ensure_owner_acceptance(candidate, scope, number, request, review_sha, base_sha, comments):
+    if review_mode() != "none":
+        return False
+    repo = candidate["repository"]
+    owner = repo.split("/", 1)[0]
+    body = _owner_acceptance_body(candidate, scope, number, request, review_sha, base_sha)
+    if any(comment.get("body") == body
+           and comment.get("user", {}).get("login") == owner
+           and comment.get("user", {}).get("type") == "User" for comment in comments):
+        return False
+    requested_at = parse_utc(request.get("created_at"))
+    wait = (requested_at + timedelta(seconds=1) - datetime.now(timezone.utc)).total_seconds()
+    if wait > 0:
+        time.sleep(wait + 0.1)
+    api(f"repos/{repo}/issues/{number}/comments", method="POST",
+        token=owner_token(repo), data={"body": body})
+    return True
+
+
 def owner_token(repo):
     token = os.environ.get("CODEX_REQUEST_TOKEN")
     if not token:
@@ -852,9 +904,7 @@ def lock_data(source_dir):
     return lock
 
 
-def repository_settings():
-    path = ROOT / REPOSITORY_CONF
-    lines = path.read_text(encoding="utf-8").splitlines()
+def _parse_repository_settings(lines):
     if not lines or lines[0] != (
             "# Managed by ~/.vps/google-osconfig-agent/install.sh; local edits are replaced on the next install."):
         raise ValueError("repository.conf is not owned by the Google OS Config recipe")
@@ -878,6 +928,11 @@ def repository_settings():
         raise ValueError("repository.conf contains an invalid or unconfigured delivery value")
     settings["signing_fingerprint"] = settings["signing_fingerprint"].upper()
     return settings
+
+
+def repository_settings():
+    path = ROOT / REPOSITORY_CONF
+    return _parse_repository_settings(path.read_text(encoding="utf-8").splitlines())
 
 
 def gpg_env(home):
@@ -998,6 +1053,53 @@ def published_manifest(owner, repository, fingerprint):
         return manifest
 
 
+def _baseline_signing_fingerprint(repo):
+    """Return the fingerprint that signed the protected baseline publication.
+
+    The byte-exact manifest is anchored by the protected baseline variable;
+    its recorded publishing configuration carries the repository.conf whose
+    signing fingerprint authorized that exact publication.  This keeps an
+    owner-reviewed signing-key rotation verifiable: the current settings
+    fingerprint governs new signatures, while the baseline is still verified
+    under the fingerprint that actually signed it.
+    """
+    owner, repository = repo.split("/", 1)
+    variable = api(f"repos/{repo}/actions/variables/FORK_ACCEPTED_BASELINE",
+                   token=owner_token(repo))
+    try:
+        expected_sha = json.loads(variable.get("value", ""))["publication"]["metadata_sha256"]
+    except (TypeError, ValueError, KeyError) as error:
+        raise ValueError("Protected accepted-baseline checkpoint is malformed") from error
+    raw = urlopen(f"https://{owner}.github.io/{repository}/rpm/manifest.json",
+                  timeout=45).read(1048577)
+    if len(raw) > 1048576 or hashlib.sha256(raw).hexdigest() != expected_sha:
+        raise ValueError("Published signed manifest differs from the protected baseline checkpoint")
+    config_sha = json.loads(raw).get("configSha")
+    if not isinstance(config_sha, str) or not SHA.fullmatch(config_sha):
+        raise ValueError("Published signed manifest has no exact publishing configuration SHA")
+    try:
+        settings = _parse_repository_settings(
+            content(repo, REPOSITORY_CONF, config_sha).decode("utf-8").splitlines())
+    except UnicodeDecodeError as error:
+        raise ValueError("Baseline repository.conf is not valid UTF-8") from error
+    if (settings["github_owner"] != owner.lower()
+            or settings["github_repo"] != repository.lower()):
+        raise ValueError("Baseline repository.conf belongs to another repository")
+    return settings["signing_fingerprint"]
+
+
+def published_baseline_manifest(repo, fingerprint):
+    """Verify the published baseline under the current or its signing fingerprint."""
+    owner, repository = repo.split("/", 1)
+    published = published_manifest(owner, repository, fingerprint)
+    if published:
+        return published
+    baseline_fingerprint = _baseline_signing_fingerprint(repo)
+    if baseline_fingerprint == fingerprint:
+        return None
+    return published_manifest(owner, repository, baseline_fingerprint)
+
+
 def osconfig_evr_key(evr):
     match = re.fullmatch(r"0:(\d{8}\.\d{2})-(?:(\d+)\.vps(\d+)|(\d+))\.fc44", evr)
     if not match:
@@ -1058,8 +1160,8 @@ def request_review(repo, pull, sha, upstream, patch_sha, config, token):
            for comment in comments):
         return
     body = (
-        "@codex review\n\n"
-        f"Review exact candidate commit {sha}. Upstream source: GoogleCloudPlatform/osconfig@{upstream}.\n"
+        review_trigger_prefix()
+        + f"Review exact candidate commit {sha}. Upstream source: GoogleCloudPlatform/osconfig@{upstream}.\n"
         f"Trusted configuration commit: {config}; patch SHA-256: {patch_sha}.\n\n"
         "Read the Go source at the exact PR base, the patch regression cases, and the "
         "RPM spec/build inputs in this candidate. The signer, verifier, and signing regression "
@@ -1084,8 +1186,8 @@ def request_review_followup(repo, pull, sha, upstream, patch_sha, config, token,
         return
     timestamp = int(now.timestamp())
     body = (
-        "@codex review\n\n"
-        f"Continue the exact-SHA review of `{sha}`. No completed clean review has arrived; "
+        review_trigger_prefix()
+        + f"Continue the exact-SHA review of `{sha}`. No completed clean review has arrived; "
         "the prior review window elapsed. Re-read the current PR diff and trusted source, "
         "then report findings or a clean result for this exact SHA. Preserve every mandatory "
         "gate and report any concrete blocker; elapsed time alone is not a reason to stop.\n\n"
@@ -1123,7 +1225,10 @@ def review_status(repo, pull_number, sha, upstream, branch):
                 cache[prefix] = None
         return cache[prefix]
 
-    return review_gate(sha, requested_at, reviews, inline, comments, resolve)
+    ready, reason = review_gate(sha, requested_at, reviews, inline, comments, resolve)
+    if not ready and reason == WAITING and review_mode() == "none":
+        return True, "External review disabled by owner configuration"
+    return ready, reason
 
 
 def review_pull_identity(repo, pull, *, base_sha, base_branch, head_sha, head_branch,
@@ -1299,8 +1404,8 @@ def request_lifecycle_review(repo, pull, candidate, candidate_id, scope,
             "the complete finding list for this exact source SHA."
         )
     body = (
-        "@codex review\n\n"
-        f"{scope_text}\n\n"
+        review_trigger_prefix()
+        + f"{scope_text}\n\n"
         f"Candidate identity: `{candidate_id}`. Scope: `{scope}`. "
         f"Upstream: `GoogleCloudPlatform/osconfig@{candidate['upstream_sha']}`. "
         f"Application source: `{candidate['application_sha']}`. "
@@ -1343,7 +1448,7 @@ def continue_pending_lifecycle_reviews(repo, manifest, full, delta, token, *, no
             continue
         if not review_followup_due(owners, sha=context["review_sha"], now=now):
             continue
-        body = ("@codex review\n\nContinue this exact paired review and report the complete finding list "
+        body = (review_trigger_prefix() + "Continue this exact paired review and report the complete finding list "
                 "or a clean completion for the unchanged source. Do not edit, test, build or publish.\n\n"
                 + marker + "\n"
                 + f"<!-- osconfig-review-window:v1 {context['review_sha']} {int(now.timestamp())} -->")
@@ -1430,7 +1535,8 @@ def _resolved_review_commits(repo, reviews, comments):
 
 
 def evaluate_native_review_scope(repo, context, candidate, scope,
-                                 accepted_baseline=None, *, allow_closed=False):
+                                 accepted_baseline=None, *, allow_closed=False,
+                                 _acceptance_attempted=False):
     core = lifecycle_module()
     pull_number = int(context["pr"])
     review_sha, base_sha = context["review_sha"], context["base_sha"]
@@ -1449,6 +1555,11 @@ def evaluate_native_review_scope(repo, context, candidate, scope,
     request = latest_owner_review_request(comments, marker, owner)
     if request is None:
         raise ValueError(f"No owner-authenticated exact {scope} review request exists")
+    if not _acceptance_attempted and _ensure_owner_acceptance(
+            candidate, scope, pull_number, request, review_sha, base_sha, comments):
+        return evaluate_native_review_scope(
+            repo, context, candidate, scope, accepted_baseline,
+            allow_closed=allow_closed, _acceptance_attempted=True)
     reviews = pages(f"repos/{repo}/pulls/{pull_number}/reviews")
     inline = pages(f"repos/{repo}/pulls/{pull_number}/comments")
     review_dismissals = native_review_dismissal_events(
@@ -3670,7 +3781,7 @@ def published_candidate_identity(repo, published, work_root):
         run("git", "config", key, value, cwd=repo_work)
     run("git", "remote", "add", "upstream", f"https://github.com/{UPSTREAM}.git", cwd=repo_work)
     run("git", "remote", "add", "origin", f"https://github.com/{repo}.git", cwd=repo_work)
-    run("git", "fetch", "--depth=1", "upstream", upstream, cwd=repo_work)
+    run("git", "fetch", "--no-tags", "upstream", upstream, cwd=repo_work)
     if run("git", "rev-parse", "FETCH_HEAD", cwd=repo_work) != upstream:
         raise ValueError("Reconstructed baseline upstream differs from the signed manifest")
     run("git", "checkout", "-b", "baseline", upstream, cwd=repo_work)
@@ -3954,7 +4065,7 @@ def prepare(candidate):
     patch_sha = digest(PATCH_DIR / "osconfig-inventory.patch")
     spec_sha = digest(PATCH_DIR / "rpm/google-osconfig-agent.spec")
     tracked_lock = json.loads((PATCH_DIR / "source.lock").read_text(encoding="utf-8"))
-    published = published_manifest(owner, repository, settings["signing_fingerprint"])
+    published = published_baseline_manifest(repo, settings["signing_fingerprint"])
     codex_token = owner_token(repo)
     core = lifecycle_module()
     if not published:
@@ -3995,7 +4106,7 @@ def prepare(candidate):
         run("git", "config", key, value, cwd=repo_work)
     run("git", "remote", "add", "upstream", f"https://github.com/{UPSTREAM}.git", cwd=repo_work)
     run("git", "remote", "add", "origin", f"https://github.com/{repo}.git", cwd=repo_work)
-    run("git", "fetch", "--depth=1", "upstream", upstream, cwd=repo_work)
+    run("git", "fetch", "--no-tags", "upstream", upstream, cwd=repo_work)
     if run("git", "rev-parse", "FETCH_HEAD", cwd=repo_work) != upstream:
         raise ValueError("Fetched commit differs from source.lock")
     run("git", "checkout", "-B", "candidate", upstream, cwd=repo_work)
@@ -4305,7 +4416,7 @@ def prepare_policy_candidate(candidate_dir):
             or os.environ.get("OSCONFIG_RPM_SIGNING_FINGERPRINT", "").upper()
             != settings["signing_fingerprint"]):
         raise ValueError("repository.conf and the Actions signing fingerprint must match this GitHub Pages repository")
-    published = published_manifest(owner, repository, settings["signing_fingerprint"])
+    published = published_baseline_manifest(repo, settings["signing_fingerprint"])
     if not published:
         raise ValueError("Policy proposal has no currently verified signed RPM baseline")
     token = owner_token(repo)
@@ -4963,7 +5074,7 @@ def application_source_preflight():
             or settings["github_repo"] != repository.lower()
             or fingerprint != settings["signing_fingerprint"]):
         raise ValueError("repository.conf and the Actions signing fingerprint must match this GitHub Pages repository")
-    published = published_manifest(owner, repository, fingerprint)
+    published = published_baseline_manifest(repo, fingerprint)
     if not published:
         raise ValueError("No verified signed RPM baseline is available for exact application-candidate selection")
     baseline = verified_pages_baseline(repo, published)
@@ -5198,8 +5309,8 @@ def request_policy_review(repo, state, token):
            for comment in comments):
         return comments
     body = (
-        "@codex review\n\n"
-        f"Review publisher-policy proposal `{state['head']}` against trusted base "
+        review_trigger_prefix()
+        + f"Review publisher-policy proposal `{state['head']}` against trusted base "
         f"`{state['config']}`. Immutable trusted tests exercise proposed release.py CLI operations "
         "in separate processes with isolated GitHub/Git fixtures; proposed Python files are syntax-parsed "
         "without importing or executing candidate tests. PyYAML's safe loader extracts semantic job, step, "
@@ -5243,10 +5354,13 @@ def policy_review_status(repo, state, comments=None):
         except subprocess.CalledProcessError:
             return None
 
-    return review_gate(state["head"], requested_at,
-                       pages(f"repos/{repo}/pulls/{state['number']}/reviews"),
-                       pages(f"repos/{repo}/pulls/{state['number']}/comments"),
-                       comments, resolve)
+    ready, reason = review_gate(state["head"], requested_at,
+                                pages(f"repos/{repo}/pulls/{state['number']}/reviews"),
+                                pages(f"repos/{repo}/pulls/{state['number']}/comments"),
+                                comments, resolve)
+    if not ready and reason == WAITING and review_mode() == "none":
+        return True, "External review disabled by owner configuration"
+    return ready, reason
 
 
 def policy_changes(repo_dir, config, head_sha, *, allow_empty=False):
@@ -6421,7 +6535,7 @@ def policy_review(candidate):
         if review_followup_due(owner_comments, sha=expected_head, now=datetime.now(timezone.utc)):
             timestamp = int(datetime.now(timezone.utc).timestamp())
             api(f"repos/{repo}/issues/{number}/comments", method="POST", token=token,
-                data={"body": ("@codex review\n\nContinue the exact-SHA publisher-policy review. "
+                data={"body": (review_trigger_prefix() + "Continue the exact-SHA publisher-policy review. "
                                "Recheck the current isolated-test evidence and report findings or a clean result. "
                                "Elapsed time alone is not a reason to stop.\n\n"
                                f"<!-- osconfig-review-window:v1 {expected_head} {timestamp} -->")})

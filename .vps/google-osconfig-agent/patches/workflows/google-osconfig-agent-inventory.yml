@@ -105,6 +105,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+          FORK_REVIEW_MODE: ${{ vars.FORK_REVIEW_MODE || 'bot' }}
+          FORK_REVIEW_TRIGGER: ${{ vars.FORK_REVIEW_TRIGGER || '@codex review' }}
           OSCONFIG_RPM_SIGNING_FINGERPRINT: ${{ vars.OSCONFIG_RPM_SIGNING_FINGERPRINT }}
           FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
         run: python3 -B .vps/google-osconfig-agent/patches/release.py application-source-preflight .
@@ -137,6 +139,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+          FORK_REVIEW_MODE: ${{ vars.FORK_REVIEW_MODE || 'bot' }}
+          FORK_REVIEW_TRIGGER: ${{ vars.FORK_REVIEW_TRIGGER || '@codex review' }}
           OSCONFIG_RPM_SIGNING_FINGERPRINT: ${{ vars.OSCONFIG_RPM_SIGNING_FINGERPRINT }}
           OSCONFIG_SOURCE_DIR: ${{ runner.temp }}/osconfig-source
           FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
@@ -207,6 +211,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+          FORK_REVIEW_MODE: ${{ vars.FORK_REVIEW_MODE || 'bot' }}
+          FORK_REVIEW_TRIGGER: ${{ vars.FORK_REVIEW_TRIGGER || '@codex review' }}
           POLICY_PR_NUMBER: ${{ inputs.policy_pr }}
           FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
         run: python3 -B trusted/.vps/google-osconfig-agent/patches/release.py policy-resume .
@@ -305,6 +311,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+          FORK_REVIEW_MODE: ${{ vars.FORK_REVIEW_MODE || 'bot' }}
+          FORK_REVIEW_TRIGGER: ${{ vars.FORK_REVIEW_TRIGGER || '@codex review' }}
           OSCONFIG_RPM_SIGNING_FINGERPRINT: ${{ vars.OSCONFIG_RPM_SIGNING_FINGERPRINT }}
           POLICY_PR_NUMBER: ${{ steps.identity.outputs.pr }}
           POLICY_HEAD_SHA: ${{ steps.identity.outputs.head }}
@@ -380,6 +388,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+          FORK_REVIEW_MODE: ${{ vars.FORK_REVIEW_MODE || 'bot' }}
+          FORK_REVIEW_TRIGGER: ${{ vars.FORK_REVIEW_TRIGGER || '@codex review' }}
           FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
         run: |
           python3 -B trusted/.vps/google-osconfig-agent/patches/release.py review-pair \
@@ -463,6 +473,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+          FORK_REVIEW_MODE: ${{ vars.FORK_REVIEW_MODE || 'bot' }}
+          FORK_REVIEW_TRIGGER: ${{ vars.FORK_REVIEW_TRIGGER || '@codex review' }}
           CANDIDATE_PR: ${{ needs.policy-check.outputs.candidate_pr }}
           FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
         run: |
@@ -499,6 +511,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+          FORK_REVIEW_MODE: ${{ vars.FORK_REVIEW_MODE || 'bot' }}
+          FORK_REVIEW_TRIGGER: ${{ vars.FORK_REVIEW_TRIGGER || '@codex review' }}
           POLICY_PR_NUMBER: ${{ needs.policy-check.outputs.pr }}
           POLICY_HEAD_SHA: ${{ needs.policy-check.outputs.head }}
         run: |
@@ -718,6 +732,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+          FORK_REVIEW_MODE: ${{ vars.FORK_REVIEW_MODE || 'bot' }}
+          FORK_REVIEW_TRIGGER: ${{ vars.FORK_REVIEW_TRIGGER || '@codex review' }}
           FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
         run: |
           python3 -B .vps/google-osconfig-agent/patches/release.py review-pair \
@@ -804,6 +820,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+          FORK_REVIEW_MODE: ${{ vars.FORK_REVIEW_MODE || 'bot' }}
+          FORK_REVIEW_TRIGGER: ${{ vars.FORK_REVIEW_TRIGGER || '@codex review' }}
           OSCONFIG_RPM_SIGNING_FINGERPRINT: ${{ vars.OSCONFIG_RPM_SIGNING_FINGERPRINT }}
           CANDIDATE_PR: ${{ needs.candidate-source.outputs.pr }}
           FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
@@ -1163,6 +1181,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+          FORK_REVIEW_MODE: ${{ vars.FORK_REVIEW_MODE || 'bot' }}
+          FORK_REVIEW_TRIGGER: ${{ vars.FORK_REVIEW_TRIGGER || '@codex review' }}
           POLICY_PR_NUMBER: ${{ needs.policy-check.outputs.pr }}
           POLICY_HEAD_SHA: ${{ needs.policy-check.outputs.head }}
           FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
@@ -1269,6 +1289,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+          FORK_REVIEW_MODE: ${{ vars.FORK_REVIEW_MODE || 'bot' }}
+          FORK_REVIEW_TRIGGER: ${{ vars.FORK_REVIEW_TRIGGER || '@codex review' }}
           REVIEW_REASON: ${{ needs.review.outputs.reason }}
         run: |
           python3 -B .vps/google-osconfig-agent/patches/release.py failed-job-evidence \
@@ -1309,6 +1331,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+          FORK_REVIEW_MODE: ${{ vars.FORK_REVIEW_MODE || 'bot' }}
+          FORK_REVIEW_TRIGGER: ${{ vars.FORK_REVIEW_TRIGGER || '@codex review' }}
           POLICY_CONFIG_SHA: ${{ github.sha }}
         run: |
           python3 -B .vps/google-osconfig-agent/patches/release.py failed-job-evidence \
@@ -1580,6 +1604,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+          FORK_REVIEW_MODE: ${{ vars.FORK_REVIEW_MODE || 'bot' }}
+          FORK_REVIEW_TRIGGER: ${{ vars.FORK_REVIEW_TRIGGER || '@codex review' }}
           CANDIDATE_PR: ${{ needs.candidate-source.outputs.pr }}
           OSCONFIG_RPM_SIGNING_FINGERPRINT: ${{ vars.OSCONFIG_RPM_SIGNING_FINGERPRINT }}
           EXPECTED_CANDIDATE_SHA: ${{ needs.candidate-source.outputs.sha }}
@@ -1699,6 +1725,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+          FORK_REVIEW_MODE: ${{ vars.FORK_REVIEW_MODE || 'bot' }}
+          FORK_REVIEW_TRIGGER: ${{ vars.FORK_REVIEW_TRIGGER || '@codex review' }}
           CANDIDATE_PR: ${{ needs.candidate-source.outputs.pr }}
           OSCONFIG_RPM_SIGNING_FINGERPRINT: ${{ vars.OSCONFIG_RPM_SIGNING_FINGERPRINT }}
           FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
@@ -1804,6 +1832,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+          FORK_REVIEW_MODE: ${{ vars.FORK_REVIEW_MODE || 'bot' }}
+          FORK_REVIEW_TRIGGER: ${{ vars.FORK_REVIEW_TRIGGER || '@codex review' }}
           CANDIDATE_PR: ${{ needs.candidate-source.outputs.pr }}
           OSCONFIG_RPM_SIGNING_FINGERPRINT: ${{ vars.OSCONFIG_RPM_SIGNING_FINGERPRINT }}
           FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance

@@ -93,6 +93,8 @@ func TestYumUpdates(t *testing.T) {
     kernel                                    x86_64                         2.6.32-754.24.3.el6                                  updates                                   32 M
 	    replacing kernel.x86_64 1.0.0-4
 	Upgrading:
+	  replacing                               x86_64                         x86_64                                              updates                                   1 M
+	  replacing                               x86_64                         noarch                                              updates                                   1 M
 	  foo                                       noarch                         2.0.0-1                                              BaseOS                                   361 k
 	  bar                                       x86_64                         2.0.0-1                                              repo                                      10 M
 	Obsoleting:

@@ -75,15 +75,22 @@ func (c *Client) report(ctx context.Context, state *inventory.InstanceInventory)
 	clog.Debugf(ctx, "Reporting instance inventory to agent endpoint.")
 	inventory := formatInventory(ctx, state)
 	vmInventory := formatVMInventory(ctx, state)
+	legacyComplete := len(inventory.GetInstalledPackages()) == len(vmInventory.GetInstalledPackages()) &&
+		len(inventory.GetAvailablePackages()) == len(vmInventory.GetAvailablePackages())
+	useLegacyAPI := legacyComplete && hasYumInventory(inventory)
 
 	reportFull := false
 	var reportInventoryRes *agentendpointpb.ReportInventoryResponse
 	var reportVMInventoryRes *agentendpointpb.ReportVmInventoryResponse
 	var err error
 	f := func() error {
-		reportVMInventoryRes, err = c.reportVMInventory(ctx, vmInventory, reportFull)
-		if shouldFallbackToLegacyAPI(err) {
+		if useLegacyAPI {
 			reportInventoryRes, err = c.reportInventory(ctx, inventory, reportFull)
+		} else {
+			reportVMInventoryRes, err = c.reportVMInventory(ctx, vmInventory, reportFull)
+			if legacyComplete && shouldFallbackToLegacyAPI(err) {
+				reportInventoryRes, err = c.reportInventory(ctx, inventory, reportFull)
+			}
 		}
 
 		if err != nil {
@@ -104,6 +111,21 @@ func (c *Client) report(ctx context.Context, state *inventory.InstanceInventory)
 			return
 		}
 	}
+}
+
+// hasYumInventory identifies native RPM inventory whose explicit package
+// architectures are preserved by the legacy API.
+func hasYumInventory(legacy *agentendpointpb.Inventory) bool {
+	for _, pkgs := range [][]*agentendpointpb.Inventory_SoftwarePackage{
+		legacy.GetInstalledPackages(), legacy.GetAvailablePackages(),
+	} {
+		for _, pkg := range pkgs {
+			if pkg.GetYumPackage() != nil {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func shouldFallbackToLegacyAPI(err error) bool {
@@ -606,10 +628,14 @@ func formatGooGetPackage(pkg *packages.PkgInfo) *agentendpointpb.Inventory_Softw
 }
 
 func formatYumPackage(pkg *packages.PkgInfo) *agentendpointpb.Inventory_SoftwarePackage_YumPackage {
+	architecture := pkg.Arch
+	if architecture == "all" {
+		architecture = "noarch"
+	}
 	fPkg := &agentendpointpb.Inventory_SoftwarePackage_YumPackage{
 		YumPackage: &agentendpointpb.Inventory_VersionedPackage{
 			PackageName:  pkg.Name,
-			Architecture: pkg.Arch,
+			Architecture: architecture,
 			Version:      pkg.Version,
 		},
 	}

@@ -131,11 +131,12 @@ func parseYumUpdates(data []byte) []*PkgInfo {
 		} else if !upgrading {
 			continue
 		}
-		// A package line should have 6 fields, break unless this is a 'replacing' entry.
+		// DNF5 can render replacement rows with the same number of columns as a package update.
+		if string(pkg[0]) == "replacing" {
+			continue
+		}
+		// A package line should have 6 fields; shorter rows end the update list.
 		if len(pkg) < 6 {
-			if string(pkg[0]) == "replacing" {
-				continue
-			}
 			break
 		}
 

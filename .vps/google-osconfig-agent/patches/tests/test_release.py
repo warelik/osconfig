@@ -407,6 +407,28 @@ class SigningWorkflowTrustTests(unittest.TestCase):
                     receipt["run"].strip(), release.TRUSTED_LIFECYCLE_RECEIPT_COMMAND,
                 )
 
+    def test_fedora_private_checkouts_install_transport_tools_first(self):
+        for job_name in ("build-rpm", "sign", "recover-validated"):
+            for defect in ("late install", "missing transport package"):
+                with self.subTest(job=job_name, defect=defect), tempfile.TemporaryDirectory() as temporary:
+                    yaml, document, path = self.load_document(temporary)
+                    steps = document["jobs"][job_name]["steps"]
+                    install = next(step for step in steps
+                                   if step.get("name") == "Install private checkout transport tools")
+                    checkout_index = next(
+                        index for index, step in enumerate(steps)
+                        if str(step.get("uses", "")).startswith("actions/checkout@")
+                        and (step.get("with") or {}).get("repository") == "warelik/machine-maintenance"
+                    )
+                    if defect == "late install":
+                        steps.remove(install)
+                        steps.insert(checkout_index + 1, install)
+                    else:
+                        install["run"] = "dnf -y install openssh-clients"
+                    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "install Git and OpenSSH transport tools"):
+                        release.validate_signing_workflow(path)
+
     def test_lifecycle_receipt_rejects_added_commands_and_secret_access(self):
         command = release.TRUSTED_LIFECYCLE_RECEIPT_COMMAND
         tampered_commands = {
@@ -486,7 +508,7 @@ class SigningWorkflowTrustTests(unittest.TestCase):
             job["timeout-minutes"] = 35
             job["container"] = "fedora:45"
             install = next(step for step in job["steps"]
-                           if str(step.get("run", "")).startswith("dnf "))
+                           if step.get("name") == "Install RPM signing tools")
             install["run"] += " package-tools-v2"
             path.write_text(release.yaml_module().safe_dump(document, sort_keys=False), encoding="utf-8")
             release.validate_signing_workflow(path)
@@ -520,7 +542,7 @@ class SigningWorkflowTrustTests(unittest.TestCase):
             with self.subTest(extra=extra), tempfile.TemporaryDirectory() as temporary:
                 yaml, document, path = self.load_document(temporary)
                 install = next(step for step in document["jobs"]["sign"]["steps"]
-                               if str(step.get("run", "")).startswith("dnf "))
+                               if step.get("name") == "Install RPM signing tools")
                 install["run"] += extra
                 path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
                 with self.assertRaises(ValueError):

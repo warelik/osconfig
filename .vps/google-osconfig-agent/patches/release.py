@@ -5312,6 +5312,48 @@ def validate_signing_workflow(workflow, *, shared=False):
     return _validate_legacy_signing_workflow(path)
 
 
+def _validate_fedora_private_checkout_transport(jobs):
+    """Require Git and SSH before each Fedora job's private source checkout."""
+    checkout_action = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+    install_name = "Install private checkout transport tools"
+    install_command = "dnf -y install git openssh-clients"
+    fedora_image = re.compile(
+        r"(?:fedora|docker\.io/library/fedora|quay\.io/fedora/fedora|"
+        r"registry\.fedoraproject\.org/fedora):[A-Za-z0-9_.-]+"
+        r"(?:@sha256:[A-Fa-f0-9]{64})?"
+    )
+    for job_name in ("build-rpm", "sign", "recover-validated"):
+        job = jobs.get(job_name)
+        if (not isinstance(job, dict)
+                or not isinstance(job.get("container"), str)
+                or not fedora_image.fullmatch(job["container"])):
+            raise ValueError(f"{job_name} must use the reviewed Fedora private-checkout job")
+        steps = job.get("steps")
+        if not isinstance(steps, list):
+            raise ValueError(f"{job_name} has no steps for its private source checkout")
+        private_checkouts = [
+            (index, step) for index, step in enumerate(steps)
+            if isinstance(step, dict)
+            and isinstance(step.get("with"), dict)
+            and step["with"].get("repository") == "warelik/machine-maintenance"
+            and step["with"].get("ssh-key") == "${{ secrets.MAINTENANCE_READ_KEY }}"
+        ]
+        if (len(private_checkouts) != 1
+                or private_checkouts[0][1].get("uses") != checkout_action
+                or private_checkouts[0][1]["with"].get("persist-credentials") is not False):
+            raise ValueError(f"{job_name} must have one exact private lifecycle checkout")
+        installs = [
+            (index, step) for index, step in enumerate(steps)
+            if isinstance(step, dict) and step.get("name") == install_name
+        ]
+        if (len(installs) != 1
+                or installs[0][1] != {"name": install_name, "run": install_command}
+                or installs[0][0] >= private_checkouts[0][0]):
+            raise ValueError(
+                f"{job_name} must install Git and OpenSSH transport tools before its private checkout"
+            )
+
+
 def _validate_legacy_signing_workflow(workflow):
     """Require the production-key job to use only trusted signer code and inputs."""
     workflow = Path(workflow)
@@ -5517,6 +5559,7 @@ def _validate_shared_signing_workflow(workflow):
     sign_job = jobs.get("sign") if isinstance(jobs, dict) else None
     if not isinstance(sign_job, dict):
         raise ValueError("Signing workflow has no signing job")
+    _validate_fedora_private_checkout_transport(jobs)
     if any(key in sign_job for key in ("env", "defaults", "uses", "services")):
         raise ValueError("Signing job cannot supply job-wide secrets, shell defaults, or candidate services")
     needs = sign_job.get("needs", [])
@@ -5649,6 +5692,7 @@ def _validate_shared_signing_workflow(workflow):
         "Check the frozen native run attempt before checkout or signing tools",
         "Check out the exact trusted workflow source",
         "Read the exact private lifecycle revision",
+        "Install private checkout transport tools",
         "Check out the exact private lifecycle source",
         "Verify and receipt the exact read-only lifecycle source",
         "Install RPM signing tools",
@@ -5828,6 +5872,7 @@ python3 -B .vps/google-osconfig-agent/patches/release.py verify-build-provenance
 
     preflight_index = step_by_name["Check the frozen native run attempt before checkout or signing tools"][0]
     pin_index = step_by_name["Read the exact private lifecycle revision"][0]
+    transport_index = step_by_name["Install private checkout transport tools"][0]
     receipt_index = step_by_name["Verify and receipt the exact read-only lifecycle source"][0]
     install_index = step_by_name["Install RPM signing tools"][0]
     verify_index = step_by_name["Verify this exact native run and built RPM receipt"][0]
@@ -5835,7 +5880,8 @@ python3 -B .vps/google-osconfig-agent/patches/release.py verify-build-provenance
     pages_index, _ = upload_by_name["google-osconfig-agent-pages"]
     proof_index = step_by_name["Record the exact native signature artifact identity"][0]
     final_proof_index, _ = upload_by_name["google-osconfig-agent-final-proof"]
-    if not (preflight_index < checkout_index < pin_index < private_checkout_index < receipt_index
+    if not (preflight_index < checkout_index < pin_index < transport_index
+            < private_checkout_index < receipt_index
             < install_index < download_by_name["google-osconfig-agent-built-rpm"][0]
             < download_by_name["google-osconfig-agent-candidate"][0] < verify_index
             < test_index < signer_index < pages_index < proof_index < final_proof_index):

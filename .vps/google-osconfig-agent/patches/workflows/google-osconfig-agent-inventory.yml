@@ -557,6 +557,8 @@ jobs:
           assert re.fullmatch(r"[0-9a-f]{40}", revision)
           print(f"revision={revision}")
           PY
+      - name: Install private checkout transport tools
+        run: dnf -y install git openssh-clients
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: warelik/machine-maintenance
@@ -1358,6 +1360,8 @@ jobs:
           assert re.fullmatch(r"[0-9a-f]{40}", revision)
           print(f"revision={revision}")
           PY
+      - name: Install private checkout transport tools
+        run: dnf -y install git openssh-clients
       - name: Check out the exact private lifecycle source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -1508,6 +1512,8 @@ jobs:
           assert re.fullmatch(r"[0-9a-f]{40}", revision)
           print(f"revision={revision}")
           PY
+      - name: Install private checkout transport tools
+        run: dnf -y install git openssh-clients
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: warelik/machine-maintenance

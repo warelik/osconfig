@@ -5,18 +5,21 @@ from datetime import datetime, timezone
 import ast
 import base64
 import hashlib
+import importlib.util
 import io
 import json
 import os
 from pathlib import Path
 import re
+import resource
 import shutil
 import shlex
+import signal
 import subprocess
 import sys
 import tarfile
 import tempfile
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
@@ -32,6 +35,7 @@ FINDING = re.compile(r"\bP[0-3]\b|\b(?:critical|high|medium|low)\s+severity\b", 
 REPAIR_STATE = re.compile(r"<!-- osconfig-fix-cycle:v1 (\{[^\n]+\}) -->")
 POLICY_REPAIR_STATE = re.compile(r"<!-- osconfig-policy-repair:v1 (\{[^\n]+\}) -->")
 POLICY_CYCLE_STATE = re.compile(r"<!-- osconfig-policy-cycle:v1 (\{[^\n]+\}) -->")
+POLICY_PAIR_MARKER = re.compile(r"<!-- fork-policy-pair:v1 (\{[^\n]*\}) -->")
 FIX_REQUEST = re.compile(r"<!-- osconfig-fix-window:v1 ([0-9a-f]{40}) ([1-9][0-9]*) -->")
 POLICY_FIX_REQUEST = re.compile(r"<!-- osconfig-policy-fix:v1 ([0-9a-f]{40}) ([1-9][0-9]*) -->")
 REVIEW_FOLLOWUP = re.compile(r"<!-- osconfig-review-window:v1 ([0-9a-f]{40}) ([1-9][0-9]*) -->")
@@ -40,10 +44,15 @@ POLICY_REPAIR_BRANCH = "repair/osconfig-policy-"
 PATCH_REL = ".vps/google-osconfig-agent/patches/osconfig-inventory.patch"
 PREFIX = ".vps/google-osconfig-agent/patches/"
 REPOSITORY_CONF = ".vps/google-osconfig-agent/repository.conf"
+WORKFLOW_PATH = ".github/workflows/google-osconfig-agent-inventory.yml"
 POLICY_FILES = {
     PREFIX + "release.py",
+    PREFIX + "README.md",
+    PREFIX + "maintenance.py",
+    PREFIX + "maintenance.lock.json",
     PREFIX + "tests/test_release.py",
     PREFIX + "tests/test_policy_isolation.py",
+    PREFIX + "tests/test_maintenance_adapter.py",
     PREFIX + "tests/signing.sh",
     PREFIX + "sign-repo.sh",
     PREFIX + "verify-repo.sh",
@@ -58,8 +67,10 @@ ACTIONLINT_SHA256 = "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b34
 JOB_LOG_LIMIT = 64 * 1024
 JOB_LOG_FETCH_LIMIT = 8 * 1024 * 1024
 API_ERROR_LIMIT = 4096
+MAX_API_PAGES = 1000
 PACKAGE_FILES = (
     "build-rpm.sh", "check-upstream.sh", "prepare-source.sh", "release.py",
+    "maintenance.py", "maintenance.lock.json",
     "source.lock", "osconfig-inventory.patch",
     "rpm/google-osconfig-agent.spec", "rpm/go-vendor-tools.toml",
 )
@@ -67,9 +78,64 @@ ROOT = Path(__file__).resolve().parents[3]
 PATCH_DIR = ROOT / PREFIX
 EDITABLE_CANDIDATE_FILES = {
     PREFIX + relative for relative in PACKAGE_FILES
-    if relative not in {"release.py", "source.lock", "verify-repo.sh"}
+    if relative not in {"release.py", "maintenance.py", "maintenance.lock.json",
+                        "source.lock", "verify-repo.sh"}
 }
 WAITING = "Waiting for Codex; no completed exact-SHA review"
+REVIEW_CONTEXT_PREFIXES = (".vps/google-osconfig-agent/",)
+REVIEW_CONTEXT_FILES = (
+    "AGENTS.md",
+    ".github/workflows/google-osconfig-agent-inventory.yml",
+)
+PATCH_REVIEW_MARKER = re.compile(r"<!-- fork-review:v1 (\{[^\n]*\}) -->")
+CANDIDATE_MARKER = re.compile(r"<!-- osconfig-candidate:v2 (\{[^\n]*\}) -->")
+FINAL_RETRY_MARKER = re.compile(r"<!-- fork-final-retry:v1 (\{[^\n]*\}) -->")
+FINAL_CANDIDATE_MARKER = re.compile(r"<!-- fork-candidate:v1 (\{[^\n]*\}) -->")
+FINAL_RESERVATION_MARKER = re.compile(r"<!-- fork-final:v1 (\{[^\n]*\}) -->")
+FINDING_BATCH_MARKER = re.compile(r"<!-- fork-finding-batch:v1 (\{[^\n]*\}) -->")
+FINDING_DISPOSITION_MARKER = re.compile(r"<!-- fork-review-disposition:v1 (\{[^\n]*\}) -->")
+FINDING_BATCH_PROLOGUE = "Complete native full/delta review finding batch for this exact candidate."
+NATIVE_JSON_PROTOCOL_PREFIXES = (
+    ("native review state", "<!-- codex-review-state:v1"),
+    ("repair cycle", "<!-- osconfig-fix-cycle:v1"),
+    ("policy repair", "<!-- osconfig-policy-repair:v1"),
+    ("policy cycle", "<!-- osconfig-policy-cycle:v1"),
+    ("policy pair", "<!-- fork-policy-pair:v1"),
+    ("review request", "<!-- fork-review:v1"),
+    ("OS Config candidate", "<!-- osconfig-candidate:v2"),
+    ("final retry grant", "<!-- fork-final-retry:v1"),
+    ("final candidate", "<!-- fork-candidate:v1"),
+    ("final reservation", "<!-- fork-final:v1"),
+    ("review history", "<!-- fork-review-history:v1"),
+    ("finding batch", "<!-- fork-finding-batch:v1"),
+    ("finding disposition", "<!-- fork-review-disposition:v1"),
+)
+FINAL_REQUIRED_JOBS = ("build-rpm", "sign")
+POLICY_VALIDATION_JOB = "policy-validation"
+POLICY_VALIDATION_STEP = "Test trusted release gate after both reviews"
+POLICY_BUNDLE_REUSE_STEPS = {
+    "Reuse exact private bundle policy validation",
+    "Reuse the exact prior policy validation",
+}
+BUILD_PROVENANCE_FILE = "fork-build-provenance.json"
+SIGNATURE_PROOF_FILE = "fork-signature-proof.json"
+PRODUCT_BUILD_INPUTS = (
+    "build-rpm.sh", "check-upstream.sh", "prepare-source.sh",
+    "osconfig-inventory.patch", "rpm/google-osconfig-agent.spec",
+    "rpm/go-vendor-tools.toml",
+)
+FULL_PRODUCT_PATHS = tuple(sorted(PREFIX + relative
+                                  for relative in (*PRODUCT_BUILD_INPUTS, "source.lock")))
+REGRESSION_INPUTS = (
+    "osconfig-inventory.patch", "check-upstream.sh",
+)
+PRODUCT_ADOPTION_PATHS = tuple(
+    PREFIX + relative for relative in (
+        "build-rpm.sh", "prepare-source.sh", "rpm/google-osconfig-agent.spec",
+        "rpm/go-vendor-tools.toml", "source.lock",
+    )
+)
+REGRESSION_ADOPTION_PATHS = (PATCH_REL, PREFIX + "check-upstream.sh")
 
 
 def parse_utc(value):
@@ -89,7 +155,7 @@ def repair_attempt_state(comments, *, cycle, sha, now):
     requests = []
     all_requests = []
     for comment in comments:
-        body = comment.get("body") or ""
+        body = _mask_native_finding_batch_envelopes(comment.get("body") or "")
         belongs_to_cycle = False
         for raw in REPAIR_STATE.findall(body):
             try:
@@ -130,13 +196,18 @@ def validate_policy_paths(changed):
 
 
 def review_followup_due(comments, *, sha, now):
-    requests = [c for c in comments
-                if (f"<!-- osconfig-codex:{sha} -->" in (c.get("body") or "")
-                    or f"<!-- osconfig-policy-codex:{sha} -->" in (c.get("body") or ""))]
+    bodies = [_mask_native_finding_batch_envelopes(comment.get("body") or "")
+              for comment in comments]
+    requests = [comment for comment, body in zip(comments, bodies)
+                if (f"<!-- osconfig-codex:{sha} -->" in body
+                    or f"<!-- osconfig-policy-codex:{sha} -->" in body
+                    or any(marker.get("review_sha") == sha
+                           for raw in PATCH_REVIEW_MARKER.findall(body)
+                           for marker in [json.loads(raw)]))]
     if not requests:
         return False
     last = max(requests, key=lambda c: parse_utc(c.get("created_at", "1970-01-01T00:00:00Z")))
-    followups = [match for c in comments for match in REVIEW_FOLLOWUP.finditer(c.get("body") or "")
+    followups = [match for body in bodies for match in REVIEW_FOLLOWUP.finditer(body)
                  if match.group(1) == sha]
     if followups:
         last_followup = max(followups, key=lambda m: int(m.group(2)))
@@ -186,15 +257,86 @@ def api(path, *, method="GET", data=None, token=None):
     return json.loads(result.stdout) if result.stdout.strip() else None
 
 
-def pages(path):
+_WORKFLOW_RUN_FILE_QUERY = (
+    "query($id:ID!){node(id:$id){... on WorkflowRun{"
+    "id databaseId event runAttempt url file{path repositoryName repositoryFileUrl url}}}}"
+)
+
+
+def native_workflow_source_proof(repo, run_record, workflow_sha, workflow_path,
+                                 cache=None):
+    """Read exact executed/reserved workflow blobs only for a differing run head."""
+    run_sha = run_record.get("head_sha") if isinstance(run_record, dict) else None
+    if run_sha == workflow_sha:
+        return None
+    if (not SHA.fullmatch(run_sha or "") or not SHA.fullmatch(workflow_sha or "")
+            or not isinstance(workflow_path, str)
+            or not workflow_path.startswith(".github/workflows/")
+            or not workflow_path.endswith((".yml", ".yaml"))):
+        raise ValueError("Mismatched native workflow run lacks an exact source identity")
+    cache = {} if cache is None else cache
+
+    def contents(revision):
+        key = ("contents", repo, workflow_path, revision)
+        if key not in cache:
+            cache[key] = api(f"repos/{repo}/contents/{workflow_path}?ref={revision}")
+        return cache[key]
+
+    node_id = run_record.get("node_id")
+    run_attempt = run_record.get("run_attempt")
+    if (not isinstance(node_id, str) or not node_id
+            or type(run_attempt) is not int or run_attempt <= 0):
+        raise ValueError("Mismatched native workflow run lacks its exact GraphQL identity")
+    graphql_key = ("workflow-run", repo, node_id, run_attempt)
+    if graphql_key not in cache:
+        cache[graphql_key] = api("graphql", method="POST", data={
+            "query": _WORKFLOW_RUN_FILE_QUERY, "variables": {"id": node_id},
+        })
+    return {
+        "run_file": contents(run_sha),
+        "reserved_file": contents(workflow_sha),
+        "workflow_run": cache[graphql_key],
+    }
+
+
+def validate_native_workflow_source(repo, run_record, workflow_sha, workflow_path,
+                                    core=None, cache=None):
+    core = lifecycle_module() if core is None else core
+    proof = native_workflow_source_proof(
+        repo, run_record, workflow_sha, workflow_path, cache=cache)
+    validator = getattr(core, "validate_workflow_source", None)
+    if not callable(validator):
+        raise ValueError("The pinned shared lifecycle has no native workflow-source validator")
+    if validator(repo, run_record, workflow_sha, workflow_path, proof) is not True:
+        raise ValueError("Shared lifecycle did not verify the exact native workflow source")
+    return run_record
+
+
+def validate_current_workflow_source(repo, run_id, run_attempt, workflow_sha, core=None):
+    if (type(run_id) is not int or run_id <= 0 or type(run_attempt) is not int
+            or run_attempt <= 0 or not SHA.fullmatch(workflow_sha or "")):
+        raise ValueError("Current workflow source validation requires exact run identities")
+    run_record = api(f"repos/{repo}/actions/runs/{run_id}/attempts/{run_attempt}")
+    if (not isinstance(run_record, dict) or run_record.get("id") != run_id
+            or run_record.get("run_attempt") != run_attempt
+            or run_record.get("path") != WORKFLOW_PATH):
+        raise ValueError("Current native workflow attempt differs from the trusted workflow")
+    return validate_native_workflow_source(
+        repo, run_record, workflow_sha, WORKFLOW_PATH, core=core)
+
+
+def pages(path, *, token=None):
     result = []
     separator = "&" if "?" in path else "?"
-    for page in range(1, 1001):
-        batch = api(f"{path}{separator}per_page=100&page={page}")
+    for page in range(1, MAX_API_PAGES + 1):
+        batch = api(f"{path}{separator}per_page=100&page={page}", token=token)
         total = None
-        if isinstance(batch, dict) and isinstance(batch.get("jobs"), list):
-            total = batch.get("total_count")
-            batch = batch["jobs"]
+        if isinstance(batch, dict):
+            collection = next((name for name in ("jobs", "workflow_runs")
+                               if isinstance(batch.get(name), list)), None)
+            if collection:
+                total = batch.get("total_count")
+                batch = batch[collection]
         if not isinstance(batch, list):
             raise ValueError("GitHub returned a non-list paginated response")
         result.extend(batch)
@@ -344,6 +486,152 @@ def output(**values):
 
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def lifecycle_module():
+    """Load only the public loader; it verifies the exact acquired private source."""
+    loader_path = Path(__file__).resolve().with_name("maintenance.py")
+    lock_path = loader_path.with_name("maintenance.lock.json")
+    if any(path.is_symlink() or not path.is_file() for path in (loader_path, lock_path)):
+        raise ValueError("The reviewed lifecycle loader or lock is missing or unsafe")
+    spec = importlib.util.spec_from_file_location("osconfig_maintenance_loader", loader_path)
+    if spec is None or spec.loader is None:
+        raise ValueError("The reviewed lifecycle loader cannot be imported")
+    loader = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(loader)
+    return loader.load(lock_path)
+
+
+def recipe_digest(directory):
+    """Hash the exact downstream source and RPM recipe inputs in path order."""
+    root = Path(directory)
+    hasher = hashlib.sha256()
+    for relative in sorted(PRODUCT_BUILD_INPUTS):
+        path = root / relative
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"OS Config candidate recipe input is missing or unsafe: {relative}")
+        hasher.update(relative.encode("utf-8") + b"\0" + path.read_bytes() + b"\0")
+    return hasher.hexdigest()
+
+
+def candidate_identity_value(candidate):
+    value = lifecycle_module().candidate_identity(candidate)
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise ValueError("The shared lifecycle module returned an invalid candidate identity")
+    return value
+
+
+def create_application_review_context(repository_dir, application_sha, candidate_id):
+    """Create a source-free context commit without changing product blobs or provenance."""
+    if not SHA.fullmatch(application_sha) or not re.fullmatch(r"[0-9a-f]{64}", candidate_id):
+        raise ValueError("Application review context requires exact candidate identities")
+    tree = run("git", "rev-parse", f"{application_sha}^{{tree}}", cwd=repository_dir)
+    app_author_date = run("git", "show", "-s", "--format=%aI", application_sha, cwd=repository_dir)
+    parse_utc(app_author_date)
+    env = dict(os.environ)
+    env.update(
+        GIT_AUTHOR_NAME="github-actions[bot]",
+        GIT_AUTHOR_EMAIL="41898282+github-actions[bot]@users.noreply.github.com",
+        GIT_COMMITTER_NAME="github-actions[bot]",
+        GIT_COMMITTER_EMAIL="41898282+github-actions[bot]@users.noreply.github.com",
+        GIT_AUTHOR_DATE=app_author_date,
+        GIT_COMMITTER_DATE=app_author_date,
+    )
+    message = f"fork-review-context:v1 {candidate_id}\n"
+    context_sha = run("git", "commit-tree", tree, "-p", application_sha,
+                      cwd=repository_dir, env=env, input=message)
+    if (run("git", "rev-parse", f"{context_sha}^{{tree}}", cwd=repository_dir) != tree
+            or run("git", "show", "-s", "--format=%P", context_sha, cwd=repository_dir) != application_sha
+            or run("git", "show", "-s", "--format=%B", context_sha, cwd=repository_dir) != message.strip()):
+        raise ValueError("Generated full-review context changed application blobs or candidate binding")
+    return context_sha
+
+
+def patchset_digest(directory):
+    path = Path(directory) / "osconfig-inventory.patch"
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("The OS Config inventory patch is missing or unsafe")
+    value = lifecycle_module().patch_digest([("osconfig-inventory.patch", path.read_bytes())])
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise ValueError("The shared lifecycle module returned an invalid patch-set digest")
+    return value
+
+
+def exact_repo_tree_paths(repository_dir, revision, prefixes):
+    """List regular tracked files at an exact commit without following worktree paths."""
+    raw = run("git", "ls-tree", "-r", "--full-tree", revision, "--", *prefixes,
+              cwd=repository_dir)
+    paths = []
+    for line in raw.splitlines():
+        metadata, separator, path = line.partition("\t")
+        fields = metadata.split()
+        if not separator or len(fields) != 3 or fields[1] != "blob":
+            raise ValueError("Review source contains a non-regular or malformed tracked entry")
+        mode = fields[0]
+        if mode not in {"100644", "100755"}:
+            raise ValueError(f"Review source contains an unsafe file mode: {path}")
+        if path == PREFIX + "candidate.json":
+            continue
+        if path in paths:
+            raise ValueError("Review source contains a duplicate tracked path")
+        paths.append(path)
+    return sorted(paths)
+
+
+def copy_checked_out_review_files(source_root, source_sha, target_root, prefixes):
+    """Copy exact tracked downstream context from the checked source commit."""
+    source_root, target_root = Path(source_root), Path(target_root)
+    if run("git", "rev-parse", "HEAD", cwd=source_root) != source_sha:
+        raise ValueError("Checked-out configuration is not the exact review source SHA")
+    if run("git", "status", "--porcelain", cwd=source_root):
+        raise ValueError("Checked-out configuration has uncommitted files")
+    paths = exact_repo_tree_paths(source_root, source_sha, prefixes)
+    for relative in paths:
+        source, target = source_root / relative, target_root / relative
+        if source.is_symlink() or not source.is_file():
+            raise ValueError(f"Review context file is missing or unsafe: {relative}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+        mode = run("git", "ls-tree", source_sha, "--", relative, cwd=source_root).split()[0]
+        target.chmod(0o755 if mode == "100755" else 0o644)
+    return paths
+
+
+def patch_go_paths(patch_file):
+    """Extract and constrain the application files that the exact patch can change."""
+    paths = set()
+    try:
+        content = Path(patch_file).read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise ValueError("The OS Config patch cannot be read as UTF-8") from error
+    for match in re.finditer(r"^\+\+\+ b/(.+)$", content, re.M):
+        path = match.group(1)
+        if (not path.endswith(".go") or path.startswith("/") or "\\" in path
+                or any(part in {"", ".", ".."} for part in path.split("/"))):
+            raise ValueError("The OS Config patch targets an unsafe or non-Go path")
+        paths.add(path)
+    if not paths:
+        raise ValueError("The OS Config patch has no application Go files")
+    return sorted(paths)
+
+
+def assemble_review_source(repository_dir, upstream, patch_path):
+    """Recreate the exact patch-produced Go tree without compiling or testing it."""
+    changed = run("git", "diff", "--name-only", upstream, "HEAD", "--", "*.go",
+                  cwd=repository_dir).splitlines()
+    expected = patch_go_paths(patch_path)
+    if changed:
+        run("git", "checkout", upstream, "--", *changed, cwd=repository_dir)
+    run("patch", "--dry-run", "--fuzz=0", "-p1", "-i", str(patch_path), cwd=repository_dir)
+    run("patch", "--fuzz=0", "-p1", "-i", str(patch_path), cwd=repository_dir)
+    actual = set(run("git", "diff", "--name-only", upstream, "--", "*.go",
+                     cwd=repository_dir).splitlines())
+    if actual != set(expected):
+        raise ValueError("Assembled Go source differs from the exact downstream patch file set")
+
+
+def review_context_candidate(candidate):
+    return json.dumps(candidate, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def actor(record, *, completion=False):
@@ -499,7 +787,9 @@ def verify_manifest_files(directory, fingerprint):
             str(signature_file), str(manifest_file), env=env)
         run("gpg", "--batch", "--homedir", env["GNUPGHOME"], "--verify",
             str(repomd_signature), str(repomd_file), env=env)
-        manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+        manifest_bytes = manifest_file.read_bytes()
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+        manifest["_verifiedManifestSha256"] = hashlib.sha256(manifest_bytes).hexdigest()
     if manifest.get("signingFingerprint") != fingerprint:
         raise ValueError("Signed RPM manifest fingerprint differs from repository.conf")
     packages = sorted(directory.glob("google-osconfig-agent-*.rpm"))
@@ -542,7 +832,8 @@ def published_manifest(owner, repository, fingerprint):
             run("gpg", "--batch", "--homedir", env["GNUPGHOME"], "--verify",
                 str(directory / "repodata/repomd.xml.asc"),
                 str(directory / "repodata/repomd.xml"), env=env)
-            manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+            manifest_bytes = (directory / "manifest.json").read_bytes()
+            manifest = json.loads(manifest_bytes.decode("utf-8"))
         except (ValueError, subprocess.CalledProcessError, json.JSONDecodeError):
             return None
         evr = manifest.get("packageEvr", "")
@@ -569,6 +860,7 @@ def published_manifest(owner, repository, fingerprint):
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         if result.returncode or digest(rpm_file) != manifest["signedRpmSha256"]:
             return None
+        manifest["_verifiedManifestSha256"] = hashlib.sha256(manifest_bytes).hexdigest()
         return manifest
 
 
@@ -595,7 +887,7 @@ def content(repo, path, ref):
 def pull_identity(repo, pull, upstream, branch):
     base = pull.get("base") or {}
     head = pull.get("head") or {}
-    return (pull.get("state") == "open"
+    return (pull.get("state") in {"open", "closed"}
             and base.get("ref") == f"review-base/{upstream}"
             and base.get("sha") == upstream
             and (base.get("repo") or {}).get("full_name") == repo
@@ -615,9 +907,10 @@ def find_pull(repo, upstream, branch):
 def request_review(repo, pull, sha, upstream, patch_sha, config, token):
     marker = f"<!-- osconfig-codex:{sha} -->"
     comments = pages(f"repos/{repo}/issues/{pull['number']}/comments")
-    if any(marker in (comment.get("body") or "")
-           and comment.get("user", {}).get("login") == repo.split("/")[0]
+    owner = repo.split("/")[0]
+    if any(comment.get("user", {}).get("login") == owner
            and comment.get("user", {}).get("type") == "User"
+           and marker in _owner_protocol_comment_body(owner, comment)
            for comment in comments):
         return
     body = (
@@ -666,10 +959,11 @@ def review_status(repo, pull_number, sha, upstream, branch):
         return False, "Candidate PR head or exact upstream base changed"
     comments = pages(f"repos/{repo}/issues/{pull_number}/comments")
     marker = f"<!-- osconfig-codex:{sha} -->"
+    owner = repo.split("/")[0]
     requests = [comment for comment in comments
-                if marker in (comment.get("body") or "")
-                and comment.get("user", {}).get("login") == repo.split("/")[0]
-                and comment.get("user", {}).get("type") == "User"]
+                if comment.get("user", {}).get("login") == owner
+                and comment.get("user", {}).get("type") == "User"
+                and marker in _owner_protocol_comment_body(owner, comment)]
     if not requests:
         return False, "No owner-authenticated review request for this SHA"
     requested_at = min(comment["created_at"] for comment in requests)
@@ -688,6 +982,1503 @@ def review_status(repo, pull_number, sha, upstream, branch):
     return review_gate(sha, requested_at, reviews, inline, comments, resolve)
 
 
+def review_pull_identity(repo, pull, *, base_sha, base_branch, head_sha, head_branch,
+                         allow_closed=False):
+    base = pull.get("base") or {}
+    head = pull.get("head") or {}
+    return (pull.get("state") in ({"open", "closed"} if allow_closed else {"open"})
+            and base.get("ref") == base_branch and base.get("sha") == base_sha
+            and (base.get("repo") or {}).get("full_name") == repo
+            and head.get("ref") == head_branch and head.get("sha") == head_sha
+            and (head.get("repo") or {}).get("full_name") == repo)
+
+
+def delta_review_branch(sha):
+    if not SHA.fullmatch(sha):
+        raise ValueError("Delta review branch requires an exact source SHA")
+    return f"review/changes-{sha}"
+
+
+def find_review_pull(repo, base_branch, head_branch, *, states=("open",)):
+    found = []
+    for state in states:
+        query = urlencode({"state": state, "base": base_branch,
+                           "head": f"{repo.split('/')[0]}:{head_branch}"})
+        found.extend(pages(f"repos/{repo}/pulls?{query}"))
+    unique = {pull["number"]: pull for pull in found}
+    if len(unique) > 1:
+        raise ValueError("Multiple pull requests claim one exact OS Config review context")
+    return next(iter(unique.values()), None)
+
+
+def ensure_review_base(repo_work, repo, branch, sha):
+    remote = run("git", "ls-remote", "--refs", "origin", f"refs/heads/{branch}", cwd=repo_work)
+    if remote:
+        if remote.split()[0] != sha:
+            raise ValueError(f"Review base {branch} does not point at its exact source SHA")
+        return
+    run("git", "push", "origin", f"{sha}:refs/heads/{branch}", cwd=repo_work)
+
+
+def ensure_review_branch(repo_work, branch, sha):
+    remote = run("git", "ls-remote", "--refs", "origin", f"refs/heads/{branch}", cwd=repo_work)
+    if not remote:
+        run("git", "push", "origin", f"{sha}:refs/heads/{branch}", cwd=repo_work)
+        return
+    old = remote.split()[0]
+    if old == sha:
+        return
+    run("git", "fetch", "--no-tags", "origin", f"refs/heads/{branch}", cwd=repo_work)
+    if run("git", "rev-parse", "FETCH_HEAD", cwd=repo_work) != old:
+        raise ValueError(f"Review branch {branch} changed while it was being read")
+    if subprocess.run(["git", "merge-base", "--is-ancestor", old, sha],
+                      cwd=repo_work, check=False).returncode != 0:
+        raise ValueError(f"Review branch {branch} is not a fast-forward of its exact old commit")
+    run("git", "push", "origin", f"{sha}:refs/heads/{branch}", cwd=repo_work)
+
+
+def fetch_archived_review_pr_head(repo_work, repo, pull):
+    """Fetch the immutable PR-head archive when its temporary source branch was cleaned up."""
+    number = pull.get("number") if isinstance(pull, dict) else None
+    head = pull.get("head") if isinstance(pull, dict) else None
+    head_sha = head.get("sha") if isinstance(head, dict) else None
+    if (type(number) is not int or number <= 0 or not isinstance(head, dict)
+            or (head.get("repo") or {}).get("full_name") != repo
+            or not isinstance(head_sha, str) or not SHA.fullmatch(head_sha)):
+        raise ValueError("Existing native review PR has no exact archived head identity")
+    archive = api(f"repos/{repo}/git/ref/pull/{number}/head")
+    if (not isinstance(archive, dict)
+            or archive.get("ref") != f"refs/pull/{number}/head"
+            or not isinstance(archive.get("object"), dict)
+            or archive["object"].get("type") != "commit"
+            or archive["object"].get("sha") != head_sha):
+        raise ValueError("Native pull-ref archive differs from the exact review PR head")
+    run("git", "fetch", "--no-tags", "origin", f"refs/pull/{number}/head", cwd=repo_work)
+    fetched = run("git", "rev-parse", "FETCH_HEAD", cwd=repo_work)
+    if fetched != head_sha:
+        raise ValueError("Fetched native pull-ref archive differs from the exact review PR head")
+    return fetched
+
+
+def existing_candidate_state(pull, *, upstream, config, archive_sha):
+    """Read the exact candidate identity retained in an existing native PR."""
+    if not isinstance(pull, dict) or pull.get("state") not in {"open", "closed"}:
+        raise ValueError("Existing candidate PR identity changed")
+    markers = CANDIDATE_MARKER.findall(pull.get("body") or "")
+    if len(markers) != 1:
+        raise ValueError("Existing candidate PR has no unique identity marker")
+    identity = json.loads(markers[0])
+    if (identity.get("schema") != 2 or identity.get("upstream") != upstream
+            or identity.get("sourceConfig") != config
+            or identity.get("archiveSha256") != archive_sha
+            or not SHA.fullmatch(identity.get("seed", ""))):
+        raise ValueError("Existing candidate PR does not match the selected source")
+    return identity
+
+
+def owner_review_marker(candidate_id, scope, review_sha, base_sha):
+    value = {"schema": 1, "candidate_id": candidate_id, "scope": scope,
+             "review_sha": review_sha, "base_sha": base_sha}
+    return "<!-- fork-review:v1 " + json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + " -->"
+
+
+def latest_owner_review_request(comments, marker, owner):
+    matches = []
+    for comment in comments:
+        if not isinstance(comment, dict):
+            continue
+        if marker not in _owner_protocol_comment_body(owner, comment):
+            continue
+        user = comment.get("user") or {}
+        if user.get("login") != owner or user.get("type") != "User":
+            continue
+        if type(comment.get("id")) is not int or comment["id"] <= 0:
+            raise ValueError("Native owner review request has an invalid comment ID")
+        created = parse_utc(comment.get("created_at"))
+        matches.append((created, comment["id"], comment))
+    if not matches:
+        return None
+    created, _, request = max(matches, key=lambda item: (item[0], item[1]))
+    if parse_utc(request.get("updated_at")) != created:
+        raise ValueError("Latest native owner review request was edited")
+    return request
+
+
+def request_lifecycle_review(repo, pull, candidate, candidate_id, scope,
+                             review_sha, base_sha, token):
+    marker = owner_review_marker(candidate_id, scope, review_sha, base_sha)
+    comments = pages(f"repos/{repo}/issues/{pull['number']}/comments")
+    owner = repo.split("/", 1)[0]
+    existing = latest_owner_review_request(comments, marker, owner)
+    if existing is not None:
+        return existing
+    if scope == "full":
+        scope_text = (
+            "Review the complete assembled Google OS Config application from this PR head, "
+            "including the actual patched Go source, package inputs and regressions against the "
+            "exact upstream base. Read the Go files in this PR, not only the unified patch. The "
+            "linked paired delta PR contains the candidate's policy/workflow snapshot at the exact "
+            "configuration SHA below; include that snapshot when checking full-project integration. "
+            "Return the complete finding list for this exact source SHA."
+        )
+    else:
+        scope_text = (
+            "Review only the downstream policy, patch, package and regression changes in this "
+            "review-only snapshot relative to the last signed configuration base. Compare the "
+            "patch and package blobs with the signed production baseline. This snapshot is "
+            "review evidence and must never be merged or used as an installation source. Return "
+            "the complete finding list for this exact source SHA."
+        )
+    body = (
+        "@codex review\n\n"
+        f"{scope_text}\n\n"
+        f"Candidate identity: `{candidate_id}`. Scope: `{scope}`. "
+        f"Upstream: `GoogleCloudPlatform/osconfig@{candidate['upstream_sha']}`. "
+        f"Application source: `{candidate['application_sha']}`. "
+        f"Configuration snapshot: `{candidate['configuration_sha']}`. "
+        f"Patch-set SHA-256: `{candidate['patchset_sha256']}`. "
+        f"Recipe SHA-256: `{candidate['recipe_sha256']}`. "
+        f"Review base: `{base_sha}`. Review source: `{review_sha}`.\n\n"
+        "Do not modify, push, merge, publish, sign, install, or deploy. Preserve all existing "
+        "regression behavior and the separate trusted signer boundary.\n\n"
+        + marker
+    )
+    return api(f"repos/{repo}/issues/{pull['number']}/comments", method="POST",
+               data={"body": body}, token=token)
+
+
+def native_source_git_data(repo, candidate, review_sha):
+    if repo != candidate.get("repository"):
+        raise ValueError("Native source-tree evidence belongs to another candidate repository")
+    roles = {
+        "application": candidate.get("application_sha"),
+        "configuration": candidate.get("configuration_sha"),
+        "review": review_sha,
+    }
+    cache = {}
+    for sha in roles.values():
+        if not isinstance(sha, str) or not SHA.fullmatch(sha):
+            raise ValueError("Native source-tree evidence requires exact commit SHAs")
+        if sha not in cache:
+            commit = api(f"repos/{repo}/git/commits/{sha}")
+            if not isinstance(commit, dict) or commit.get("sha") != sha:
+                raise ValueError("Native source-tree Git Data commit identity mismatch")
+            cache[sha] = commit
+    return {role: cache[sha] for role, sha in roles.items()}
+
+
+def native_review_dismissal_events(repo, pr_number, review_sha, reviews):
+    """Read complete native issue events when this exact source was dismissed."""
+    if any(isinstance(review, dict) and review.get("state") == "DISMISSED"
+           and review.get("commit_id") == review_sha for review in reviews):
+        return pages(f"repos/{repo}/issues/{pr_number}/events")
+    return []
+
+
+def _native_review_target(repo, pull, request, candidate, scope, review_sha, base_sha,
+                          head_branch, base_branch, accepted_baseline=None,
+                          review_dismissals=None, *,
+                          allow_closed=False):
+    target = {
+        "candidate": candidate,
+        "scope": scope,
+        "pr": pull,
+        "request": {key: request.get(key) for key in ("id", "user", "body", "created_at", "updated_at")},
+        "bot_login": BOT,
+        "app_slug": APP,
+        "review_sha": review_sha,
+        "base_sha": base_sha,
+        "head_ref": head_branch,
+        "base_ref": base_branch,
+        "allow_closed": allow_closed,
+        "coverage": "application-context" if scope == "full" else "delta",
+        "source_git_data": native_source_git_data(repo, candidate, review_sha),
+        "review_dismissals": review_dismissals or [],
+    }
+    if scope == "full":
+        target["application_commit"] = target["source_git_data"]["application"]
+        target["review_commit"] = target["source_git_data"]["review"]
+    else:
+        target["accepted_baseline"] = accepted_baseline
+    return target
+
+
+def _resolved_review_commits(repo, reviews, comments):
+    prefixes = set()
+    for item in [*reviews, *comments]:
+        if not isinstance(item, dict):
+            continue
+        user, app = item.get("user") or {}, item.get("performed_via_github_app")
+        if (user.get("login") != BOT or user.get("type") != "Bot"
+                or isinstance(app, dict) and app.get("slug") != APP):
+            continue
+        prefixes.update(REVIEWED.findall(item.get("body") or ""))
+    resolved = {}
+    for prefix in sorted(prefixes):
+        try:
+            value = api(f"repos/{repo}/commits/{prefix}").get("sha")
+        except (subprocess.CalledProcessError, json.JSONDecodeError) as error:
+            raise ValueError("Native Codex completion source did not resolve exactly") from error
+        if not isinstance(value, str) or not SHA.fullmatch(value) or not value.startswith(prefix):
+            raise ValueError("Native Codex completion source did not resolve exactly")
+        resolved[prefix] = value
+    return resolved
+
+
+def evaluate_native_review_scope(repo, context, candidate, scope,
+                                 accepted_baseline=None, *, allow_closed=False):
+    core = lifecycle_module()
+    pull_number = int(context["pr"])
+    review_sha, base_sha = context["review_sha"], context["base_sha"]
+    if scope == "delta" and context.get("head_branch") != delta_review_branch(review_sha):
+        raise ValueError("Delta review branch does not use its exact changes SHA ref")
+    pull = api(f"repos/{repo}/pulls/{pull_number}")
+    if not review_pull_identity(repo, pull, base_sha=base_sha,
+                                base_branch=context["base_branch"],
+                                head_sha=review_sha, head_branch=context["head_branch"],
+                                allow_closed=allow_closed):
+        raise ValueError(f"The exact {scope} review PR source or base changed")
+    comments = pages(f"repos/{repo}/issues/{pull_number}/comments")
+    candidate_id = core.candidate_identity(candidate)
+    marker = owner_review_marker(candidate_id, scope, review_sha, base_sha)
+    owner = repo.split("/", 1)[0]
+    request = latest_owner_review_request(comments, marker, owner)
+    if request is None:
+        raise ValueError(f"No owner-authenticated exact {scope} review request exists")
+    reviews = pages(f"repos/{repo}/pulls/{pull_number}/reviews")
+    inline = pages(f"repos/{repo}/pulls/{pull_number}/comments")
+    review_dismissals = native_review_dismissal_events(
+        repo, pull_number, review_sha, reviews)
+    target = _native_review_target(repo, pull, request, candidate, scope,
+                                   review_sha, base_sha,
+                                   context["head_branch"], context["base_branch"],
+                                   accepted_baseline, review_dismissals,
+                                   allow_closed=allow_closed)
+    return core.evaluate_review(target, reviews, inline, comments,
+                                _resolved_review_commits(repo, reviews, comments))
+
+
+def native_review_finding_history(repo, candidate, accepted_proof):
+    baseline = json.loads(accepted_proof["variable"]["value"])
+    published_at = baseline["publication"]["published_at"]
+    cutoff = parse_utc(published_at)
+    def signature(pull):
+        head, base = pull.get("head") or {}, pull.get("base") or {}
+        if (type(pull.get("number")) is not int or pull["number"] <= 0
+                or not isinstance(head.get("sha"), str) or not SHA.fullmatch(head["sha"])):
+            raise ValueError("Native review inventory is missing exact source identities")
+        parse_utc(pull.get("updated_at"))
+        return (pull["number"], pull["updated_at"], head["sha"], head.get("ref"),
+                (head.get("repo") or {}).get("full_name"), pull.get("state"),
+                base.get("sha"), base.get("ref"))
+    def inventory():
+        selected, previous = [], None
+        for pull in pages(f"repos/{repo}/pulls?state=all&sort=updated&direction=desc"):
+            signature(pull)
+            updated = parse_utc(pull["updated_at"])
+            if previous is not None and updated > previous:
+                raise ValueError("Native review inventory changed while paginating")
+            previous = updated
+            if updated >= cutoff:
+                selected.append(pull)
+        if len({pull["number"] for pull in selected}) != len(selected):
+            raise ValueError("Native review inventory repeated a pull request while paginating")
+        return selected
+    initial = inventory()
+    records = []
+    for summary in initial:
+        if (summary.get("head", {}).get("repo") or {}).get("full_name") != repo:
+            continue
+        number = summary["number"]
+        pull = api(f"repos/{repo}/pulls/{number}")
+        if signature(pull) != signature(summary):
+            raise ValueError("Native review source changed before evidence collection")
+        comments = pages(f"repos/{repo}/issues/{number}/comments")
+        reviews = pages(f"repos/{repo}/pulls/{number}/reviews")
+        inline = pages(f"repos/{repo}/pulls/{number}/comments")
+        records.append({"pull": pull, "comments": comments, "reviews": reviews,
+                        "inline": inline, "resolved_commits": _resolved_review_commits(
+                            repo, reviews + inline, comments)})
+        if signature(api(f"repos/{repo}/pulls/{number}")) != signature(pull):
+            raise ValueError("Native review source changed during evidence collection")
+    if [signature(pull) for pull in inventory()] != [signature(pull) for pull in initial]:
+        raise ValueError("Native review inventory changed during evidence collection")
+    return lifecycle_module().review_history(
+        candidate, records, published_at,
+        read_native=lambda route: api(route))
+
+
+def _native_authoritative_findings(snapshots, native_findings):
+    """Use native-normalized facts when a legacy snapshot repeats their ID."""
+    if not isinstance(snapshots, list) or not isinstance(native_findings, list):
+        raise ValueError("Native and carried review findings must be complete lists")
+    native_ids = {item.get("finding_id") for item in native_findings
+                  if isinstance(item, dict) and isinstance(item.get("finding_id"), str)}
+    carried_only = [item for item in snapshots
+                    if not isinstance(item, dict) or item.get("finding_id") not in native_ids]
+    return [*carried_only, *native_findings]
+
+
+def current_review_baseline(repo, saved_proof):
+    token = owner_token(repo)
+    endpoint = f"repos/{repo}/actions/variables/FORK_ACCEPTED_BASELINE"
+    variable = api(endpoint, token=token)
+    if saved_proof != {"endpoint": endpoint, "variable": variable}:
+        raise ValueError("Native accepted baseline changed after candidate preparation")
+    value = json.loads(variable["value"])
+    owner, repository = repo.split("/", 1)
+    raw = urlopen(f"https://{owner}.github.io/{repository}/rpm/manifest.json", timeout=45).read(1048577)
+    if (len(raw) > 1048576
+            or hashlib.sha256(raw).hexdigest() != value["publication"]["metadata_sha256"]):
+        raise ValueError("Published signed manifest changed after candidate preparation")
+    published = {**json.loads(raw), "_verifiedManifestSha256": hashlib.sha256(raw).hexdigest()}
+    baseline = verified_pages_baseline(repo, published, token=token)
+    baseline["candidate"] = value["candidate"]
+    return accepted_baseline_proof(repo, variable, baseline)
+
+
+def review_pair_status(repo, manifest):
+    candidate = manifest.get("candidate")
+    contexts = manifest.get("reviewContexts")
+    accepted_baseline = current_review_baseline(repo, manifest.get("acceptedBaselineProof"))
+    if not isinstance(candidate, dict) or not isinstance(contexts, dict):
+        raise ValueError("Candidate manifest has no complete ABI 1 review identity")
+    core = lifecycle_module()
+    candidate_id = core.candidate_identity(candidate)
+    if manifest.get("candidateIdentity") != candidate_id:
+        raise ValueError("Candidate manifest identity differs from the shared ABI 1 identity")
+    closed = any(api(f"repos/{repo}/pulls/{contexts[scope]['pr']}").get("state") == "closed"
+                 for scope in ("full", "delta"))
+    allow_closed = closed and validated_policy_bundle(repo, candidate, contexts["full"]["pr"])
+    full = evaluate_native_review_scope(repo, contexts["full"], candidate, "full",
+                                        allow_closed=allow_closed)
+    delta = evaluate_native_review_scope(repo, contexts["delta"], candidate, "delta",
+                                         accepted_baseline, allow_closed=allow_closed)
+    native_history = native_review_finding_history(repo, candidate, accepted_baseline)
+    history = _native_authoritative_findings(
+        manifest.get("findingHistory", []), native_history["findings"])
+    by_id = {}
+    for item in [*manifest.get("findingDispositions", []), *native_history["dispositions"]]:
+        key = item["finding_id"]
+        if key in by_id and by_id[key] != item:
+            raise ValueError("Conflicting current owner dispositions share one native finding ID")
+        by_id[key] = item
+    dispositions = list(by_id.values())
+    pair = core.evaluate_pair(candidate, full, delta, history, dispositions)
+    return full, delta, pair
+
+
+def review_pair(candidate_dir):
+    repo = os.environ["GITHUB_REPOSITORY"]
+    manifest = json.loads((Path(candidate_dir) / "candidate-manifest.json").read_text(encoding="utf-8"))
+    full, delta, pair = review_pair_status(repo, manifest)
+    result = {"full": full, "delta": delta, "pair": pair}
+    (Path(candidate_dir) / "review-pair.json").write_text(
+        json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    ready = pair.get("state") == "ready" and pair.get("complete") is True
+    reason = pair.get("reason", "Invalid paired review result")
+    output(review_ready=ready, review_reason=reason,
+           candidate_id=pair.get("candidate_id") or manifest.get("candidateIdentity"),
+           full_state=full.get("state"), delta_state=delta.get("state"))
+    if pair.get("findings"):
+        print(json.dumps(pair["findings"], ensure_ascii=False, sort_keys=True))
+    print(reason)
+
+
+def _finding_record_is_valid(item):
+    return (isinstance(item, dict)
+            and isinstance(item.get("finding_id"), str) and item["finding_id"]
+            and isinstance(item.get("candidate_id"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", item["candidate_id"])
+            and item.get("scope") in {"full", "delta"}
+            and isinstance(item.get("source_sha"), str) and SHA.fullmatch(item["source_sha"])
+            and type(item.get("native_id")) is int and item["native_id"] > 0
+            and isinstance(item.get("body"), str))
+
+
+def native_review_tree(repo, revision):
+    """Resolve a native Git commit to its exact regular-file tree map."""
+    commit = api(f"repos/{repo}/commits/{revision}")
+    if not isinstance(commit, dict) or commit.get("sha") != revision:
+        raise ValueError("GitHub did not return the exact finding source commit")
+    tree_sha = (commit.get("commit", {}).get("tree") or {}).get("sha")
+    if not isinstance(tree_sha, str) or not SHA.fullmatch(tree_sha):
+        raise ValueError("Finding source commit has no exact native tree")
+    tree = api(f"repos/{repo}/git/trees/{tree_sha}?recursive=1")
+    if not isinstance(tree, dict) or tree.get("truncated") is True or not isinstance(tree.get("tree"), list):
+        raise ValueError("Finding source tree is incomplete or malformed")
+    entries = {}
+    for item in tree["tree"]:
+        if not isinstance(item, dict) or item.get("type") != "blob":
+            continue
+        path, mode, blob = item.get("path"), item.get("mode"), item.get("sha")
+        if (not isinstance(path, str) or path.startswith("/") or "\\" in path
+                or any(part in {"", ".", ".."} for part in path.split("/"))
+                or mode not in {"100644", "100755"}
+                or not isinstance(blob, str) or not SHA.fullmatch(blob)):
+            raise ValueError("Finding source tree contains an unsafe or malformed file")
+        entries[path] = {"mode": mode, "blob_sha": blob}
+    return tree_sha, entries
+
+
+def _native_structured_protocol_values(body):
+    if not isinstance(body, str):
+        raise ValueError("Native structured protocol comment body is malformed")
+    current_kind = "structured protocol"
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"Duplicate key in native {current_kind}")
+            result[key] = value
+        return result
+
+    decoder = json.JSONDecoder(object_pairs_hook=unique_object)
+    values, cursor = [], 0
+    while True:
+        matches = [(position, kind, prefix)
+                   for kind, prefix in NATIVE_JSON_PROTOCOL_PREFIXES
+                   if (position := body.find(prefix, cursor)) >= 0]
+        if not matches:
+            return values
+        start, kind, prefix = min(matches, key=lambda item: item[0])
+        payload_start = start + len(prefix)
+        if not body.startswith(" ", payload_start):
+            raise ValueError(f"Native {kind} marker envelope is malformed")
+        current_kind = kind
+        try:
+            value, end = decoder.raw_decode(body, payload_start + 1)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"Native {kind} marker envelope is malformed") from error
+        if not isinstance(value, dict) or not body.startswith(" -->", end):
+            raise ValueError(f"Native {kind} marker envelope is malformed")
+        marker_end = end + len(" -->")
+        values.append((kind, value, start, marker_end))
+        cursor = marker_end
+
+
+def _native_finding_batch_values(body):
+    return [(value, start, end)
+            for kind, value, start, end in _native_structured_protocol_values(body)
+            if kind == "finding batch"]
+
+
+def _mask_finding_batch_spans(body, envelopes):
+    if not envelopes:
+        return body
+    pieces, cursor = [], 0
+    for _value, start, end in envelopes:
+        pieces.append(body[cursor:start])
+        pieces.append("".join("\n" if char == "\n" else " " for char in body[start:end]))
+        cursor = end
+    pieces.append(body[cursor:])
+    return "".join(pieces)
+
+
+def _mask_native_finding_batch_envelopes(body):
+    if not isinstance(body, str):
+        raise ValueError("Native comment body is malformed")
+    return _mask_finding_batch_spans(body, _native_finding_batch_values(body))
+
+
+def _owner_protocol_comment_body(owner, comment, *, cutoff=None):
+    body = comment.get("body")
+    if body is None:
+        body = ""
+    if not isinstance(body, str):
+        raise ValueError("Owner-authenticated comment body is malformed")
+    user = comment.get("user") or {}
+    if user.get("login") != owner or user.get("type") != "User":
+        return body
+    batch_prefix = "<!-- fork-finding-batch:v1"
+    if batch_prefix not in body and not body.startswith(FINDING_BATCH_PROLOGUE):
+        return body
+    created_at, updated_at = comment.get("created_at"), comment.get("updated_at")
+    if not isinstance(created_at, str) or not isinstance(updated_at, str):
+        raise ValueError("Owner-authenticated finding batch timestamps are missing")
+    try:
+        created_time, updated_time = parse_utc(created_at), parse_utc(updated_at)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError("Owner-authenticated finding batch timestamps are malformed") from error
+    if cutoff is not None and created_time < cutoff and updated_time < cutoff:
+        return ""
+    comment_id = comment.get("id")
+    if type(comment_id) is not int or comment_id <= 0:
+        raise ValueError("Owner-authenticated finding batch lacks a positive native comment ID")
+    if updated_time != created_time:
+        raise ValueError("Owner-authenticated finding batch comment was edited")
+    envelopes = _native_finding_batch_values(body)
+    if body.startswith(FINDING_BATCH_PROLOGUE) and not envelopes:
+        raise ValueError("Owner-authenticated finding batch snapshot marker is missing")
+    return _mask_finding_batch_spans(body, envelopes)
+
+
+def load_review_finding_history(repo, pull_number, *, published_at=None):
+    """Read only owner-authenticated exact native finding batches/dispositions."""
+    if not isinstance(published_at, str):
+        raise ValueError("Native finding history requires its verified publication cutoff")
+    try:
+        cutoff = parse_utc(published_at)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError("Native finding history publication cutoff is malformed") from error
+    owner = repo.split("/", 1)[0]
+    comments = pages(f"repos/{repo}/issues/{pull_number}/comments")
+    findings, sources, prior_dispositions = {}, {}, {}
+    batches = []
+
+    for comment in comments:
+        user = comment.get("user") or {}
+        if user.get("login") != owner or user.get("type") != "User":
+            continue
+        created_at, updated_at = comment.get("created_at"), comment.get("updated_at")
+        if not isinstance(created_at, str) or not isinstance(updated_at, str):
+            raise ValueError("Owner-authenticated comment timestamps are missing")
+        try:
+            created_time, updated_time = parse_utc(created_at), parse_utc(updated_at)
+        except (AttributeError, TypeError, ValueError) as error:
+            raise ValueError("Owner-authenticated comment timestamps are malformed") from error
+        if created_time < cutoff and updated_time < cutoff:
+            continue
+        comment_id = comment.get("id")
+        if type(comment_id) is not int or comment_id <= 0:
+            raise ValueError("Owner-authenticated comment lacks a positive native comment ID")
+        if updated_time != created_time:
+            raise ValueError("Owner-authenticated comment was edited")
+        body = comment.get("body")
+        if body is None:
+            body = ""
+        if not isinstance(body, str):
+            raise ValueError("Owner-authenticated finding comment body is malformed")
+        batch_envelopes = _native_finding_batch_values(body)
+        if batch_envelopes:
+            if len(batch_envelopes) != 1:
+                raise ValueError("Owner-authenticated finding batch marker is ambiguous")
+            value = batch_envelopes[0][0]
+            candidate = value.get("candidate")
+            candidate_id = value.get("candidate_id")
+            expected_fields = {"schema", "candidate_id", "candidate", "review_contexts", "findings"}
+            if (set(value) != expected_fields
+                    or type(value.get("schema")) is not int or value["schema"] != 1
+                    or not isinstance(candidate, dict)
+                    or lifecycle_module().candidate_identity(candidate) != candidate_id
+                    or not isinstance(value.get("findings"), list)):
+                raise ValueError("Owner-authenticated finding batch is not bound to an exact candidate")
+            contexts = value.get("review_contexts")
+            if not isinstance(contexts, dict):
+                raise ValueError("Finding batch has no exact full/delta source contexts")
+            for finding in value["findings"]:
+                if not _finding_record_is_valid(finding):
+                    raise ValueError("Native finding batch contains a malformed review finding")
+                previous = findings.get(finding["finding_id"])
+                if previous is not None and previous != finding:
+                    raise ValueError("Native finding history has conflicting records for one finding ID")
+                findings[finding["finding_id"]] = finding
+            batches.append((created_time, comment_id, candidate_id, candidate, contexts))
+        protocol_body = _mask_finding_batch_spans(body, batch_envelopes)
+        if FINDING_DISPOSITION_MARKER.search(protocol_body):
+            value = _marker_value(FINDING_DISPOSITION_MARKER, protocol_body,
+                                  "review finding disposition")
+            if (set(value) != {"schema", "candidate_id", "source_sha", "findings"}
+                    or value.get("schema") != 1
+                    or not re.fullmatch(r"[0-9a-f]{64}", value.get("candidate_id", ""))
+                    or not SHA.fullmatch(value.get("source_sha", ""))
+                    or not isinstance(value.get("findings"), list) or not value["findings"]):
+                raise ValueError("Owner-authenticated finding disposition is malformed")
+            for item in value["findings"]:
+                if (not isinstance(item, dict)
+                        or set(item) != {"finding_id", "status", "evidence"}
+                        or not isinstance(item.get("finding_id"), str)
+                        or item.get("status") not in {"fixed", "disproved"}
+                        or not isinstance(item.get("evidence"), str) or not item["evidence"].strip()):
+                    raise ValueError("Native finding disposition entry is malformed")
+                prior_dispositions[item["finding_id"]] = {
+                    **item, "candidate_id": value["candidate_id"],
+                    "source_sha": value["source_sha"],
+                    "native_comment": {key: comment.get(key)
+                                       for key in ("id", "created_at", "updated_at", "user")},
+                }
+    for _created_time, _comment_id, candidate_id, candidate, contexts in sorted(
+            batches, key=lambda item: (item[0], item[1])):
+        sources[candidate_id] = {"candidate": candidate, "review_contexts": contexts}
+    return comments, [findings[finding_id] for finding_id in sorted(findings)], sources, prior_dispositions
+
+
+def record_review_finding_batch(repo, pull_number, candidate, contexts, pair, token):
+    if pair.get("complete") is not True:
+        return
+    findings = pair.get("observed_findings")
+    if not isinstance(findings, list) or not findings:
+        return
+    core = lifecycle_module()
+    candidate_id = core.candidate_identity(candidate)
+    marker_value = {"schema": 1, "candidate_id": candidate_id,
+                    "candidate": candidate, "review_contexts": contexts,
+                    "findings": findings}
+    encoded = json.dumps(marker_value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    encoded = encoded.replace("<", "\\u003c").replace(">", "\\u003e")
+    marker = "<!-- fork-finding-batch:v1 " + encoded + " -->"
+    comments = pages(f"repos/{repo}/issues/{pull_number}/comments")
+    owner = repo.split("/", 1)[0]
+    if any(item.get("user", {}).get("login") == owner
+           and item.get("user", {}).get("type") == "User"
+           and marker in _owner_protocol_comment_body(owner, item) for item in comments):
+        return
+    api(f"repos/{repo}/issues/{pull_number}/comments", method="POST", token=token,
+        data={"body": FINDING_BATCH_PROLOGUE + "\n\n" + marker})
+
+
+def _post_finding_dispositions(repo, pull_number, candidate_id, source_sha, findings, token):
+    marker_value = {"schema": 1, "candidate_id": candidate_id,
+                    "source_sha": source_sha, "findings": findings}
+    marker = "<!-- fork-review-disposition:v1 " + json.dumps(
+        marker_value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + " -->"
+    comments = pages(f"repos/{repo}/issues/{pull_number}/comments")
+    owner = repo.split("/", 1)[0]
+    if any(item.get("user", {}).get("login") == owner
+           and item.get("user", {}).get("type") == "User"
+           and marker in _owner_protocol_comment_body(owner, item) for item in comments):
+        return
+    api(f"repos/{repo}/issues/{pull_number}/comments", method="POST", token=token,
+        data={"body": "Exact-source disposition for a carried native review finding.\n\n" + marker})
+
+
+def record_policy_pair_context(repo, proposal_number, manifest, token):
+    value = {key: manifest[key] for key in (
+        "candidate", "candidateIdentity", "acceptedBaselineProof", "findingHistory",
+        "findingDispositions", "reviewContexts", "configSha", "proposalPr",
+        "proposalHeadSha", "candidatePr", "deltaPr")}
+    value["schema"] = 1
+    marker = "<!-- fork-policy-pair:v1 " + json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + " -->"
+    comments = pages(f"repos/{repo}/issues/{proposal_number}/comments")
+    owner = repo.split("/", 1)[0]
+    if any(item.get("user", {}).get("login") == owner
+           and item.get("user", {}).get("type") == "User"
+           and marker in _owner_protocol_comment_body(owner, item) for item in comments):
+        return
+    api(f"repos/{repo}/issues/{proposal_number}/comments", method="POST", token=token,
+        data={"body": "Exact paired review contexts for bounded continuation.\n\n" + marker})
+
+
+def create_review_finding_dispositions(repo, pull_number, candidate,
+                                       findings, sources, prior_dispositions, token):
+    """Disposition only when exact source blobs and a relevant regression support it."""
+    current_id = lifecycle_module().candidate_identity(candidate)
+    current_trees = {}
+    generated = {candidate["application_sha"]: {}, candidate["configuration_sha"]: {}}
+    for scope, source_sha in (("full", candidate["application_sha"]),
+                              ("delta", candidate["configuration_sha"])):
+        current_trees[scope] = native_review_tree(repo, source_sha)
+    prior_tree_cache = {}
+    for finding in findings:
+        finding_id = finding["finding_id"]
+        old = prior_dispositions.get(finding_id)
+        source_record = sources.get(finding["candidate_id"])
+        if not source_record:
+            continue
+        old_candidate = source_record["candidate"]
+        scope = finding["scope"]
+        old_sha = (old_candidate["application_sha"] if scope == "full"
+                   else old_candidate["configuration_sha"])
+        current_sha = candidate["application_sha"] if scope == "full" else candidate["configuration_sha"]
+        if old_sha == current_sha:
+            continue
+        if old_sha not in prior_tree_cache:
+            prior_tree_cache[old_sha] = native_review_tree(repo, old_sha)
+        old_tree_sha, old_tree = prior_tree_cache[old_sha]
+        new_tree_sha, new_tree = current_trees[scope]
+        finding_path = finding.get("path")
+        prior_path = None
+        if isinstance(finding_path, str):
+            prior_path = old_tree.get(finding_path)
+            current_path = new_tree.get(finding_path)
+        else:
+            current_path = None
+        changed_regressions = []
+        if scope == "full":
+            regression_paths = {path for path in set(old_tree) | set(new_tree)
+                                if path.endswith("_test.go")}
+        else:
+            regression_paths = {path for path in set(old_tree) | set(new_tree)
+                                if path.startswith(PREFIX + "tests/")
+                                and (Path(path).name.startswith("test_") or path.endswith("_test.py"))}
+        for path in sorted(regression_paths):
+            if old_tree.get(path) != new_tree.get(path) and path in new_tree:
+                changed_regressions.append((path, new_tree[path]["blob_sha"]))
+        if old and old.get("status") in {"fixed", "disproved"}:
+            old_disposition_sha = old.get("source_sha")
+            if old_disposition_sha and old_disposition_sha not in prior_tree_cache:
+                prior_tree_cache[old_disposition_sha] = native_review_tree(repo, old_disposition_sha)
+            disposition_tree = prior_tree_cache.get(old_disposition_sha, (None, {}))[1]
+            same_scope = (finding_path in disposition_tree
+                          and disposition_tree.get(finding_path) == new_tree.get(finding_path))
+            if finding_path is None and disposition_tree:
+                previous_tree_sha = prior_tree_cache[old_disposition_sha][0]
+                same_scope = previous_tree_sha == new_tree_sha
+            if same_scope:
+                evidence = (f"Carried prior {old['status']} disposition from source `{old_disposition_sha}`; "
+                            f"the exact current {scope} source tree is `{new_tree_sha}` and the affected "
+                            f"blob is unchanged. Prior evidence: {old['evidence']}")
+                generated[current_sha][finding_id] = {
+                    "finding_id": finding_id, "status": old["status"], "evidence": evidence,
+                }
+                continue
+        if not (isinstance(finding_path, str) and prior_path and current_path
+                and prior_path != current_path and changed_regressions):
+            continue
+        regression_evidence = ", ".join(f"`{path}` blob `{blob}`"
+                                        for path, blob in changed_regressions)
+        code_text = content(repo, finding_path, current_sha).decode("utf-8", errors="replace")
+        code_names = (re.findall(r"(?m)^\s*func\s+(Test[A-Za-z0-9_]+)\s*\(", code_text)
+                      if scope == "full" else
+                      re.findall(r"(?m)^\s*def\s+(?:test_[A-Za-z0-9_]+)", code_text))
+        regression_names = []
+        for test_path, _ in changed_regressions:
+            test_text = content(repo, test_path, current_sha).decode("utf-8", errors="replace")
+            names = (re.findall(r"(?m)^\s*func\s+(Test[A-Za-z0-9_]+)\s*\(", test_text)
+                     if scope == "full" else
+                     re.findall(r"(?m)^\s*def\s+(test_[A-Za-z0-9_]+)", test_text))
+            regression_names.extend((test_path, name) for name in names)
+        if not regression_names:
+            continue
+        regression_symbols = ", ".join(f"`{path}:{name}`" for path, name in regression_names)
+        changed_code = ", ".join(f"`{name}`" for name in code_names) or f"`{finding_path}`"
+        evidence = (f"Current exact {scope} source `{current_sha}` changes {changed_code} at "
+                    f"`{finding_path}` (blob `{prior_path['blob_sha']}` -> "
+                    f"`{current_path['blob_sha']}`). Regression code is present as {regression_symbols}; "
+                    f"its exact blobs are {regression_evidence}. Source trees are `{old_tree_sha}` -> "
+                    f"`{new_tree_sha}`. Both new native review scopes bind this candidate and must "
+                    "complete before this disposition can clear the carried finding.")
+        generated[current_sha][finding_id] = {
+            "finding_id": finding_id, "status": "fixed", "evidence": evidence,
+        }
+    for source_sha, items in generated.items():
+        if items:
+            _post_finding_dispositions(repo, pull_number, current_id, source_sha,
+                                       [items[key] for key in sorted(items)], token)
+
+
+def _marker_value(pattern, body, label):
+    matches = pattern.findall(body or "")
+    if len(matches) != 1:
+        raise ValueError(f"Native {label} marker is missing or ambiguous")
+    try:
+        value = json.loads(matches[0])
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"Native {label} marker is malformed") from error
+    if not isinstance(value, dict):
+        raise ValueError(f"Native {label} marker must contain a JSON object")
+    return value
+
+
+def native_workflow_runs(repo):
+    path = f"repos/{repo}/actions/workflows/google-osconfig-agent-inventory.yml/runs"
+    return pages(path)
+
+
+def native_heavy_job_started(job):
+    """Ignore GitHub's timestamped skipped placeholder jobs with no steps."""
+    if (not job.get("started_at")
+            and not (job.get("conclusion") == "skipped" and job.get("steps") == [])
+            and (job.get("steps") or job.get("status") == "completed"
+                 or job.get("conclusion") not in {None, "skipped"})):
+        raise ValueError("Executed native heavy-job steps lack a start timestamp")
+    return bool(job.get("started_at")) and not (
+        job.get("conclusion") == "skipped" and job.get("steps") == [])
+
+
+def native_policy_job_started(job):
+    """Recognize actual policy job attempts while ignoring skipped placeholders."""
+    if (not job.get("started_at")
+            and not (job.get("conclusion") == "skipped" and job.get("steps") == [])
+            and (job.get("steps") or job.get("status") == "completed"
+                 or job.get("conclusion") not in {None, "skipped"})):
+        raise ValueError("Executed native policy-job steps lack a start timestamp")
+    return bool(job.get("started_at")) and not (
+        job.get("conclusion") == "skipped" and job.get("steps") == [])
+
+
+def native_final_history(repo, current_candidate, baseline, current_run_id,
+                         current_run_attempt):
+    """Gather complete native run-attempt, exact-job-endpoint, reservation and grant facts."""
+    core = lifecycle_module()
+    comments = pages(f"repos/{repo}/issues/comments")
+    owner = repo.split("/", 1)[0]
+    cutoff = parse_utc(baseline["published_at"])
+    reservations = {}
+    candidate_pr_by_id = {core.candidate_identity(current_candidate):
+                          int(os.environ.get("CANDIDATE_PR", "0"))}
+    complete = True
+
+    protocol_bodies = []
+    for comment in comments:
+        try:
+            protocol_bodies.append(_owner_protocol_comment_body(owner, comment, cutoff=cutoff))
+        except ValueError:
+            complete = False
+            protocol_bodies.append("")
+
+    for comment, body in zip(comments, protocol_bodies):
+        if not FINAL_RESERVATION_MARKER.search(body) and not FINAL_CANDIDATE_MARKER.search(body):
+            continue
+        try:
+            created = parse_utc(comment.get("created_at", ""))
+            if created < cutoff:
+                continue
+            final = _marker_value(FINAL_RESERVATION_MARKER, body, "final reservation")
+            reserved_candidate = _marker_value(FINAL_CANDIDATE_MARKER, body, "candidate reservation")
+            reserved_id = core.candidate_identity(reserved_candidate)
+            required = {"schema", "candidate_id", "run_id", "run_attempt", "workflow_sha"}
+            allowed = required | {"retry_grant_id"}
+            if (not required <= set(final) <= allowed or final.get("schema") != 1
+                    or final.get("candidate_id") != reserved_id
+                    or type(final.get("run_id")) is not int or final["run_id"] <= 0
+                    or type(final.get("run_attempt")) is not int or final["run_attempt"] <= 0
+                    or not SHA.fullmatch(final.get("workflow_sha", ""))):
+                complete = False
+                continue
+            issue_match = re.search(r"/issues/([1-9][0-9]*)$", comment.get("issue_url") or "")
+            if not issue_match:
+                complete = False
+                continue
+            pr_number = int(issue_match.group(1))
+            previous_pr = candidate_pr_by_id.get(reserved_id)
+            if previous_pr and previous_pr != pr_number:
+                complete = False
+                continue
+            candidate_pr_by_id[reserved_id] = pr_number
+            key = (final["run_id"], final["run_attempt"])
+            if key in reservations:
+                complete = False
+                continue
+            reservations[key] = (comment, reserved_candidate, reserved_id, final)
+        except (TypeError, ValueError):
+            complete = False
+
+    grants = []
+    for comment, body in zip(comments, protocol_bodies):
+        if not FINAL_RETRY_MARKER.search(body):
+            continue
+        try:
+            marker = _marker_value(FINAL_RETRY_MARKER, body, "final retry grant")
+            user = comment.get("user") or {}
+            issue_match = re.search(r"/issues/([1-9][0-9]*)$", comment.get("issue_url") or "")
+            if (user.get("login") != owner or user.get("type") != "User"
+                    or marker.get("schema") != 1
+                    or not isinstance(marker.get("candidate_id"), str)
+                    or type(marker.get("previous_run_id")) is not int
+                    or type(marker.get("previous_run_attempt")) is not int
+                    or not issue_match
+                    or candidate_pr_by_id.get(marker["candidate_id"]) != int(issue_match.group(1))):
+                complete = False
+                continue
+            if parse_utc(comment.get("created_at", "")) > cutoff:
+                grants.append({key: value for key, value in comment.items()
+                               if key in {"id", "user", "body", "created_at", "updated_at"}})
+        except (TypeError, ValueError):
+            complete = False
+
+    attempts = []
+    consumed = []
+    observed_reservations = set()
+    workflow_source_cache = {}
+    for record in native_workflow_runs(repo):
+        run_id = record.get("id")
+        latest_attempt = record.get("run_attempt")
+        if type(run_id) is not int or run_id <= 0 or type(latest_attempt) is not int or latest_attempt <= 0:
+            complete = False
+            continue
+        try:
+            if parse_utc(record.get("updated_at", "")) < cutoff:
+                continue
+        except (TypeError, ValueError):
+            complete = False
+            continue
+        for attempt_number in range(1, latest_attempt + 1):
+            key = (run_id, attempt_number)
+            if key == (current_run_id, current_run_attempt):
+                if key in reservations:
+                    observed_reservations.add(key)
+                continue
+            try:
+                run_record = api(f"repos/{repo}/actions/runs/{run_id}/attempts/{attempt_number}")
+                if (not isinstance(run_record, dict) or run_record.get("id") != run_id
+                        or run_record.get("run_attempt") != attempt_number):
+                    raise ValueError("GitHub returned a different native run attempt")
+                reservation_tuple = reservations.get(key)
+                if parse_utc(run_record.get("updated_at", "")) < cutoff and not reservation_tuple:
+                    continue
+                jobs_endpoint = f"repos/{repo}/actions/runs/{run_id}/attempts/{attempt_number}/jobs"
+                job_records = pages(jobs_endpoint)
+            except (TypeError, ValueError, subprocess.CalledProcessError, json.JSONDecodeError):
+                complete = False
+                continue
+            required = [job for job in job_records if job.get("name") in FINAL_REQUIRED_JOBS]
+            policy_jobs = [job for job in job_records
+                           if job.get("name") == POLICY_VALIDATION_JOB]
+            started_after, active_after = [], []
+            for job in required:
+                try:
+                    if native_heavy_job_started(job) and parse_utc(job["started_at"]) >= cutoff:
+                        started_after.append(job)
+                except (TypeError, ValueError):
+                    complete = False
+                if job.get("status") in {"queued", "in_progress"}:
+                    active_after.append(job)
+            if not reservation_tuple:
+                if (started_after or active_after
+                        or any(native_policy_job_started(job)
+                               or job.get("status") in {"queued", "in_progress"}
+                               for job in policy_jobs)):
+                    complete = False
+                continue
+            observed_reservations.add(key)
+            comment, attempt_candidate, candidate_id, marker = reservation_tuple
+            workflow_source = native_workflow_source_proof(
+                repo, run_record, marker["workflow_sha"], WORKFLOW_PATH,
+                cache=workflow_source_cache)
+            reservation = {name: comment.get(name) for name in (
+                "id", "user", "body", "created_at", "updated_at")}
+            run = {name: run_record.get(name) for name in (
+                "id", "node_id", "path", "head_sha", "event", "head_branch", "status", "conclusion",
+                "created_at", "updated_at", "run_attempt")}
+            jobs = [{name: job.get(name) for name in (
+                "id", "name", "status", "conclusion", "started_at", "completed_at", "steps")}
+                     for job in job_records]
+            jobs_context = {"endpoint": jobs_endpoint, "run_id": run_id,
+                            "run_attempt": attempt_number}
+            attempt_record = {"candidate": attempt_candidate, "candidate_id": candidate_id,
+                              "run": run, "jobs": jobs, "jobs_context": jobs_context,
+                              "reservation": reservation,
+                              "workflow_sha": marker["workflow_sha"],
+                              "run_attempt_count": latest_attempt}
+            if workflow_source is not None:
+                attempt_record["workflow_source"] = workflow_source
+            attempts.append(attempt_record)
+            if type(marker.get("retry_grant_id")) is int:
+                consumed.append(marker["retry_grant_id"])
+
+    if set(reservations) - observed_reservations:
+        complete = False
+    return {
+        "complete": complete,
+        "repository": repo,
+        "workflow_path": WORKFLOW_PATH,
+        "baseline": baseline,
+        "required_heavy_jobs": list(FINAL_REQUIRED_JOBS),
+        "attempts": attempts,
+        "grants": grants,
+        "consumed_grant_ids": sorted(consumed),
+    }
+
+
+def current_final_reservation(repo, pr_number, candidate, run_id, run_attempt, workflow_sha):
+    core = lifecycle_module()
+    candidate_id = core.candidate_identity(candidate)
+    owner = repo.split("/", 1)[0]
+    comments = pages(f"repos/{repo}/issues/{pr_number}/comments")
+    matches = []
+    for comment in comments:
+        try:
+            body = _owner_protocol_comment_body(owner, comment)
+            reserved_candidate = _marker_value(FINAL_CANDIDATE_MARKER,
+                                                body, "candidate reservation")
+            final = _marker_value(FINAL_RESERVATION_MARKER,
+                                  body, "final reservation")
+        except ValueError:
+            continue
+        if final.get("run_id") == run_id and final.get("run_attempt") == run_attempt:
+            if (core.candidate_identity(reserved_candidate) != candidate_id
+                    or final.get("candidate_id") != candidate_id
+                    or final.get("run_attempt") != run_attempt
+                    or final.get("workflow_sha") != workflow_sha):
+                raise ValueError("This native run already reserved a different candidate identity")
+            user = comment.get("user") or {}
+            if user.get("login") != "github-actions[bot]" or user.get("type") != "Bot":
+                raise ValueError("The current final reservation was not created by the trusted workflow")
+            matches.append(comment)
+    if len(matches) > 1:
+        raise ValueError("The current workflow run has duplicate final reservations")
+    return matches[0] if matches else None
+
+
+def existing_reservation_decision(comment, decision):
+    """Preserve the fresh exact gate decision when authorize-final is retried."""
+    action = decision.get("decision") if isinstance(decision, dict) else None
+    if action not in {"allow", "policy-only", "already-validated"}:
+        raise ValueError("Existing final reservation no longer has its exact native authorization")
+    body = _mask_native_finding_batch_envelopes(comment.get("body") or "")
+    marker = _marker_value(
+        FINAL_RESERVATION_MARKER, body, "final reservation")
+    if marker.get("retry_grant_id") != decision.get("grant_id"):
+        raise ValueError("Existing final reservation differs from the exact authorization grant")
+    return action
+
+
+def policy_validation_state(history, candidate_id):
+    """Read the once-only policy-unit ledger from exact native run-attempt jobs."""
+    if not isinstance(history, dict) or history.get("complete") is not True:
+        raise ValueError("Complete native history is required for policy-validation accounting")
+    active = []
+    executions = []
+    successful_reuse = False
+    for attempt in history.get("attempts", []):
+        if attempt.get("candidate_id") != candidate_id:
+            continue
+        run = attempt.get("run") or {}
+        policy_jobs = [job for job in attempt.get("jobs", [])
+                       if job.get("name") == POLICY_VALIDATION_JOB]
+        if len(policy_jobs) > 1:
+            raise ValueError("Native run attempt contains duplicate policy-validation jobs")
+        for job in policy_jobs:
+            if job.get("status") in {"queued", "in_progress"}:
+                active.append((run.get("id"), run.get("run_attempt")))
+            steps = job.get("steps")
+            if not isinstance(steps, list):
+                raise ValueError("Native policy-validation attempt omits its step records")
+            for step in steps:
+                name = step.get("name")
+                if name == POLICY_VALIDATION_STEP:
+                    started = (bool(step.get("started_at"))
+                               or step.get("status") == "in_progress"
+                               or (step.get("status") == "completed"
+                                   and step.get("conclusion") not in {None, "skipped"}))
+                    if started:
+                        executions.append({
+                            "run_id": run.get("id"),
+                            "run_attempt": run.get("run_attempt"),
+                            "job_conclusion": job.get("conclusion"),
+                            "step_status": step.get("status"),
+                            "step_conclusion": step.get("conclusion"),
+                        })
+                elif name in POLICY_BUNDLE_REUSE_STEPS and step.get("conclusion") == "success":
+                    successful_reuse = True
+    if active:
+        return {"active": True, "failed": False, "validated": False,
+                "reason": "An exact-candidate policy-validation run is still active"}
+    if len(executions) > 1:
+        return {"active": False, "failed": True, "validated": False,
+                "reason": "Policy unit tests already ran more than once for this exact candidate"}
+    if executions:
+        execution = executions[0]
+        if (execution["step_status"] != "completed"
+                or execution["step_conclusion"] != "success"):
+            return {"active": False, "failed": True, "validated": False,
+                    "reason": "The exact candidate's one policy-validation attempt did not succeed"}
+        return {"active": False, "failed": False, "validated": True,
+                "reason": "Exact-candidate policy tests passed on a native run attempt"}
+    return {"active": False, "failed": False, "validated": successful_reuse,
+            "reason": ("The exact candidate reused a successful native policy-validation receipt"
+                       if successful_reuse else "No policy unit validation has run for this candidate")}
+
+
+def validated_policy_bundle(repo, candidate, full_pr_number):
+    """Verify an exact private shared-validation receipt using owner-authenticated reads."""
+    token = owner_token(repo)
+    comments = pages(f"repos/{repo}/issues/{full_pr_number}/comments", token=token)
+
+    def read_native(route):
+        if (not isinstance(route, str) or not route.startswith("repos/")
+                or "\n" in route or "\r" in route or "://" in route
+                or any(part in {"", ".", ".."}
+                       for part in route.split("?", 1)[0].split("/"))):
+            raise ValueError("Shared bundle reader accepts only API-relative native GET routes")
+        return api(route, token=token)
+
+    from maintenance import validated_bundle
+    proof = validated_bundle(candidate, comments, read_native)
+    if proof is not None and not isinstance(proof, dict):
+        raise ValueError("Shared lifecycle returned a malformed validated-bundle receipt")
+    return proof is not None
+
+
+def authorize_final(candidate_dir):
+    repo = os.environ["GITHUB_REPOSITORY"]
+    run_id = int(os.environ["GITHUB_RUN_ID"])
+    run_attempt = int(os.environ.get("GITHUB_RUN_ATTEMPT", "1"))
+    workflow_sha = os.environ["GITHUB_SHA"]
+    if run_attempt < 1:
+        raise ValueError("Native workflow run attempt is invalid")
+    manifest = json.loads((Path(candidate_dir) / "candidate-manifest.json").read_text(encoding="utf-8"))
+    candidate = manifest.get("candidate")
+    if not isinstance(candidate, dict):
+        raise ValueError("Final attempt has no exact shared candidate identity")
+    core = lifecycle_module()
+    candidate_id = core.candidate_identity(candidate)
+    if candidate_id != manifest.get("candidateIdentity"):
+        raise ValueError("Final attempt candidate identity differs from its reviewed manifest")
+    existing = current_final_reservation(repo, int(manifest["candidatePr"]),
+                                        candidate, run_id, run_attempt, workflow_sha)
+    frozen = json.loads((Path(candidate_dir) / "final-history.json").read_text(encoding="utf-8"))
+    baseline = frozen.get("baseline")
+    if not isinstance(baseline, dict) or not isinstance(baseline.get("candidate"), dict):
+        raise ValueError("The published RPM baseline has no exact reconstructable product identity")
+    if core.candidate_identity(baseline["candidate"]) != baseline.get("candidate_id"):
+        raise ValueError("Frozen published baseline candidate identity is inconsistent")
+    accepted_proof = frozen.get("acceptedBaselineProof")
+    if not isinstance(accepted_proof, dict):
+        raise ValueError("Frozen final gate lacks the native accepted-baseline variable proof")
+    accepted_baseline_proof(repo, accepted_proof.get("variable"), baseline)
+    owner, repository = repo.split("/", 1)
+    current_manifest = urlopen(
+        f"https://{owner}.github.io/{repository}/rpm/manifest.json", timeout=45).read()
+    if hashlib.sha256(current_manifest).hexdigest() != baseline["manifest_sha256"]:
+        raise ValueError("Public signed manifest changed after source selection")
+    current_published = json.loads(current_manifest.decode("utf-8"))
+    if current_published.get("configSha") != baseline.get("config_sha"):
+        raise ValueError("Public signed manifest configuration differs from its frozen baseline")
+    current_deployment = verified_pages_baseline(
+        repo, {**current_published, "_verifiedManifestSha256": baseline["manifest_sha256"]})
+    for key in ("release_id", "published_at", "manifest_sha256", "config_sha"):
+        if current_deployment.get(key) != baseline.get(key):
+            raise ValueError("Latest successful Pages deployment changed after source selection")
+    history = native_final_history(repo, candidate, baseline, run_id, run_attempt)
+    decision = core.authorize_final(candidate, history)
+    if decision.get("candidate_id") != candidate_id:
+        raise ValueError("Shared final-attempt gate returned a different candidate identity")
+    action = decision.get("decision")
+    if action in {"allow", "policy-only", "already-validated"}:
+        validate_current_workflow_source(repo, run_id, run_attempt, workflow_sha, core)
+    if action == "reuse":
+        output(final_decision=action, final_candidate_id=candidate_id,
+               final_run_id=run_id, final_run_attempt=run_attempt,
+               final_workflow_sha=workflow_sha, final_reason=decision.get("reason", ""))
+        print(decision.get("reason", action))
+        return
+    if action == "wait":
+        output(final_decision=action, final_candidate_id=candidate_id,
+               final_run_id=run_id, final_run_attempt=run_attempt,
+               final_workflow_sha=workflow_sha, final_reason=decision.get("reason", ""))
+        print(decision.get("reason", action))
+        return
+    policy_state = policy_validation_state(history, candidate_id)
+    if policy_state["active"]:
+        reason = policy_state["reason"]
+        output(final_decision="wait", final_candidate_id=candidate_id,
+               final_run_id=run_id, final_run_attempt=run_attempt,
+               final_workflow_sha=workflow_sha, final_reason=reason)
+        print(reason)
+        return
+    if policy_state["failed"]:
+        raise ValueError(policy_state["reason"])
+    policy_validation_reuse = policy_state["validated"]
+    reuse_run_id = None
+    reuse_run_attempt = None
+    reuse_workflow_sha = None
+    reuse_legacy_attempt_one = False
+    if action == "already-validated":
+        if decision.get("artifact_reuse_allowed") is not True:
+            raise ValueError("Shared final-attempt gate did not authorize exact artifact reuse")
+        validated = decision.get("validated_run")
+        if (not isinstance(validated, dict)
+                or type(validated.get("id")) is not int or validated["id"] <= 0
+                or type(validated.get("run_attempt")) is not int
+                or validated["run_attempt"] <= 0):
+            raise ValueError("Already-validated decision lacks its exact native run attempt")
+        matches = [attempt for attempt in history["attempts"]
+                   if (attempt.get("candidate_id") == candidate_id
+                       and (attempt.get("run") or {}).get("id") == validated["id"]
+                       and (attempt.get("run") or {}).get("run_attempt")
+                           == validated["run_attempt"])]
+        if len(matches) != 1:
+            raise ValueError("Validated build has no unique exact native attempt receipt")
+        reuse_run_id = validated["id"]
+        reuse_run_attempt = validated["run_attempt"]
+        reuse_workflow_sha = matches[0].get("workflow_sha")
+        reuse_legacy_attempt_one = (
+            reuse_run_attempt == 1 and matches[0].get("run_attempt_count") == 1)
+        if not isinstance(reuse_workflow_sha, str) or not SHA.fullmatch(reuse_workflow_sha):
+            raise ValueError("Validated build attempt lacks its exact workflow source identity")
+        if not policy_validation_reuse:
+            raise ValueError("Successful application artifacts lack a successful exact-candidate policy validation")
+    if existing:
+        action = existing_reservation_decision(existing, decision)
+        bundle_reuse = (validated_policy_bundle(
+            repo, candidate, int(manifest["candidatePr"])) if action == "policy-only" else False)
+        output(final_decision=action, final_candidate_id=candidate_id,
+               final_run_id=run_id, final_run_attempt=run_attempt,
+               final_workflow_sha=workflow_sha,
+               reuse_run_id=reuse_run_id, reuse_run_attempt=reuse_run_attempt,
+               reuse_workflow_sha=reuse_workflow_sha,
+               reuse_legacy_attempt_one=reuse_legacy_attempt_one,
+               policy_validation_reuse=policy_validation_reuse,
+               validated_bundle=bundle_reuse,
+               final_reason=decision.get("reason", ""))
+        return
+    if action not in {"allow", "policy-only", "already-validated"}:
+        raise ValueError(decision.get("reason", "Shared final-attempt gate denied this candidate"))
+    if action == "allow" and decision.get("allowed") is not True:
+        raise ValueError("Shared final-attempt gate returned an inconsistent allow decision")
+    if action == "policy-only" and decision.get("policy_validation_allowed") is not True:
+        raise ValueError("Shared final-attempt gate denied policy-only final validation")
+    if action == "already-validated" and decision.get("artifact_reuse_allowed") is not True:
+        raise ValueError("Shared final-attempt gate denied verified artifact reuse")
+    reservation = {
+        "schema": 1, "candidate_id": candidate_id,
+        "run_id": run_id, "run_attempt": run_attempt, "workflow_sha": workflow_sha,
+    }
+    if decision.get("grant_id") is not None:
+        reservation["retry_grant_id"] = int(decision["grant_id"])
+    purpose = ("exact validated-artifact metadata continuation" if action == "already-validated"
+               else "one authorized native final run")
+    body = (
+        f"Exact OS Config final-sequence reservation for {purpose}. It does not assert that "
+        "publication or delivery succeeded.\n\n"
+        f"<!-- fork-candidate:v1 {review_context_candidate(candidate)} -->\n"
+        f"<!-- fork-final:v1 {json.dumps(reservation, sort_keys=True, separators=(',', ':'))} -->"
+    )
+    api(f"repos/{repo}/issues/{manifest['candidatePr']}/comments", method="POST",
+        data={"body": body})
+    bundle_reuse = False
+    if action == "policy-only":
+        bundle_reuse = validated_policy_bundle(
+            repo, candidate, int(manifest["candidatePr"]))
+    output(final_decision=action, final_candidate_id=candidate_id,
+           final_run_id=run_id, final_run_attempt=run_attempt,
+           final_workflow_sha=workflow_sha,
+           reuse_run_id=reuse_run_id, reuse_run_attempt=reuse_run_attempt,
+           reuse_workflow_sha=reuse_workflow_sha,
+           reuse_legacy_attempt_one=reuse_legacy_attempt_one,
+           policy_validation_reuse=policy_validation_reuse,
+           final_reason=decision.get("reason", ""), retry_grant_id=decision.get("grant_id"),
+           validated_bundle=bundle_reuse)
+    print(decision.get("reason", action))
+
+
+def verify_final_run(candidate_dir, expected_run_id, expected_run_attempt,
+                     expected_workflow_sha, expected_candidate_id):
+    """Bind every costly or publishing job to this native workflow attempt's reservation."""
+    repo = os.environ["GITHUB_REPOSITORY"]
+    run_id = int(os.environ["GITHUB_RUN_ID"])
+    run_attempt = int(os.environ.get("GITHUB_RUN_ATTEMPT", "1"))
+    workflow_sha = os.environ["GITHUB_SHA"]
+    if (run_id != int(expected_run_id) or run_attempt != int(expected_run_attempt)
+            or workflow_sha != expected_workflow_sha):
+        raise ValueError("This job attempt differs from the exact final-guard reservation outputs")
+    manifest = json.loads((Path(candidate_dir) / "candidate-manifest.json").read_text(encoding="utf-8"))
+    candidate = manifest.get("candidate")
+    if not isinstance(candidate, dict):
+        raise ValueError("Final-stage artifact has no exact shared candidate identity")
+    candidate_id = lifecycle_module().candidate_identity(candidate)
+    if candidate_id != expected_candidate_id or manifest.get("candidateIdentity") != candidate_id:
+        raise ValueError("Final-stage artifact differs from the exact final-guard candidate identity")
+    reservation = current_final_reservation(
+        repo, int(manifest["candidatePr"]), candidate, run_id, run_attempt, workflow_sha)
+    if not reservation:
+        raise ValueError("This native workflow attempt has no exact final-candidate reservation")
+    print(f"Verified final reservation for run {run_id} attempt {run_attempt} and candidate {candidate_id}")
+
+
+def _artifact_file_hashes(directory, *, excluded=()):
+    root = Path(directory)
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("Final artifact directory is missing or unsafe")
+    excluded = set(excluded)
+    files = {}
+    for path in root.rglob("*"):
+        if path.is_symlink():
+            raise ValueError("Final artifact tree contains a symlink")
+        if not path.is_file():
+            continue
+        name = path.relative_to(root).as_posix()
+        if name in excluded:
+            continue
+        files[name] = digest(path)
+    if not files:
+        raise ValueError("Final artifact tree contains no regular files")
+    return dict(sorted(files.items()))
+
+
+def _artifact_candidate(candidate_dir, expected_candidate_id):
+    manifest_path = Path(candidate_dir) / "candidate-manifest.json"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise ValueError("Artifact candidate manifest is missing or unsafe")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    candidate = manifest.get("candidate")
+    if not isinstance(candidate, dict):
+        raise ValueError("Artifact provenance has no exact candidate identity")
+    candidate_id = lifecycle_module().candidate_identity(candidate)
+    if candidate_id != expected_candidate_id or manifest.get("candidateIdentity") != candidate_id:
+        raise ValueError("Artifact provenance differs from the exact reviewed candidate")
+    candidate_sha = manifest.get("candidateSha")
+    if not isinstance(candidate_sha, str) or not SHA.fullmatch(candidate_sha):
+        raise ValueError("Artifact provenance has no exact reviewed source commit")
+    return manifest, candidate_id, candidate_sha
+
+
+def _attempt_provenance(stage, candidate_id, candidate_sha, run_id, run_attempt,
+                        workflow_sha, files, *, build_provenance_sha256=None):
+    if (not isinstance(candidate_id, str) or not re.fullmatch(r"[0-9a-f]{64}", candidate_id)
+            or not isinstance(candidate_sha, str) or not SHA.fullmatch(candidate_sha)
+            or type(run_id) is not int or run_id <= 0
+            or type(run_attempt) is not int or run_attempt <= 0
+            or not isinstance(workflow_sha, str) or not SHA.fullmatch(workflow_sha)
+            or not isinstance(files, dict) or not files):
+        raise ValueError("Final artifact run/attempt provenance is malformed")
+    value = {"schema": 1, "stage": stage, "candidate_id": candidate_id,
+             "candidate_sha": candidate_sha, "run_id": run_id,
+             "run_attempt": run_attempt, "workflow_sha": workflow_sha,
+             "files": files}
+    if build_provenance_sha256 is not None:
+        if not re.fullmatch(r"[0-9a-f]{64}", build_provenance_sha256):
+            raise ValueError("Build artifact provenance digest is malformed")
+        value["build_provenance_sha256"] = build_provenance_sha256
+    return value
+
+
+def _read_attempt_provenance(path, expected_stage, expected_candidate_id,
+                             expected_candidate_sha, expected_run_id,
+                             expected_run_attempt, expected_workflow_sha):
+    path = Path(path)
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"{expected_stage} artifact provenance is missing or unsafe")
+    value = json.loads(path.read_text(encoding="utf-8"))
+    required = {"schema", "stage", "candidate_id", "candidate_sha", "run_id",
+                "run_attempt", "workflow_sha", "files"}
+    if expected_stage == "signed-repository":
+        required.add("build_provenance_sha256")
+    if (not isinstance(value, dict) or set(value) != required
+            or type(value.get("schema")) is not int or value["schema"] != 1
+            or value.get("stage") != expected_stage
+            or value.get("candidate_id") != expected_candidate_id
+            or value.get("candidate_sha") != expected_candidate_sha
+            or value.get("run_id") != expected_run_id
+            or value.get("run_attempt") != expected_run_attempt
+            or value.get("workflow_sha") != expected_workflow_sha
+            or not SHA.fullmatch(value.get("candidate_sha", ""))
+            or not SHA.fullmatch(value.get("workflow_sha", ""))
+            or not isinstance(value.get("files"), dict) or not value["files"]
+            or any(not isinstance(name, str) or not name or "\\" in name or "\x00" in name
+                   or any(part in {"", ".", ".."} for part in name.split("/"))
+                   or not isinstance(blob, str) or not re.fullmatch(r"[0-9a-f]{64}", blob)
+                   for name, blob in value["files"].items())):
+        raise ValueError(f"{expected_stage} artifact lacks exact source/run-attempt provenance")
+    if expected_stage == "signed-repository" and not re.fullmatch(
+            r"[0-9a-f]{64}", value.get("build_provenance_sha256", "")):
+        raise ValueError("Signed artifact is not bound to its exact build provenance")
+    return value
+
+
+def write_build_provenance(candidate_dir, built_dir):
+    manifest, candidate_id, candidate_sha = _artifact_candidate(candidate_dir,
+                                                                os.environ.get("EXPECTED_CANDIDATE_ID", ""))
+    run_id = int(os.environ["GITHUB_RUN_ID"])
+    run_attempt = int(os.environ.get("GITHUB_RUN_ATTEMPT", "1"))
+    workflow_sha = os.environ["GITHUB_SHA"]
+    files = _artifact_file_hashes(built_dir, excluded={BUILD_PROVENANCE_FILE})
+    value = _attempt_provenance("built-rpm", candidate_id, candidate_sha,
+                                run_id, run_attempt, workflow_sha, files)
+    target = Path(built_dir) / BUILD_PROVENANCE_FILE
+    target.write_text(json.dumps(value, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    print(f"Recorded exact build provenance for run {run_id} attempt {run_attempt}")
+
+
+def verify_build_provenance(candidate_dir, built_dir, expected_run_id,
+                            expected_run_attempt, expected_workflow_sha,
+                            expected_candidate_id):
+    _, candidate_id, candidate_sha = _artifact_candidate(candidate_dir, expected_candidate_id)
+    proof = _read_attempt_provenance(
+        Path(built_dir) / BUILD_PROVENANCE_FILE, "built-rpm", candidate_id,
+        candidate_sha, int(expected_run_id), int(expected_run_attempt), expected_workflow_sha)
+    if proof["files"] != _artifact_file_hashes(
+            built_dir, excluded={BUILD_PROVENANCE_FILE}):
+        raise ValueError("Built RPM artifact files differ from their exact attempt receipt")
+    return proof
+
+
+def write_signature_proof(candidate_dir, built_dir, pages_dir, proof_dir):
+    run_id = int(os.environ["GITHUB_RUN_ID"])
+    run_attempt = int(os.environ.get("GITHUB_RUN_ATTEMPT", "1"))
+    workflow_sha = os.environ["GITHUB_SHA"]
+    expected_candidate_id = os.environ.get("EXPECTED_CANDIDATE_ID", "")
+    build_proof = verify_build_provenance(
+        candidate_dir, built_dir, run_id, run_attempt, workflow_sha,
+        expected_candidate_id)
+    _, candidate_id, candidate_sha = _artifact_candidate(candidate_dir,
+                                                          expected_candidate_id)
+    value = _attempt_provenance(
+        "signed-repository", candidate_id, candidate_sha, run_id, run_attempt,
+        workflow_sha, _artifact_file_hashes(pages_dir),
+        build_provenance_sha256=digest(Path(built_dir) / BUILD_PROVENANCE_FILE))
+    target_dir = Path(proof_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    (target_dir / SIGNATURE_PROOF_FILE).write_text(
+        json.dumps(value, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    print(f"Recorded exact signature provenance for run {run_id} attempt {run_attempt}")
+
+
+def verify_reusable_artifacts(candidate_dir, built_dir, pages_dir, proof_dir,
+                              expected_run_id, expected_run_attempt,
+                              expected_workflow_sha, expected_candidate_id,
+                              allow_legacy_attempt_one=False):
+    source_manifest, candidate_id, candidate_sha = _artifact_candidate(
+        candidate_dir, expected_candidate_id)
+    built_manifest, built_candidate_id, built_candidate_sha = _artifact_candidate(
+        built_dir, candidate_id)
+    built_files = _artifact_file_hashes(built_dir, excluded={BUILD_PROVENANCE_FILE})
+    signed_files = _artifact_file_hashes(pages_dir)
+    if (built_candidate_sha != candidate_sha
+            or not re.fullmatch(r"[0-9a-f]{64}", built_manifest.get("rpmSha256", ""))):
+        raise ValueError("Built RPM manifest differs from the exact source candidate")
+    rpm_files = sorted((Path(built_dir) / "rpm").glob("google-osconfig-agent-*.rpm"))
+    if (len(rpm_files) != 1 or rpm_files[0].is_symlink()
+            or digest(rpm_files[0]) != built_manifest["rpmSha256"]):
+        raise ValueError("Built RPM bytes differ from their exact source manifest")
+    package_name, package_evr, package_arch = run(
+        "rpm", "-qp", "--qf", "%{NAME}|%{EPOCHNUM}:%{VERSION}-%{RELEASE}|%{ARCH}",
+        str(rpm_files[0])).split("|")
+    if (package_name != "google-osconfig-agent"
+            or package_evr != built_manifest.get("packageEvr")
+            or package_arch != built_manifest.get("architecture")):
+        raise ValueError("Built RPM package identity differs from its native manifest")
+    build_proof_path = Path(built_dir) / BUILD_PROVENANCE_FILE
+    signature_proof_path = Path(proof_dir) / SIGNATURE_PROOF_FILE
+    if build_proof_path.is_symlink() or signature_proof_path.is_symlink():
+        raise ValueError("Reusable artifact provenance contains a symlink")
+    build_proof = None
+    if build_proof_path.exists() or signature_proof_path.exists():
+        if not build_proof_path.is_file() or not signature_proof_path.is_file():
+            raise ValueError("Reusable artifacts contain incomplete run-attempt provenance")
+        build_proof = verify_build_provenance(
+            candidate_dir, built_dir, expected_run_id, expected_run_attempt,
+            expected_workflow_sha, expected_candidate_id)
+        signature_proof = _read_attempt_provenance(
+            signature_proof_path, "signed-repository", candidate_id,
+            candidate_sha, int(expected_run_id), int(expected_run_attempt), expected_workflow_sha)
+        if signature_proof["build_provenance_sha256"] != digest(build_proof_path):
+            raise ValueError("Signed artifact does not match the exact previously validated build")
+        if signature_proof["files"] != signed_files:
+            raise ValueError("Signed repository files differ from their exact attempt receipt")
+    else:
+        if (allow_legacy_attempt_one is not True or int(expected_run_attempt) != 1):
+            raise ValueError("Reusable artifacts lack exact run-attempt provenance")
+        if (built_manifest.get("upstreamCommit") != source_manifest.get("upstreamCommit")
+                or built_manifest.get("patchSha256") != source_manifest.get("patchSha256")):
+            raise ValueError("Legacy built RPM does not match the exact source candidate")
+        if built_candidate_id != candidate_id:
+            raise ValueError("Legacy built RPM differs from the exact candidate identity")
+    _, manifest, _, _, published, _ = verify_candidate_artifact(candidate_dir, pages_dir)
+    if (published.get("candidateSha") != candidate_sha
+            or manifest.get("candidateIdentity") != candidate_id
+            or built_candidate_id != candidate_id
+            or published.get("packageEvr") != built_manifest.get("packageEvr")
+            or published.get("upstreamCommit") != built_manifest.get("upstreamCommit")
+            or published.get("patchSha256") != built_manifest.get("patchSha256")
+            or (build_proof is not None and build_proof.get("candidate_id") != candidate_id)):
+        raise ValueError("Signed artifact identity differs from the exact validated source")
+    verify_env = os.environ.copy()
+    verify_env.update({
+        "EXPECTED_CANDIDATE_SHA": candidate_sha,
+        "EXPECTED_UPSTREAM_SHA": manifest["candidate"]["upstream_sha"],
+        "EXPECTED_PATCH_SHA": manifest["patchSha256"],
+    })
+    run("bash", str(PATCH_DIR / "verify-repo.sh"), str(built_dir),
+        str(Path(pages_dir).parent), env=verify_env)
+    print(f"Verified exact signed artifacts from run {expected_run_id} attempt {expected_run_attempt}")
+
+
 def add_package_tree(work, source_dir):
     for relative in PACKAGE_FILES:
         source = PATCH_DIR / relative
@@ -702,10 +2493,48 @@ def add_package_tree(work, source_dir):
     (work / PREFIX / "candidate.json").write_text(json.dumps(metadata, sort_keys=True) + "\n")
 
 
+def add_product_review_tree(work, source_dir):
+    """Copy only product/build sources into the upstream-based full review PR."""
+    for relative in (*PRODUCT_BUILD_INPUTS, "source.lock"):
+        source = (Path(source_dir) / "source.lock" if relative == "source.lock"
+                  else PATCH_DIR / relative)
+        if source.is_symlink() or not source.is_file():
+            raise ValueError(f"OS Config product review input is missing or unsafe: {relative}")
+        target = Path(work) / PREFIX / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+        target.chmod(0o755 if source.stat().st_mode & 0o111 else 0o644)
+
+
 def check_cached_whitespace(repo_work):
     """Check staged package inputs; the inventory patch is itself a unified diff."""
     run("git", "diff", "--cached", "--check", "--", ".",
         f":(exclude){PATCH_REL}", cwd=repo_work)
+
+
+def git_tree_map(repository_dir, commit, paths):
+    raw = run("git", "ls-tree", "-r", "--full-tree", commit, "--", *paths,
+              cwd=repository_dir)
+    result = {}
+    for line in raw.splitlines():
+        metadata, separator, path = line.partition("\t")
+        fields = metadata.split()
+        if not separator or len(fields) != 3 or fields[1] != "blob":
+            raise ValueError("Adoption tree contains a non-regular or malformed path")
+        if fields[0] not in {"100644", "100755"} or not SHA.fullmatch(fields[2]):
+            raise ValueError(f"Adoption tree path has an unsupported mode or blob: {path}")
+        result[path] = {"mode": fields[0], "blob_sha": fields[2]}
+    return result
+
+
+def validate_reviewed_adoption(repository_dir, reviewed_sha, adopted_sha):
+    core = lifecycle_module()
+    reviewed = git_tree_map(repository_dir, reviewed_sha,
+                            (*PRODUCT_ADOPTION_PATHS, *REGRESSION_ADOPTION_PATHS))
+    adopted = git_tree_map(repository_dir, adopted_sha,
+                           (*PRODUCT_ADOPTION_PATHS, *REGRESSION_ADOPTION_PATHS))
+    core.validate_adoption(reviewed, adopted,
+                           list(PRODUCT_ADOPTION_PATHS), list(REGRESSION_ADOPTION_PATHS))
 
 
 def verify_reusable_commit(work, commit, expected_tree, expected_parent, label):
@@ -715,6 +2544,356 @@ def verify_reusable_commit(work, commit, expected_tree, expected_parent, label):
     if tree != expected_tree or parents != [expected_parent]:
         raise ValueError(f"Existing {label} has an unexpected tree or parent")
     return commit
+
+
+def published_product_inputs_match(repo, published, source_dir):
+    """Prove a policy-only migration leaves every signed build input identical."""
+    candidate_sha = published.get("candidateSha")
+    if not isinstance(candidate_sha, str) or not SHA.fullmatch(candidate_sha):
+        return False
+    for relative in (*PRODUCT_BUILD_INPUTS, "source.lock"):
+        path = PREFIX + relative
+        try:
+            prior = content(repo, path, candidate_sha)
+        except (subprocess.CalledProcessError, ValueError):
+            return False
+        current_path = (Path(source_dir) / "source.lock" if relative == "source.lock"
+                        else PATCH_DIR / relative)
+        if current_path.is_symlink() or not current_path.is_file():
+            return False
+        if prior != current_path.read_bytes():
+            return False
+    return True
+
+
+def downstream_context_paths(repository_dir, revision):
+    return exact_repo_tree_paths(repository_dir, revision,
+                                 (*REVIEW_CONTEXT_PREFIXES, *REVIEW_CONTEXT_FILES))
+
+
+def create_delta_snapshot(repo_work, *, baseline_config, application_sha,
+                          source_root, source_config_sha, repo,
+                          ensure_remote_base=True):
+    """Commit current config modes with exact candidate product blobs on the signed base."""
+    base_branch = f"review-base/{baseline_config}"
+    run("git", "fetch", "--no-tags", "origin", baseline_config, cwd=repo_work)
+    if run("git", "rev-parse", "FETCH_HEAD", cwd=repo_work) != baseline_config:
+        raise ValueError("Fetched signed configuration base differs from the manifest")
+    expected_paths = set(FULL_PRODUCT_PATHS)
+    if len(expected_paths) != len(FULL_PRODUCT_PATHS):
+        raise ValueError("Configured OS Config product paths are not unique")
+    config_product = git_tree_map(source_root, source_config_sha, FULL_PRODUCT_PATHS)
+    application_product = git_tree_map(repo_work, application_sha, FULL_PRODUCT_PATHS)
+    for label, tree in (("source configuration", config_product),
+                        ("application", application_product)):
+        if set(tree) != expected_paths:
+            missing = sorted(expected_paths - set(tree))
+            extra = sorted(set(tree) - expected_paths)
+            detail = []
+            if missing:
+                detail.append("missing " + ", ".join(missing))
+            if extra:
+                detail.append("unexpected " + ", ".join(extra))
+            raise ValueError(f"OS Config {label} product tree is incomplete: {'; '.join(detail)}")
+    if ensure_remote_base:
+        ensure_review_base(repo_work, repo, base_branch, baseline_config)
+    run("git", "checkout", "-B", "delta", baseline_config, cwd=repo_work)
+    previous = downstream_context_paths(repo_work, baseline_config)
+    if previous:
+        run("git", "rm", "-f", "--", *previous, cwd=repo_work)
+    current = copy_checked_out_review_files(source_root, source_config_sha, repo_work,
+                                            (*REVIEW_CONTEXT_PREFIXES, *REVIEW_CONTEXT_FILES))
+    if current:
+        run("git", "add", "-A", "--", *current, cwd=repo_work)
+    run("git", "checkout", application_sha, "--", *FULL_PRODUCT_PATHS, cwd=repo_work)
+    for path in FULL_PRODUCT_PATHS:
+        mode = config_product[path]["mode"]
+        blob_sha = application_product[path]["blob_sha"]
+        run("git", "update-index", "--cacheinfo",
+            f"{mode},{blob_sha},{path}", cwd=repo_work)
+    run("git", "checkout-index", "--force", "--", *FULL_PRODUCT_PATHS, cwd=repo_work)
+    run("git", "diff", "--cached", "--check", "--", ".",
+        f":(exclude){PATCH_REL}", cwd=repo_work)
+    tree = run("git", "write-tree", cwd=repo_work)
+    message = f"OS Config downstream review snapshot from {baseline_config}\n"
+    env = dict(os.environ)
+    env.update(
+        GIT_AUTHOR_NAME="github-actions[bot]",
+        GIT_AUTHOR_EMAIL="41898282+github-actions[bot]@users.noreply.github.com",
+        GIT_COMMITTER_NAME="github-actions[bot]",
+        GIT_COMMITTER_EMAIL="41898282+github-actions[bot]@users.noreply.github.com",
+        GIT_AUTHOR_DATE="2000-01-01T00:00:00Z",
+        GIT_COMMITTER_DATE="2000-01-01T00:00:00Z",
+    )
+    delta_sha = run("git", "commit-tree", tree, "-p", baseline_config,
+                    cwd=repo_work, env=env, input=message)
+    if not SHA.fullmatch(delta_sha):
+        raise ValueError("Git returned an invalid downstream review snapshot SHA")
+    return delta_sha, base_branch
+
+
+def published_candidate_identity(repo, published, work_root):
+    """Use signed ABI provenance or deterministically reconstruct the vps137 baseline."""
+    core = lifecycle_module()
+    recorded = published.get("candidate")
+    if isinstance(recorded, dict):
+        identity = core.candidate_identity(recorded)
+        if published.get("candidateIdentity", identity) != identity:
+            raise ValueError("Signed published candidate identity is inconsistent")
+        return recorded
+    required = ("candidateSha", "configSha", "upstreamCommit", "patchSha256",
+                "specSha256", "upstreamArchiveSha256")
+    if any(not isinstance(published.get(key), str) for key in required):
+        raise ValueError("The signed production baseline lacks exact source identity")
+    upstream = published["upstreamCommit"]
+    candidate_sha = published["candidateSha"]
+    config_sha = published["configSha"]
+    if not all(SHA.fullmatch(value) for value in (upstream, candidate_sha, config_sha)):
+        raise ValueError("The signed production baseline contains an invalid source revision")
+    repo_work = Path(work_root) / "published-baseline-source"
+    run("git", "init", str(repo_work))
+    for key, value in (("user.name", "github-actions[bot]"),
+                       ("user.email", "41898282+github-actions[bot]@users.noreply.github.com"),
+                       ("core.hooksPath", "/dev/null"), ("commit.gpgSign", "false")):
+        run("git", "config", key, value, cwd=repo_work)
+    run("git", "remote", "add", "upstream", f"https://github.com/{UPSTREAM}.git", cwd=repo_work)
+    run("git", "remote", "add", "origin", f"https://github.com/{repo}.git", cwd=repo_work)
+    run("git", "fetch", "--depth=1", "upstream", upstream, cwd=repo_work)
+    if run("git", "rev-parse", "FETCH_HEAD", cwd=repo_work) != upstream:
+        raise ValueError("Reconstructed baseline upstream differs from the signed manifest")
+    run("git", "checkout", "-b", "baseline", upstream, cwd=repo_work)
+    run("git", "fetch", "--depth=1", "origin", candidate_sha, cwd=repo_work)
+    if run("git", "rev-parse", "FETCH_HEAD", cwd=repo_work) != candidate_sha:
+        raise ValueError("Fetched signed candidate commit differs from its manifest")
+    run("git", "checkout", candidate_sha, "--", *FULL_PRODUCT_PATHS, cwd=repo_work)
+    patch_path = repo_work / PATCH_REL
+    if digest(patch_path) != published["patchSha256"]:
+        raise ValueError("Reconstructed production patch differs from its signed digest")
+    if digest(repo_work / (PREFIX + "rpm/google-osconfig-agent.spec")) != published["specSha256"]:
+        raise ValueError("Reconstructed production RPM spec differs from its signed digest")
+    assemble_review_source(repo_work, upstream, patch_path)
+    source_files = run("git", "diff", "--name-only", upstream, "--", "*.go",
+                       cwd=repo_work).splitlines()
+    run("git", "add", "-A", "--", *FULL_PRODUCT_PATHS, *source_files, cwd=repo_work)
+    check_cached_whitespace(repo_work)
+    tree = run("git", "write-tree", cwd=repo_work)
+    env = dict(os.environ)
+    env.update(
+        GIT_AUTHOR_NAME="github-actions[bot]",
+        GIT_AUTHOR_EMAIL="41898282+github-actions[bot]@users.noreply.github.com",
+        GIT_COMMITTER_NAME="github-actions[bot]",
+        GIT_COMMITTER_EMAIL="41898282+github-actions[bot]@users.noreply.github.com",
+        GIT_AUTHOR_DATE="2000-01-01T00:00:00Z",
+        GIT_COMMITTER_DATE="2000-01-01T00:00:00Z",
+    )
+    application_sha = run("git", "commit-tree", tree, "-p", upstream, cwd=repo_work,
+                          env=env, input="OS Config assembled application source\n")
+    value = {
+        "schema": 1, "repository": repo, "upstream_sha": upstream,
+        "application_sha": application_sha, "configuration_sha": config_sha,
+        "patchset_sha256": core.patch_digest([("osconfig-inventory.patch", patch_path.read_bytes())]),
+        "recipe_sha256": recipe_digest(repo_work / PREFIX),
+        "platform": "fedora-44/x86_64",
+    }
+    core.candidate_identity(value)
+    return value
+
+
+def verified_pages_baseline(repo, published, *, token=None):
+    """Bind the signed baseline manifest to its latest successful Pages deployment."""
+    config_sha = published.get("configSha")
+    manifest_sha = published.get("_verifiedManifestSha256")
+    if not isinstance(config_sha, str) or not SHA.fullmatch(config_sha):
+        raise ValueError("The signed RPM manifest has no exact publishing configuration SHA")
+    if not isinstance(manifest_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", manifest_sha):
+        raise ValueError("The signed RPM manifest has no verified byte identity")
+    read_pages = (lambda route: pages(route, token=token)) if token is not None else pages
+    deployments = [item for item in read_pages(f"repos/{repo}/deployments?environment=github-pages")
+                   if item.get("environment") == "github-pages"]
+    successful = []
+    for deployment in deployments:
+        if not isinstance(deployment.get("id"), int) or deployment.get("ref") != DEFAULT_BRANCH:
+            continue
+        statuses = read_pages(f"repos/{repo}/deployments/{deployment['id']}/statuses")
+        status = next((item for item in statuses if item.get("state") == "success"), None)
+        if status:
+            successful.append((status.get("created_at", ""), deployment, status))
+    if not successful:
+        raise ValueError("No successful native GitHub Pages deployment identifies the signed baseline")
+    created, deployment, status = max(successful, key=lambda item: (item[0], item[1]["id"]))
+    if deployment.get("sha") != config_sha:
+        raise ValueError("The latest successful Pages deployment differs from the signed manifest source")
+    parse_utc(created)
+    return {
+        "release_id": deployment["id"],
+        "published_at": created,
+        "manifest_sha256": manifest_sha,
+        "publication": {
+            "kind": "signed-repository",
+            "id": deployment["id"],
+            "published_at": created,
+            "metadata_sha256": manifest_sha,
+        },
+        "config_sha": config_sha,
+        "candidate": published.get("candidate"),
+        "candidate_id": published.get("candidateIdentity"),
+        "deployment_status_id": status.get("id"),
+    }
+
+
+def accepted_baseline_proof(repo, variable, baseline):
+    """Bind the protected native checkpoint to the verified signed publication."""
+    endpoint = f"repos/{repo}/actions/variables/FORK_ACCEPTED_BASELINE"
+    if (not isinstance(variable, dict)
+            or variable.get("name") != "FORK_ACCEPTED_BASELINE"
+            or not isinstance(variable.get("value"), str)):
+        raise ValueError("Native FORK_ACCEPTED_BASELINE repository variable is missing or malformed")
+    created, updated = parse_utc(variable.get("created_at")), parse_utc(variable.get("updated_at"))
+    if updated < created:
+        raise ValueError("Native accepted-baseline variable update predates its creation")
+    try:
+        value = json.loads(variable["value"])
+    except (TypeError, ValueError) as error:
+        raise ValueError("Native accepted-baseline value is malformed JSON") from error
+    expected = {
+        "schema": 1,
+        "repository": repo,
+        "candidate": baseline.get("candidate"),
+        "publication": {
+            "kind": "signed-repository",
+            "id": baseline.get("release_id"),
+            "published_at": baseline.get("published_at"),
+            "metadata_sha256": baseline.get("manifest_sha256"),
+        },
+    }
+    if value != expected:
+        raise ValueError("Protected accepted-baseline checkpoint differs from the latest verified signed manifest/deployment")
+    if not isinstance(expected["candidate"], dict):
+        raise ValueError("Verified signed RPM baseline has no exact application/configuration identity")
+    candidate_id = lifecycle_module().candidate_identity(expected["candidate"])
+    if baseline.get("candidate_id") not in {None, candidate_id}:
+        raise ValueError("Protected accepted-baseline candidate differs from signed production provenance")
+    if updated < parse_utc(baseline["published_at"]):
+        raise ValueError("Native accepted-baseline checkpoint predates the verified publication")
+    return {"endpoint": endpoint, "variable": variable}
+
+
+def advance_accepted_baseline(repo, candidate_manifest, signed_manifest, token):
+    """Advance the protected native checkpoint only after signed deployment verification."""
+    core = lifecycle_module()
+    candidate = candidate_manifest.get("candidate")
+    candidate_id = core.candidate_identity(candidate)
+    if candidate_id != candidate_manifest.get("candidateIdentity"):
+        raise ValueError("Published source candidate identity differs from its reviewed manifest")
+    deployment = verified_pages_baseline(repo, signed_manifest)
+    checkpoint_value = {
+        "schema": 1,
+        "repository": repo,
+        "candidate": candidate,
+        "publication": deployment["publication"],
+    }
+    encoded = json.dumps(checkpoint_value, ensure_ascii=False,
+                         sort_keys=True, separators=(",", ":"))
+    endpoint = f"repos/{repo}/actions/variables/FORK_ACCEPTED_BASELINE"
+    current = api(endpoint, token=token)
+    if not isinstance(current, dict):
+        raise ValueError("GitHub returned no native accepted-baseline variable object")
+    expected = (candidate_manifest.get("acceptedBaselineProof") or {}).get("variable")
+    if current.get("name") != "FORK_ACCEPTED_BASELINE":
+        raise ValueError("Protected accepted-baseline repository variable changed identity")
+    if current.get("value") != encoded:
+        if not isinstance(expected, dict) or current != expected:
+            raise ValueError("Protected accepted-baseline checkpoint changed after source selection")
+        api(endpoint, method="PATCH", data={"name": "FORK_ACCEPTED_BASELINE", "value": encoded}, token=token)
+        current = api(endpoint, token=token)
+    if (not isinstance(current, dict) or current.get("name") != "FORK_ACCEPTED_BASELINE"
+            or current.get("value") != encoded):
+        raise ValueError("GitHub did not store the exact new accepted-baseline checkpoint")
+    parse_utc(current.get("created_at"))
+    updated_at = parse_utc(current.get("updated_at"))
+    if updated_at < parse_utc(deployment["published_at"]):
+        raise ValueError("Updated accepted-baseline checkpoint predates the verified publication")
+    print(f"Advanced protected accepted baseline to published candidate {candidate_id}")
+
+
+def policy_inputs_match_published_config(repo, baseline_config, current_config):
+    """Compare every downstream config/build/regression blob to the accepted source."""
+    if not SHA.fullmatch(baseline_config) or not SHA.fullmatch(current_config):
+        return False
+    trees = []
+    for revision in (baseline_config, current_config):
+        result = api(f"repos/{repo}/git/trees/{revision}?recursive=1")
+        if not isinstance(result, dict) or result.get("truncated") is True:
+            return False
+        entries = result.get("tree")
+        if not isinstance(entries, list):
+            return False
+        trees.append({item.get("path"): (item.get("mode"), item.get("sha"))
+                      for item in entries if isinstance(item, dict)
+                      and item.get("type") == "blob"})
+    previous, current = trees
+    configuration_paths = set(POLICY_FILES) | {"AGENTS.md", REPOSITORY_CONF}
+    product_paths = {PREFIX + relative for relative in PRODUCT_BUILD_INPUTS}
+    configuration_paths.update(product_paths)
+    return all(previous.get(path) == current.get(path) for path in configuration_paths)
+
+
+def candidate_config_inputs_match(repo, baseline_config, product_root, policy_root):
+    """Compare assembled package inputs and trusted policy files with accepted config."""
+    result = api(f"repos/{repo}/git/trees/{baseline_config}?recursive=1")
+    if not isinstance(result, dict) or result.get("truncated") is True:
+        raise ValueError("Accepted configuration tree is incomplete")
+    entries = result.get("tree")
+    if not isinstance(entries, list):
+        raise ValueError("Accepted configuration tree is malformed")
+    previous = {item.get("path"): (item.get("mode"), item.get("sha"))
+                for item in entries if isinstance(item, dict) and item.get("type") == "blob"}
+    configuration_paths = set(POLICY_FILES) | {"AGENTS.md", REPOSITORY_CONF}
+    configuration_paths.update(
+        PREFIX + relative for relative in PACKAGE_FILES if relative != "source.lock")
+    product_root, policy_root = Path(product_root), Path(policy_root)
+    product_paths = {PREFIX + relative for relative in PRODUCT_BUILD_INPUTS}
+    for path in configuration_paths:
+        local = product_root / path if path in product_paths else policy_root / path
+        expected = previous.get(path)
+        if local.is_symlink():
+            return False
+        if not local.is_file():
+            if expected is not None:
+                return False
+            continue
+        mode = "100755" if local.stat().st_mode & 0o111 else "100644"
+        blob = run("git", "hash-object", str(local), cwd=product_root)
+        if expected != (mode, blob):
+            return False
+    return True
+
+
+def ensure_review_pull(repo, *, title, body, base_sha, base_branch, head_sha, head_branch,
+                       allow_closed=False):
+    pull = find_review_pull(repo, base_branch, head_branch, states=("open", "closed"))
+    if pull and not review_pull_identity(repo, pull, base_sha=base_sha,
+                                         base_branch=base_branch,
+                                         head_sha=pull.get("head", {}).get("sha"),
+                                         head_branch=head_branch, allow_closed=True):
+        raise ValueError("Existing review PR has a different source or base identity")
+    if pull and pull.get("head", {}).get("sha") != head_sha:
+        raise ValueError("Existing review PR head does not match its exact pushed branch")
+    if pull and pull.get("state") == "closed" and not allow_closed:
+        pull = api(f"repos/{repo}/pulls/{pull['number']}", method="PATCH",
+                   data={"state": "open", "body": body})
+    elif pull and pull.get("body") != body:
+        pull = api(f"repos/{repo}/pulls/{pull['number']}", method="PATCH", data={"body": body})
+    elif not pull:
+        pull = api(f"repos/{repo}/pulls", method="POST", data={
+            "title": title, "head": head_branch, "base": base_branch, "body": body,
+        })
+    if not review_pull_identity(repo, pull, base_sha=base_sha,
+                                base_branch=base_branch,
+                                head_sha=head_sha, head_branch=head_branch,
+                                allow_closed=allow_closed):
+        raise ValueError("Review PR does not identify the exact source and base")
+    return pull
 
 
 def prepare(candidate):
@@ -738,23 +2917,37 @@ def prepare(candidate):
     spec_sha = digest(PATCH_DIR / "rpm/google-osconfig-agent.spec")
     tracked_lock = json.loads((PATCH_DIR / "source.lock").read_text(encoding="utf-8"))
     published = published_manifest(owner, repository, settings["signing_fingerprint"])
-    if (published
+    codex_token = owner_token(repo)
+    core = lifecycle_module()
+    if not published:
+        raise ValueError("No verified signed RPM baseline is available for paired review and final authorization")
+    baseline = verified_pages_baseline(repo, published)
+    with tempfile.TemporaryDirectory(prefix="osconfig-published-baseline-") as temporary:
+        baseline["candidate"] = published_candidate_identity(repo, published, temporary)
+    baseline["candidate_id"] = core.candidate_identity(baseline["candidate"])
+    native_baseline = api(
+        f"repos/{repo}/actions/variables/FORK_ACCEPTED_BASELINE", token=codex_token)
+    accepted_proof = accepted_baseline_proof(repo, native_baseline, baseline)
+    base = f"review-base/{upstream}"
+    baseline_config = baseline["candidate"]["configuration_sha"]
+    branch_key = hashlib.sha256((config + "\0" + baseline_config).encode()).hexdigest()
+    branch = f"review/{upstream}-{branch_key}"
+    pull = find_review_pull(repo, base, branch, states=("open", "closed"))
+    if (not pull and published
             and tracked_lock.get("commit") == upstream
             and tracked_lock.get("archiveSha256") == lock["archiveSha256"]
             and published.get("upstreamCommit") == upstream
             and published.get("upstreamArchiveSha256") == lock["archiveSha256"]
             and published.get("patchSha256") == patch_sha
             and published.get("specSha256") == spec_sha
-            and published.get("packageEvr") == settings["minimum_evr"]):
+            and published.get("packageEvr") == settings["minimum_evr"]
+            and published_product_inputs_match(repo, published, source_dir)
+            and policy_inputs_match_published_config(repo, baseline_config, config)):
         output(candidate_exists=False, published=True, upstream_commit=upstream,
                upstream_tag=lock["tag"], patch_sha=patch_sha,
                review_ready=True, review_reason="The exact signed candidate is already adopted")
-        print("The exact upstream, patch and package EVR are already signed, published and adopted")
+        print("The exact signed RPM and every source/build input remain unchanged; no RPM rebuild is needed")
         return
-    codex_token = owner_token(repo)
-    branch = f"review/osconfig-{upstream[:12]}-{patch_sha[:12]}-{config[:8]}"
-    base = f"review-base/{upstream}"
-    pull = find_pull(repo, upstream, branch)
     candidate.mkdir(parents=True, exist_ok=True)
     repo_work = candidate / "git"
     run("git", "init", str(repo_work))
@@ -767,92 +2960,384 @@ def prepare(candidate):
     run("git", "fetch", "--depth=1", "upstream", upstream, cwd=repo_work)
     if run("git", "rev-parse", "FETCH_HEAD", cwd=repo_work) != upstream:
         raise ValueError("Fetched commit differs from source.lock")
-    run("git", "checkout", "-b", "candidate", upstream, cwd=repo_work)
+    run("git", "checkout", "-B", "candidate", upstream, cwd=repo_work)
+    repair_changed = False
+    existing_state = None
     if pull:
-        if not pull_identity(repo, pull, upstream, branch):
-            raise ValueError("Existing candidate PR identity changed")
-        markers = re.findall(r"<!-- osconfig-candidate:v1 (\{[^\n]+\}) -->", pull.get("body") or "")
-        if len(markers) != 1:
-            raise ValueError("Existing candidate PR has no unique identity marker")
-        identity = json.loads(markers[0])
-        if (identity.get("upstream") != upstream or identity.get("config") != config
-                or identity.get("archiveSha256") != lock["archiveSha256"]
-                or not SHA.fullmatch(identity.get("seed", ""))):
-            raise ValueError("Existing candidate PR does not match the selected source")
-        seed = identity["seed"]
-        run("git", "fetch", "--no-tags", "origin", f"refs/heads/{branch}", cwd=repo_work)
-        head = run("git", "rev-parse", "FETCH_HEAD", cwd=repo_work)
-        if head != pull["head"]["sha"]:
-            raise ValueError("Candidate branch and PR head differ")
+        existing_state = existing_candidate_state(
+            pull, upstream=upstream, config=config, archive_sha=lock["archiveSha256"])
+        seed = existing_state["seed"]
+        head = fetch_archived_review_pr_head(repo_work, repo, pull)
+        run("git", "merge-base", "--is-ancestor", upstream, head, cwd=repo_work)
         run("git", "checkout", "-B", "candidate", head, cwd=repo_work)
         changed = run("git", "diff", "--name-only", seed, head, cwd=repo_work).splitlines()
         if set(changed) - EDITABLE_CANDIDATE_FILES:
             raise ValueError("Codex changed the immutable source lock or files outside the package candidate")
+        repair_changed = bool(changed)
     else:
-        add_package_tree(repo_work, source_dir)
-        run("git", "add", "--", PREFIX, cwd=repo_work)
-        check_cached_whitespace(repo_work)
-        run("git", "commit", "-m", f"Prepare OS Config inventory candidate {lock['tag']}", cwd=repo_work)
-        seed = run("git", "rev-parse", "HEAD", cwd=repo_work)
-        head = seed
+        add_product_review_tree(repo_work, source_dir)
+    candidate_patch = repo_work / PATCH_REL
+    if candidate_patch.is_symlink() or not candidate_patch.is_file():
+        raise ValueError("Candidate inventory patch is missing or unsafe")
+    if (repo_work / PREFIX / "source.lock").read_bytes() != (source_dir / "source.lock").read_bytes():
+        raise ValueError("Candidate source.lock differs from the selected exact upstream archive")
+    assemble_review_source(repo_work, upstream, candidate_patch)
+    source_files = run("git", "diff", "--name-only", upstream, "--", "*.go",
+                       cwd=repo_work).splitlines()
+    stage_paths = [*FULL_PRODUCT_PATHS, *source_files]
+    run("git", "add", "-A", "--", *stage_paths, cwd=repo_work)
+    check_cached_whitespace(repo_work)
+    staged = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=repo_work,
+                            check=False)
+    if staged.returncode == 1:
+        if pull:
+            run("git", "commit", "-m", f"Assemble OS Config inventory candidate {lock['tag']}",
+                cwd=repo_work)
+            application_sha = run("git", "rev-parse", "HEAD", cwd=repo_work)
+        else:
+            tree = run("git", "write-tree", cwd=repo_work)
+            env = dict(os.environ)
+            env.update(
+                GIT_AUTHOR_NAME="github-actions[bot]",
+                GIT_AUTHOR_EMAIL="41898282+github-actions[bot]@users.noreply.github.com",
+                GIT_COMMITTER_NAME="github-actions[bot]",
+                GIT_COMMITTER_EMAIL="41898282+github-actions[bot]@users.noreply.github.com",
+                GIT_AUTHOR_DATE="2000-01-01T00:00:00Z",
+                GIT_COMMITTER_DATE="2000-01-01T00:00:00Z",
+            )
+            application_sha = run("git", "commit-tree", tree, "-p", upstream, cwd=repo_work,
+                                  env=env, input="OS Config assembled application source\n")
+            run("git", "update-ref", "refs/heads/candidate", application_sha, cwd=repo_work)
+            run("git", "reset", "--hard", application_sha, cwd=repo_work)
+    elif staged.returncode != 0:
+        raise ValueError("Unable to inspect the assembled OS Config review source")
+    if application_sha is None:
+        if pull and not repair_changed and existing_state:
+            application_sha = existing_state.get("candidate", {}).get("application_sha")
+        else:
+            application_sha = run("git", "rev-parse", "HEAD", cwd=repo_work)
+    if not isinstance(application_sha, str) or not SHA.fullmatch(application_sha):
+        raise ValueError("Assembled OS Config application source has no exact commit identity")
+    run("git", "merge-base", "--is-ancestor", upstream, application_sha, cwd=repo_work)
     run("gh", "auth", "setup-git")
-    base_ref = run("git", "ls-remote", "--refs", "origin", f"refs/heads/{base}", cwd=repo_work)
-    if base_ref and base_ref.split()[0] != upstream:
-        raise ValueError("Existing review base does not point at the exact upstream SHA")
-    head_ref = run("git", "ls-remote", "--refs", "origin", f"refs/heads/{branch}", cwd=repo_work)
-    if head_ref and head_ref.split()[0] != head:
-        remote_head = head_ref.split()[0]
-        run("git", "fetch", "--no-tags", "origin", f"refs/heads/{branch}", cwd=repo_work)
-        expected_tree = run("git", "rev-parse", f"{head}^{{tree}}", cwd=repo_work)
-        verify_reusable_commit(repo_work, remote_head, expected_tree, upstream, "candidate branch")
-        head = seed = remote_head
-        run("git", "checkout", "-B", "candidate", head, cwd=repo_work)
-    push = [f"https://github.com/{repo}.git"]
-    if not base_ref:
-        push.append(f"{upstream}:refs/heads/{base}")
-    if not head_ref:
-        push.append(f"{head}:refs/heads/{branch}")
-    if len(push) > 1:
-        run("git", "push", *push, cwd=repo_work)
-    if not pull:
-        state = {"schema": 1, "config": config, "upstream": upstream,
-                 "tag": lock["tag"], "archiveSha256": lock["archiveSha256"], "seed": seed}
-        pull = api(f"repos/{repo}/pulls", method="POST", data={
-            "title": f"Review Google OS Config inventory fix {lock['tag']}",
-            "head": branch, "base": base,
-            "body": (
-                f"Exact upstream release {lock['tag']} at {upstream}.\n\n"
-                f"Source archive SHA-256: {lock['archiveSha256']}.\n"
-                f"Packaging configuration: {config}.\n"
-                "This temporary PR is review input. Only a tested, signed RPM-MD repository is published.\n\n"
-                f"<!-- osconfig-candidate:v1 {json.dumps(state, sort_keys=True)} -->"),
-        })
-    if not pull_identity(repo, pull, upstream, branch) or pull["head"]["sha"] != head:
-        raise ValueError("Candidate PR does not identify the exact upstream source")
+    patchset_sha = lifecycle_module().patch_digest([("osconfig-inventory.patch", candidate_patch.read_bytes())])
+    recipe_sha = recipe_digest(repo_work / PREFIX)
+    if not SHA.fullmatch(baseline_config):
+        raise ValueError("The signed production manifest has no exact prior configuration SHA")
+    if candidate_config_inputs_match(repo, baseline_config, repo_work, ROOT):
+        candidate_configuration_sha = baseline_config
+        delta_sha = application_sha
+        delta_base = baseline["candidate"]["application_sha"]
+        delta_base_branch = f"review-base/{delta_base}"
+        run("git", "fetch", "--no-tags", "origin", delta_base, cwd=repo_work)
+        if run("git", "rev-parse", "FETCH_HEAD", cwd=repo_work) != delta_base:
+            raise ValueError("Fetched accepted application base differs from the protected baseline")
+        delta_branch = delta_review_branch(delta_sha)
+    else:
+        delta_sha, delta_base_branch = create_delta_snapshot(
+            repo_work, baseline_config=baseline_config, application_sha=application_sha,
+            source_root=ROOT, source_config_sha=config, repo=repo,
+            ensure_remote_base=False)
+        candidate_configuration_sha = delta_sha
+        delta_base = baseline_config
+        delta_branch = delta_review_branch(delta_sha)
+    candidate_value = {
+        "schema": 1,
+        "repository": repo,
+        "upstream_sha": upstream,
+        "application_sha": application_sha,
+        "configuration_sha": candidate_configuration_sha,
+        "patchset_sha256": patchset_sha,
+        "recipe_sha256": recipe_sha,
+        "platform": "fedora-44/x86_64",
+    }
+    candidate_id = core.candidate_identity(candidate_value)
+    bundle_reuse = bool(pull and pull.get("state") == "closed"
+                        and validated_policy_bundle(repo, candidate_value, pull["number"]))
+    if not bundle_reuse:
+        # A closed verified pair can be reused from native PR-head archives. Do
+        # not recreate its deleted temporary refs; only a fresh review cycle
+        # needs the review branches pushed again.
+        ensure_review_base(repo_work, repo, base, upstream)
+        ensure_review_base(repo_work, repo, delta_base_branch, delta_base)
+        ensure_review_branch(repo_work, delta_branch, delta_sha)
+    if (pull and not repair_changed and existing_state
+            and existing_state.get("candidateId") == candidate_id
+            and existing_state.get("candidate", {}).get("application_sha") == application_sha):
+        review_source_sha = existing_state.get("reviewSourceSha")
+        if not isinstance(review_source_sha, str) or not SHA.fullmatch(review_source_sha):
+            raise ValueError("Existing full review context has no exact source SHA")
+        if (run("git", "rev-parse", f"{review_source_sha}^{{tree}}", cwd=repo_work)
+                != run("git", "rev-parse", f"{application_sha}^{{tree}}", cwd=repo_work)
+                or run("git", "show", "-s", "--format=%P", review_source_sha, cwd=repo_work)
+                != application_sha
+                or run("git", "show", "-s", "--format=%B", review_source_sha, cwd=repo_work)
+                != f"fork-review-context:v1 {candidate_id}"):
+            raise ValueError("Existing full review context does not bind the exact application candidate")
+    else:
+        review_source_sha = create_application_review_context(
+            repo_work, application_sha, candidate_id)
+    run("git", "update-ref", "refs/heads/candidate", review_source_sha, cwd=repo_work)
+    run("git", "reset", "--hard", review_source_sha, cwd=repo_work)
+    if not bundle_reuse:
+        ensure_review_branch(repo_work, branch, review_source_sha)
+    delta_pull = find_review_pull(repo, delta_base, delta_branch, states=("open", "closed"))
+    delta_body = (
+        ("Review-only application delta against the last accepted application. The complete "
+         "upstream integration is covered by the paired full-source review. "
+         if candidate_configuration_sha == baseline_config else
+         "Review-only snapshot of the candidate's downstream policy, patch, package, and regression "
+         "files relative to the last accepted configuration. It is not a product integration branch, "
+         "release source, or installation source. ")
+        + "The complete assembled Go source is reviewed in "
+        f"the full-source context at `{review_source_sha}` for application `{application_sha}`. "
+        f"Candidate identity: `{candidate_id}`.\n\n"
+        f"Last accepted configuration: `{baseline_config}`. Selected upstream: `{upstream}`.\n\n"
+        f"<!-- osconfig-delta:v2 {json.dumps({'candidateId': candidate_id, 'candidate': candidate_value,
+                                               'sourceConfig': config, 'baselineConfig': baseline_config},
+                                              sort_keys=True, separators=(',', ':'))} -->"
+    )
+    delta_pull = ensure_review_pull(
+        repo, title=f"Review OS Config downstream delta {candidate_id[:12]}",
+        body=delta_body, base_sha=delta_base, base_branch=delta_base_branch,
+        head_sha=delta_sha, head_branch=delta_branch, allow_closed=bundle_reuse)
+    full_state = {
+        "schema": 2, "sourceConfig": config, "upstream": upstream,
+        "tag": lock["tag"], "archiveSha256": lock["archiveSha256"],
+        "seed": review_source_sha, "candidate": candidate_value, "candidateId": candidate_id,
+        "applicationSha": application_sha, "reviewSourceSha": review_source_sha,
+        "baselineConfig": baseline_config, "deltaSha": delta_sha,
+        "deltaPr": delta_pull["number"],
+    }
+    full_body = (
+        f"Exact upstream release {lock['tag']} at {upstream}.\n\n"
+        f"Assembled patched Go source commit: `{application_sha}`. Full review context: `{review_source_sha}`. "
+        f"Downstream configuration snapshot: `{delta_sha}`.\n"
+        f"Source archive SHA-256: {lock['archiveSha256']}. Trusted workflow configuration: `{config}`.\n"
+        f"Paired delta review: #{delta_pull['number']} against last signed configuration `{baseline_config}`.\n\n"
+        "The actual Go files changed by the inventory patch are included in this PR. The delta PR is "
+        "review-only evidence. The signer, verifier, and signing regression remain sourced from the "
+        "trusted default branch. Only the reviewed, tested and signed RPM-MD repository is published.\n\n"
+        f"<!-- osconfig-candidate:v2 {json.dumps(full_state, sort_keys=True, separators=(',', ':'))} -->"
+    )
+    pull = ensure_review_pull(
+        repo, title=f"Review assembled Google OS Config candidate {lock['tag']}",
+        body=full_body, base_sha=upstream, base_branch=base,
+        head_sha=review_source_sha, head_branch=branch, allow_closed=bundle_reuse)
+    _, finding_history, finding_sources, prior_dispositions = load_review_finding_history(
+        repo, pull["number"], published_at=baseline["published_at"])
+    create_review_finding_dispositions(
+        repo, pull["number"], candidate_value, finding_history,
+        finding_sources, prior_dispositions, codex_token)
+    _, finding_history, _, all_dispositions = load_review_finding_history(
+        repo, pull["number"], published_at=baseline["published_at"])
+    candidate_dispositions = [item for item in all_dispositions.values()
+                              if item.get("candidate_id") == candidate_id]
     artifact = candidate / "inputs"
     artifact.mkdir(exist_ok=True)
     shutil.copy2(source_dir / "source.tar.gz", artifact / "source.tar.gz")
     shutil.copy2(source_dir / "source.lock", artifact / "source.lock")
+    run("git", "checkout", "-B", "candidate", review_source_sha, cwd=repo_work)
     for relative in PACKAGE_FILES:
-        shutil.copy2(repo_work / PREFIX / relative, artifact / Path(relative).name)
+        source = (repo_work / PREFIX / relative if relative in PRODUCT_BUILD_INPUTS or relative == "source.lock"
+                  else PATCH_DIR / relative)
+        if source.is_symlink() or not source.is_file():
+            raise ValueError(f"Candidate package input is missing or unsafe: {relative}")
+        shutil.copy2(source, artifact / Path(relative).name)
     manifest = {
         "upstreamTag": lock["tag"], "upstreamCommit": upstream,
         "upstreamArchiveSha256": lock["archiveSha256"],
         "patchSha256": digest(artifact / "osconfig-inventory.patch"),
         "specSha256": digest(artifact / "google-osconfig-agent.spec"),
-        "candidateSha": head, "candidatePr": pull["number"],
+        "candidateSha": review_source_sha, "candidatePr": pull["number"],
+        "candidateApplicationSha": application_sha,
         "candidateBranch": branch, "baseBranch": base, "configSha": config,
+        "candidate": candidate_value, "candidateIdentity": candidate_id,
+        "acceptedBaselineProof": accepted_proof,
+        "findingHistory": finding_history,
+        "findingDispositions": candidate_dispositions,
+        "baselineConfigSha": baseline_config,
+        "deltaPr": delta_pull["number"], "deltaBranch": delta_branch,
+        "deltaBaseBranch": delta_base,
+        "reviewContexts": {
+            "full": {"pr": pull["number"], "review_sha": review_source_sha, "base_sha": upstream,
+                     "head_branch": branch, "base_branch": base},
+            "delta": {"pr": delta_pull["number"], "review_sha": delta_sha,
+                      "base_sha": delta_base, "head_branch": delta_branch,
+                      "base_branch": delta_base_branch},
+        },
     }
     (artifact / "candidate-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    request_review(repo, pull, head, upstream, manifest["patchSha256"], config, codex_token)
-    ready, reason = review_status(repo, pull["number"], head, upstream, branch)
-    if not ready and reason == WAITING:
-        request_review_followup(repo, pull, head, upstream, manifest["patchSha256"],
-                                config, codex_token)
-    output(candidate_exists=True, candidate_sha=head, candidate_pr=pull["number"],
+    (artifact / "final-history.json").write_text(
+        json.dumps({"baseline": baseline, "acceptedBaselineProof": accepted_proof},
+                   sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    request_lifecycle_review(repo, pull, candidate_value, candidate_id, "full",
+                             review_source_sha, upstream, codex_token)
+    request_lifecycle_review(repo, delta_pull, candidate_value, candidate_id, "delta",
+                             delta_sha, baseline_config, codex_token)
+    full, delta, pair = review_pair_status(repo, manifest)
+    record_review_finding_batch(repo, pull["number"], candidate_value,
+                                manifest["reviewContexts"], pair, codex_token)
+    ready = pair.get("state") == "ready" and pair.get("complete") is True
+    reason = pair.get("reason", "Invalid paired review result")
+    output(candidate_exists=True, candidate_sha=review_source_sha, candidate_pr=pull["number"],
            candidate_branch=branch, upstream_commit=upstream, upstream_tag=lock["tag"],
-           patch_sha=manifest["patchSha256"], review_ready=ready, review_reason=reason)
-    print(f"Candidate PR #{pull['number']} at {head}: {reason}")
+           patch_sha=manifest["patchSha256"], review_ready=ready, review_reason=reason,
+           candidate_id=candidate_id, delta_pr=delta_pull["number"],
+           delta_branch=delta_branch, configuration_sha=delta_sha,
+           full_state=full.get("state"), delta_state=delta.get("state"))
+    print(f"Candidate full PR #{pull['number']} / delta PR #{delta_pull['number']} "
+          f"for identity {candidate_id}: {reason}")
+
+
+def prepare_policy_candidate(candidate_dir):
+    """Prepare full-app and downstream-delta review contexts for a policy proposal."""
+    repo = os.environ["GITHUB_REPOSITORY"]
+    number = int(os.environ["POLICY_PR_NUMBER"])
+    expected_head = os.environ["POLICY_HEAD_SHA"]
+    pull = api(f"repos/{repo}/pulls/{number}")
+    proposal_config = (pull.get("base") or {}).get("sha", "")
+    state = policy_identity(repo, pull, proposal_config)
+    if not state or state["head"] != expected_head:
+        raise ValueError("Publisher policy proposal changed before paired-source preparation")
+    changed = policy_changes(candidate_dir, proposal_config, expected_head, allow_empty=True)
+    if not changed:
+        output(policy_candidate_changed=False, policy_pr=number, policy_head=expected_head,
+               policy_config=proposal_config)
+        print("Publisher repair PR has no proposed changes yet")
+        return
+
+    settings = repository_settings()
+    owner, repository = repo.split("/", 1)
+    if (settings["github_owner"] != owner.lower() or settings["github_repo"] != repository.lower()
+            or os.environ.get("OSCONFIG_RPM_SIGNING_FINGERPRINT", "").upper()
+            != settings["signing_fingerprint"]):
+        raise ValueError("repository.conf and the Actions signing fingerprint must match this GitHub Pages repository")
+    published = published_manifest(owner, repository, settings["signing_fingerprint"])
+    if not published:
+        raise ValueError("Policy proposal has no currently verified signed RPM baseline")
+    token = owner_token(repo)
+    core = lifecycle_module()
+    baseline = verified_pages_baseline(repo, published)
+    candidate_dir = Path(candidate_dir).resolve()
+    repo_work_root = Path(tempfile.mkdtemp(prefix="osconfig-policy-source-"))
+    candidate_value = published_candidate_identity(repo, published, repo_work_root)
+    baseline["candidate"] = dict(candidate_value)
+    baseline["candidate_id"] = core.candidate_identity(baseline["candidate"])
+    variable = api(f"repos/{repo}/actions/variables/FORK_ACCEPTED_BASELINE", token=token)
+    accepted_proof = accepted_baseline_proof(repo, variable, baseline)
+    baseline_config = candidate_value["configuration_sha"]
+    upstream = candidate_value["upstream_sha"]
+    repo_work = repo_work_root / "published-baseline-source"
+    run("gh", "auth", "setup-git")
+    run("git", "update-ref", "refs/heads/application", candidate_value["application_sha"], cwd=repo_work)
+    run("git", "checkout", "-B", "application", candidate_value["application_sha"], cwd=repo_work)
+    base_branch = f"review-base/{upstream}"
+    ensure_review_base(repo_work, repo, base_branch, upstream)
+    delta_sha, delta_base = create_delta_snapshot(
+        repo_work, baseline_config=baseline_config,
+        application_sha=candidate_value["application_sha"], source_root=candidate_dir,
+        source_config_sha=expected_head, repo=repo)
+    candidate_value["configuration_sha"] = delta_sha
+    candidate_id = core.candidate_identity(candidate_value)
+    full_context_sha = create_application_review_context(
+        repo_work, candidate_value["application_sha"], candidate_id)
+    full_branch = f"review/{upstream}-{candidate_id}"
+    delta_branch = f"review/changes-{delta_sha}"
+    ensure_review_branch(repo_work, full_branch, full_context_sha)
+    ensure_review_branch(repo_work, delta_branch, delta_sha)
+
+    delta_body = (
+        "Review-only snapshot of the proposed downstream policy, workflow, patch and regression "
+        "files relative to the protected accepted baseline. It is not a product integration branch "
+        "or installation source. The complete assembled Go application is in the paired full-review "
+        f"context `{full_context_sha}`. Proposal PR: #{number} at `{expected_head}`. "
+        f"Candidate identity: `{candidate_id}`.\n\n"
+        f"Accepted signed configuration: `{baseline_config}`. Selected upstream: `{upstream}`.\n\n"
+        f"<!-- osconfig-delta:v2 {json.dumps({'candidateId': candidate_id, 'candidate': candidate_value,
+                                               'sourceConfig': expected_head, 'baselineConfig': baseline_config},
+                                              sort_keys=True, separators=(',', ':'))} -->"
+    )
+    delta_pull = ensure_review_pull(
+        repo, title=f"Review OS Config policy delta {candidate_id[:12]}",
+        body=delta_body, base_sha=baseline_config, base_branch=delta_base,
+        head_sha=delta_sha, head_branch=delta_branch)
+    full_body = (
+        f"Exact assembled application from signed upstream `{upstream}`. Product source SHA: "
+        f"`{candidate_value['application_sha']}`. Full review context: `{full_context_sha}`.\n"
+        f"Proposed policy source: PR #{number} at `{expected_head}`; exact review snapshot: `{delta_sha}`.\n"
+        f"Paired downstream-delta review: #{delta_pull['number']} against accepted config `{baseline_config}`.\n\n"
+        "Read the actual assembled patched Go source in this PR and the separately bound policy "
+        "snapshot in the paired delta PR. This review context changes no product blobs or provenance.\n\n"
+        f"<!-- osconfig-policy-candidate:v1 {json.dumps({'schema': 1, 'proposalPr': number,
+            'proposalHead': expected_head, 'candidate': candidate_value, 'candidateId': candidate_id,
+            'applicationSha': candidate_value['application_sha'], 'reviewSourceSha': full_context_sha,
+            'baselineConfig': baseline_config, 'deltaSha': delta_sha,
+            'deltaPr': delta_pull['number']}, sort_keys=True, separators=(',', ':'))} -->"
+    )
+    full_pull = ensure_review_pull(
+        repo, title=f"Review OS Config policy candidate {candidate_id[:12]}",
+        body=full_body, base_sha=upstream, base_branch=base_branch,
+        head_sha=full_context_sha, head_branch=full_branch)
+    full_context = {"pr": full_pull["number"], "review_sha": full_context_sha,
+                    "base_sha": upstream, "head_branch": full_branch,
+                    "base_branch": base_branch}
+    delta_context = {"pr": delta_pull["number"], "review_sha": delta_sha,
+                     "base_sha": baseline_config, "head_branch": delta_branch,
+                     "base_branch": delta_base}
+
+    _, finding_history, finding_sources, prior_dispositions = load_review_finding_history(
+        repo, number, published_at=baseline["published_at"])
+    create_review_finding_dispositions(
+        repo, number, candidate_value, finding_history, finding_sources,
+        prior_dispositions, token)
+    _, finding_history, _, all_dispositions = load_review_finding_history(
+        repo, number, published_at=baseline["published_at"])
+    candidate_dispositions = [item for item in all_dispositions.values()
+                              if item.get("candidate_id") == candidate_id]
+    inputs = candidate_dir / "inputs"
+    inputs.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "upstreamTag": published.get("upstreamTag"),
+        "upstreamCommit": upstream,
+        "upstreamArchiveSha256": published.get("upstreamArchiveSha256"),
+        "patchSha256": published.get("patchSha256"),
+        "specSha256": published.get("specSha256"),
+        "candidateSha": full_context_sha, "candidatePr": full_pull["number"],
+        "candidateApplicationSha": candidate_value["application_sha"],
+        "candidateBranch": full_branch, "baseBranch": base_branch,
+        "configSha": os.environ["GITHUB_SHA"],
+        "candidate": candidate_value, "candidateIdentity": candidate_id,
+        "acceptedBaselineProof": accepted_proof,
+        "findingHistory": finding_history, "findingDispositions": candidate_dispositions,
+        "baselineConfigSha": baseline_config, "proposalPr": number,
+        "proposalHeadSha": expected_head, "deltaPr": delta_pull["number"],
+        "deltaBranch": delta_branch, "deltaBaseBranch": delta_base,
+        "reviewContexts": {"full": full_context, "delta": delta_context},
+    }
+    (inputs / "candidate-manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    (inputs / "final-history.json").write_text(
+        json.dumps({"baseline": baseline, "acceptedBaselineProof": accepted_proof},
+                   ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    record_policy_pair_context(repo, number, manifest, token)
+    request_lifecycle_review(repo, full_pull, candidate_value, candidate_id, "full",
+                             full_context_sha, upstream, token)
+    request_lifecycle_review(repo, delta_pull, candidate_value, candidate_id, "delta",
+                             delta_sha, baseline_config, token)
+    full_review, delta_review, pair = review_pair_status(repo, manifest)
+    record_review_finding_batch(repo, full_pull["number"], candidate_value,
+                                manifest["reviewContexts"], pair, token)
+    record_review_finding_batch(repo, number, candidate_value,
+                                manifest["reviewContexts"], pair, token)
+    ready = pair.get("state") == "ready" and pair.get("complete") is True
+    reason = pair.get("reason", "Invalid paired review result")
+    output(policy_candidate_changed=True, policy_pr=number, policy_head=expected_head,
+           policy_config=proposal_config, candidate_id=candidate_id,
+           candidate_pr=full_pull["number"], delta_pr=delta_pull["number"],
+           review_ready=ready, review_reason=reason,
+           full_state=full_review.get("state"), delta_state=delta_review.get("state"))
+    print(f"Prepared exact paired policy/application review for candidate {candidate_id}: {reason}")
 
 
 def review(candidate_dir):
@@ -888,7 +3373,8 @@ def request_fix(candidate_dir, evidence):
         f"- Request for `{match.group(1)}` at {comment.get('created_at', 'unknown time')}: "
         f"{comment.get('html_url', 'recorded on this PR')}"
         for comment in owner_comments
-        for match in FIX_REQUEST.finditer(comment.get("body") or "")
+        for match in FIX_REQUEST.finditer(
+            _mask_native_finding_batch_envelopes(comment.get("body") or ""))
     ) or "- no prior machine task"
     instruction = (
         "This is a scheduled continuation after the previous bounded repair window. Use "
@@ -960,7 +3446,7 @@ def policy_identity(repo, pull, config):
 
 
 def open_policy_pull(repo, config):
-    for pull in pages(f"repos/{repo}/pulls?state=open&base={DEFAULT_BRANCH}"):
+    for pull in pages(f"repos/{repo}/pulls?state=open"):
         if not (pull.get("head", {}).get("ref") or "").startswith(POLICY_REPAIR_BRANCH):
             continue
         state = policy_identity(repo, pull, config)
@@ -970,6 +3456,24 @@ def open_policy_pull(repo, config):
                 and pull.get("user", {}).get("login") in {repo.split("/")[0], "github-actions[bot]"}):
             api(f"repos/{repo}/pulls/{pull['number']}", method="PATCH", data={"state": "closed"})
     return None
+
+
+def active_policy_candidate_exists(repo):
+    """Return whether any complete page contains an active publisher-policy PR."""
+    pulls = pages(f"repos/{repo}/pulls?state=open&base={DEFAULT_BRANCH}")
+    return any(
+        (pull.get("head", {}).get("ref") or "").startswith(POLICY_REPAIR_BRANCH)
+        and (pull.get("head", {}).get("repo") or {}).get("full_name") == repo
+        for pull in pulls
+    )
+
+
+def candidate_preflight():
+    repo = os.environ["GITHUB_REPOSITORY"]
+    blocked = active_policy_candidate_exists(repo)
+    output(blocked=blocked)
+    print("An active publisher-policy candidate is open" if blocked
+          else "No active publisher-policy candidate was found")
 
 
 def create_policy_pull(repo, config):
@@ -1024,10 +3528,12 @@ def request_policy_task(repo, state, evidence, token):
     now = datetime.now(timezone.utc)
     requests = [(match.group(1), int(match.group(2)), comment.get("created_at", ""), comment)
                 for comment in owner_comments
-                for match in POLICY_FIX_REQUEST.finditer(comment.get("body") or "")]
+                for match in POLICY_FIX_REQUEST.finditer(
+                    _mask_native_finding_batch_envelopes(comment.get("body") or ""))]
     cycle_starts = []
     for comment in owner_comments:
-        for raw in POLICY_CYCLE_STATE.findall(comment.get("body") or ""):
+        body = _mask_native_finding_batch_envelopes(comment.get("body") or "")
+        for raw in POLICY_CYCLE_STATE.findall(body):
             try:
                 cycle = json.loads(raw)
             except (ValueError, TypeError):
@@ -1058,7 +3564,8 @@ def request_policy_task(repo, state, evidence, token):
         "@codex fix this publisher failure on this PR branch.\n\n"
         + instruction
         + "This is a publisher-policy repair, separate from the application patch/RPM candidate. "
-        "Change only `.vps/google-osconfig-agent/patches/release.py`, "
+        "Change only `.vps/google-osconfig-agent/patches/README.md`, "
+        "`.vps/google-osconfig-agent/patches/release.py`, "
         "`.vps/google-osconfig-agent/patches/tests/test_release.py`, "
         "`.vps/google-osconfig-agent/patches/tests/test_policy_isolation.py`, "
         "`.vps/google-osconfig-agent/patches/requirements-policy.txt`, "
@@ -1162,9 +3669,10 @@ def report_permission_blocker(repo, config, evidence):
 def request_policy_review(repo, state, token):
     comments = pages(f"repos/{repo}/issues/{state['number']}/comments")
     marker = f"<!-- osconfig-policy-codex:{state['head']} -->"
-    if any(marker in (comment.get("body") or "")
-           and comment.get("user", {}).get("login") == repo.split("/")[0]
+    owner = repo.split("/", 1)[0]
+    if any(comment.get("user", {}).get("login") == owner
            and comment.get("user", {}).get("type") == "User"
+           and marker in _owner_protocol_comment_body(owner, comment)
            for comment in comments):
         return comments
     body = (
@@ -1198,10 +3706,11 @@ def policy_review_status(repo, state, comments=None):
         return False, "Publisher repair identity or exact SHA changed"
     comments = comments if comments is not None else pages(f"repos/{repo}/issues/{state['number']}/comments")
     marker = f"<!-- osconfig-policy-codex:{state['head']} -->"
+    owner = repo.split("/", 1)[0]
     requests = [comment for comment in comments
-                if marker in (comment.get("body") or "")
-                and comment.get("user", {}).get("login") == repo.split("/")[0]
-                and comment.get("user", {}).get("type") == "User"]
+                if comment.get("user", {}).get("login") == owner
+                and comment.get("user", {}).get("type") == "User"
+                and marker in _owner_protocol_comment_body(owner, comment)]
     if not requests:
         return False, "No owner-authenticated exact-SHA publisher review request"
     requested_at = min(comment["created_at"] for comment in requests)
@@ -1338,7 +3847,23 @@ def verify_workflow_action_pins(workflows):
     return references
 
 
-def validate_signing_workflow(workflow):
+def validate_signing_workflow(workflow, *, shared=False):
+    """Preserve the legacy API while requiring the shared signer in shared CI."""
+    path = Path(workflow)
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"Signing workflow is not a regular file: {path}")
+    yaml = yaml_module()
+    try:
+        document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (yaml.YAMLError, UnicodeError) as error:
+        raise ValueError(f"Signing workflow contains invalid or unsafe YAML: {path.name}") from error
+    jobs = document.get("jobs") if isinstance(document, dict) else None
+    if shared or isinstance(jobs, dict) and "final-guard" in jobs:
+        return _validate_shared_signing_workflow(path)
+    return _validate_legacy_signing_workflow(path)
+
+
+def _validate_legacy_signing_workflow(workflow):
     """Require the production-key job to use only trusted signer code and inputs."""
     workflow = Path(workflow)
     yaml = yaml_module()
@@ -1527,6 +4052,351 @@ def validate_signing_workflow(workflow):
         raise ValueError("Trusted signing regression must pass before the production key is exposed")
 
 
+def _validate_shared_signing_workflow(workflow):
+    """Require the production-key job to use only trusted signer code and inputs."""
+    workflow = Path(workflow)
+    yaml = yaml_module()
+    if not workflow.is_file() or workflow.is_symlink():
+        raise ValueError(f"Signing workflow is not a regular file: {workflow}")
+    try:
+        document = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+    except (yaml.YAMLError, UnicodeError) as error:
+        raise ValueError(f"Signing workflow contains invalid or unsafe YAML: {workflow.name}") from error
+    if isinstance(document, dict) and ("env" in document or "defaults" in document):
+        raise ValueError("Signing workflow cannot supply job-wide environment or shell defaults")
+    jobs = document.get("jobs") if isinstance(document, dict) else None
+    sign_job = jobs.get("sign") if isinstance(jobs, dict) else None
+    if not isinstance(sign_job, dict):
+        raise ValueError("Signing workflow has no signing job")
+    if any(key in sign_job for key in ("env", "defaults", "uses", "services")):
+        raise ValueError("Signing job cannot supply job-wide secrets, shell defaults, or candidate services")
+    needs = sign_job.get("needs", [])
+    needs = {needs} if isinstance(needs, str) else set(needs) if isinstance(needs, list) else set()
+    condition = " ".join(str(sign_job.get("if", "")).split())
+    required_conditions = (
+        ("needs.prepare.outputs.exists", "true"),
+        ("needs.build-rpm.result", "success"),
+        ("needs.review.result", "success"),
+        ("needs.review.outputs.ready", "true"),
+    )
+    if condition.startswith("${{") and condition.endswith("}}"):
+        condition = condition[3:-2].strip()
+    terms = [re.fullmatch(
+        r"\s*(needs\.[A-Za-z0-9_.-]+)\s*==\s*(?:(['\"])([A-Za-z]+)\2|"
+        r"(needs\.[A-Za-z0-9_.-]+|github\.run_id|github\.run_attempt|github\.sha))\s*",
+        term,
+    ) for term in condition.split("&&")]
+    parsed_terms = set()
+    if all(terms):
+        for term in terms:
+            parsed_terms.add((term[1], term[3] if term[3] is not None else term[4]))
+    condition_valid = set(required_conditions).issubset(parsed_terms)
+    final_guard_outputs = (jobs.get("final-guard", {}).get("outputs", {})
+                           if isinstance(jobs.get("final-guard"), dict) else {})
+    if {"run_id", "run_attempt", "workflow_sha", "candidate_id"} <= set(final_guard_outputs):
+        condition_valid = condition_valid and {
+            ("needs.final-guard.result", "success"),
+            ("needs.final-guard.outputs.decision", "allow"),
+            ("needs.final-guard.outputs.candidate_id", "needs.candidate-source.outputs.candidate_id"),
+            ("needs.final-guard.outputs.run_id", "github.run_id"),
+            ("needs.final-guard.outputs.run_attempt", "github.run_attempt"),
+            ("needs.final-guard.outputs.workflow_sha", "github.sha"),
+        } <= parsed_terms
+    runner = sign_job.get("runs-on")
+    runner_labels = ([runner] if isinstance(runner, str) else runner
+                     if isinstance(runner, list) and all(isinstance(label, str) for label in runner)
+                     else [])
+    if (not any(re.fullmatch(r"ubuntu-(?:[0-9]{2}\.[0-9]{2}|latest)", label, re.I)
+                for label in runner_labels)
+            or any("self-hosted" in label.lower() for label in runner_labels)):
+        raise ValueError("Signing job must use a GitHub-hosted Ubuntu runner")
+    container = sign_job.get("container")
+    if isinstance(container, dict):
+        if set(container) != {"image"}:
+            raise ValueError("Signing job container cannot supply environment or mount overrides")
+        container = container.get("image")
+    trusted_images = (
+        r"fedora",
+        r"docker\.io/library/fedora",
+        r"quay\.io/fedora/fedora",
+        r"registry\.fedoraproject\.org/fedora",
+    )
+    image_pattern = r"(?:" + "|".join(trusted_images) + r"):[A-Za-z0-9_.-]+(?:@sha256:[A-Fa-f0-9]{64})?"
+    if not isinstance(container, str) or not re.fullmatch(image_pattern, container):
+        raise ValueError("Signing job container must come from an official Fedora image repository")
+    if (not {"candidate-source", "final-guard", "prepare", "build-rpm", "review"}.issubset(needs)
+            or sign_job.get("permissions") != {
+                "contents": "read", "issues": "read", "pull-requests": "read",
+            }
+            or not condition_valid):
+        raise ValueError("Signing job must wait for the exact reviewed application candidate")
+    if "uses" in sign_job:
+        raise ValueError("Signing workflow cannot delegate the signing job to a candidate reusable workflow")
+    steps = sign_job.get("steps")
+    if not isinstance(steps, list) or not steps:
+        raise ValueError("Signing workflow has no trusted steps")
+
+    key = "OSCONFIG_RPM_SIGNING_PRIVATE_KEY"
+    key_occurrences = []
+
+    def find_key(node, path=()):
+        if isinstance(node, dict):
+            for name, value in node.items():
+                next_path = path + (name,)
+                if name == key:
+                    key_occurrences.append((next_path, value))
+                find_key(value, next_path)
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                find_key(value, path + (index,))
+
+    find_key(document)
+    keyed_steps = [index for index, step in enumerate(steps)
+                   if isinstance(step, dict) and key in (step.get("env") or {})]
+    if len(keyed_steps) != 1 or len(key_occurrences) != 1:
+        raise ValueError("Production signing key must be scoped to one trusted signer step")
+    signer_index = keyed_steps[0]
+    secret_path, secret_value = key_occurrences[0]
+    if (secret_path != ("jobs", "sign", "steps", signer_index, "env", key)
+            or secret_value != "${{ secrets.OSCONFIG_RPM_SIGNING_PRIVATE_KEY }}"):
+        raise ValueError("Production signing key must be available only to the trusted signer step")
+
+    checkout_steps = []
+    download_steps = []
+    upload_steps = []
+    run_steps = []
+    step_by_name = {}
+    allowed_step_keys = {"uses", "name", "run", "env", "with", "id", "timeout-minutes", "shell"}
+    for index, step in enumerate(steps):
+        if not isinstance(step, dict):
+            raise ValueError("Signing workflow contains a malformed step")
+        if set(step) - allowed_step_keys:
+            raise ValueError("Signing workflow step has unexpected execution settings")
+        if ("uses" in step) == ("run" in step):
+            raise ValueError("Signing workflow step must use exactly one trusted action or command")
+        name = step.get("name")
+        if not isinstance(name, str) or name in step_by_name:
+            raise ValueError("Signing workflow step names must be unique and explicit")
+        step_by_name[name] = (index, step)
+        uses = step.get("uses")
+        if uses is not None:
+            if not isinstance(uses, str) or "@" not in uses:
+                raise ValueError("Signing workflow action is not pinned")
+            repository = uses.split("@", 1)[0]
+            if repository == "actions/checkout":
+                checkout_steps.append((index, step))
+            elif repository == "actions/download-artifact":
+                download_steps.append((index, step))
+            elif repository == "actions/upload-artifact":
+                upload_steps.append((index, step))
+            else:
+                raise ValueError("Signing workflow may use only the trusted checkout and artifact actions")
+        if "run" in step:
+            if not isinstance(step["run"], str):
+                raise ValueError("Signing workflow command must be text")
+            run_steps.append((index, step))
+
+    expected_step_names = {
+        "Check the frozen native run attempt before checkout or signing tools",
+        "Check out the exact trusted workflow source",
+        "Read the exact private lifecycle revision",
+        "Check out the exact private lifecycle source",
+        "Verify and receipt the exact read-only lifecycle source",
+        "Install RPM signing tools",
+        "Download the exact built RPM",
+        "Download the exact candidate source artifact",
+        "Verify this exact native run and built RPM receipt",
+        "Check signing and verifier rejection with disposable keys",
+        "Sign and verify RPM and RPM-MD metadata",
+        "Upload the signed RPM repository",
+        "Record the exact native signature artifact identity",
+        "Upload exact native signature provenance",
+    }
+    if set(step_by_name) != expected_step_names:
+        raise ValueError("Signing job contains an unreviewed command or action step")
+    for index, step in enumerate(steps):
+        if step.get("shell") != ("bash" if step.get("name") ==
+                                 "Check the frozen native run attempt before checkout or signing tools"
+                                 else None):
+            raise ValueError("Signing workflow has an unexpected shell override")
+        if step.get("timeout-minutes") is not None:
+            raise ValueError("Signing workflow step cannot override its process timeout")
+    if len(checkout_steps) != 2:
+        raise ValueError("Signing job must check out only trusted sources")
+    checkout_index, checkout = checkout_steps[0]
+    checkout_inputs = checkout.get("with") or {}
+    if checkout_inputs != {"ref": "${{ github.sha }}", "persist-credentials": False}:
+        raise ValueError("Signing job must check out the exact trusted workflow commit into the workspace")
+    private_checkout_index, private_checkout = checkout_steps[1]
+    if (private_checkout.get("with") != {
+            "repository": "warelik/machine-maintenance",
+            "ref": "${{ steps.maintenance-pin.outputs.revision }}",
+            "path": "machine-maintenance",
+            "ssh-key": "${{ secrets.MAINTENANCE_READ_KEY }}",
+            "persist-credentials": False,
+            "fetch-depth": 1,
+    }):
+        raise ValueError("Signing job must read only the exact pinned private lifecycle source")
+    if len(download_steps) != 2:
+        raise ValueError("Signing job must download only the exact reviewed candidate and built RPM")
+    download_by_name = {step.get("with", {}).get("name"): (index, step.get("with", {}))
+                        for index, step in download_steps}
+    if (download_by_name.get("google-osconfig-agent-built-rpm", (None, None))[1]
+            != {"name": "google-osconfig-agent-built-rpm",
+                "path": "${{ runner.temp }}/osconfig-built"}
+            or download_by_name.get("google-osconfig-agent-candidate", (None, None))[1]
+            != {"name": "google-osconfig-agent-candidate",
+                "path": "${{ runner.temp }}/osconfig-candidate"}):
+        raise ValueError("Signing job cannot download an alternate or candidate signer artifact")
+    if len(upload_steps) != 2:
+        raise ValueError("Signing job must upload only the signed repository and its run-attempt proof")
+    upload_by_name = {step.get("with", {}).get("name"): (index, step.get("with", {}))
+                      for index, step in upload_steps}
+    if (upload_by_name.get("google-osconfig-agent-pages", (None, None))[1]
+            != {"name": "google-osconfig-agent-pages",
+                "path": "${{ runner.temp }}/osconfig-pages/rpm",
+                "if-no-files-found": "error", "retention-days": 3}
+            or upload_by_name.get("google-osconfig-agent-final-proof", (None, None))[1]
+            != {"name": "google-osconfig-agent-final-proof",
+                "path": "${{ runner.temp }}/osconfig-final-proof",
+                "if-no-files-found": "error", "retention-days": 3}):
+        raise ValueError("Signing job has an unexpected artifact output")
+
+    expected_envs = {
+        "Check the frozen native run attempt before checkout or signing tools": {
+            "EXPECTED_RUN_ID": "${{ needs.final-guard.outputs.run_id }}",
+            "EXPECTED_RUN_ATTEMPT": "${{ needs.final-guard.outputs.run_attempt }}",
+            "EXPECTED_WORKFLOW_SHA": "${{ needs.final-guard.outputs.workflow_sha }}",
+            "EXPECTED_CANDIDATE_ID": "${{ needs.final-guard.outputs.candidate_id }}",
+            "EXPECTED_DECISION": "${{ needs.final-guard.outputs.decision }}",
+            "SOURCE_CANDIDATE_ID": "${{ needs.candidate-source.outputs.candidate_id }}",
+        },
+        "Verify and receipt the exact read-only lifecycle source": {
+            "FORK_MAINTENANCE_ROOT": "${{ github.workspace }}/machine-maintenance",
+        },
+        "Verify this exact native run and built RPM receipt": {
+            "GH_TOKEN": "${{ github.token }}",
+            "CANDIDATE_PR": "${{ needs.candidate-source.outputs.pr }}",
+            "EXPECTED_CANDIDATE_ID": "${{ needs.final-guard.outputs.candidate_id }}",
+            "FORK_MAINTENANCE_ROOT": "${{ github.workspace }}/machine-maintenance",
+        },
+        "Sign and verify RPM and RPM-MD metadata": {
+            "OSCONFIG_RPM_SIGNING_PRIVATE_KEY": "${{ secrets.OSCONFIG_RPM_SIGNING_PRIVATE_KEY }}",
+            "OSCONFIG_RPM_SIGNING_FINGERPRINT": "${{ vars.OSCONFIG_RPM_SIGNING_FINGERPRINT }}",
+            "EXPECTED_CANDIDATE_SHA": "${{ needs.candidate-source.outputs.sha }}",
+            "EXPECTED_UPSTREAM_SHA": "${{ needs.candidate-source.outputs.upstream }}",
+            "EXPECTED_PATCH_SHA": "${{ needs.candidate-source.outputs.patch }}",
+        },
+        "Record the exact native signature artifact identity": {
+            "EXPECTED_CANDIDATE_ID": "${{ needs.final-guard.outputs.candidate_id }}",
+        },
+    }
+    signer_index = step_by_name["Sign and verify RPM and RPM-MD metadata"][0]
+    keyed_steps = [index for index, step in enumerate(steps)
+                   if "OSCONFIG_RPM_SIGNING_PRIVATE_KEY" in (step.get("env") or {})]
+    if keyed_steps != [signer_index]:
+        raise ValueError("Only the trusted signer step may receive environment values")
+    for name, (_, step) in step_by_name.items():
+        expected_env = expected_envs.get(name)
+        if step.get("env", {}) != (expected_env or {}):
+            raise ValueError("Signing job step has unexpected credential or environment values")
+
+    preflight = step_by_name["Check the frozen native run attempt before checkout or signing tools"][1]
+    expected_preflight = '''set -euo pipefail
+[[ "$EXPECTED_DECISION" == allow ]]
+[[ "$EXPECTED_RUN_ID" == "$GITHUB_RUN_ID" ]]
+[[ "$EXPECTED_RUN_ATTEMPT" == "$GITHUB_RUN_ATTEMPT" ]]
+[[ "$EXPECTED_WORKFLOW_SHA" == "$GITHUB_SHA" ]]
+[[ "$EXPECTED_CANDIDATE_ID" == "$SOURCE_CANDIDATE_ID" ]]'''
+    if preflight.get("run", "").strip() != expected_preflight:
+        raise ValueError("Signing job must verify the frozen native attempt before checkout")
+    if steps[0] is not preflight:
+        raise ValueError("Signing attempt guard must precede checkout and all signing tools")
+
+    pin = step_by_name["Read the exact private lifecycle revision"][1]
+    expected_pin = '''python3 -B - <<'PY' >> "$GITHUB_OUTPUT"
+import json, re
+lock = json.load(open(".vps/google-osconfig-agent/patches/maintenance.lock.json", encoding="utf-8"))
+revision = lock.get("revision", "")
+assert re.fullmatch(r"[0-9a-f]{40}", revision)
+print(f"revision={revision}")
+PY'''
+    if pin.get("id") != "maintenance-pin" or pin.get("run", "").strip() != expected_pin:
+        raise ValueError("Signing job must read its exact pinned private lifecycle revision")
+
+    receipt = step_by_name["Verify and receipt the exact read-only lifecycle source"][1]
+    receipt_command = receipt.get("run", "")
+    if any(fragment not in receipt_command for fragment in (
+            "git -C \"$FORK_MAINTENANCE_ROOT\" rev-parse HEAD",
+            "core.sshCommand",
+            ".maintenance-source.json",
+            "\"repository\": \"warelik/machine-maintenance\"")):
+        raise ValueError("Signing job must verify the private source checkout without credentials")
+
+    install = step_by_name["Install RPM signing tools"][1]
+    try:
+        install_tokens = shlex.split(install.get("run", ""))
+    except ValueError as error:
+        raise ValueError("Signing job tool install command is malformed") from error
+    if (len(install_tokens) <= 3
+            or install_tokens[:3] not in (["dnf", "-y", "install"], ["dnf", "install", "-y"])
+            or any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9+_.-]*", package)
+                   for package in install_tokens[3:])):
+        raise ValueError("Signing job may install only named Fedora signing tools")
+
+    verify = step_by_name["Verify this exact native run and built RPM receipt"][1]
+    verify_command = '''python3 -B .vps/google-osconfig-agent/patches/release.py verify-final-run \\
+  "$RUNNER_TEMP/osconfig-candidate" \\
+  "${{ needs.final-guard.outputs.run_id }}" \\
+  "${{ needs.final-guard.outputs.run_attempt }}" \\
+  "${{ needs.final-guard.outputs.workflow_sha }}" \\
+  "${{ needs.final-guard.outputs.candidate_id }}"
+python3 -B .vps/google-osconfig-agent/patches/release.py verify-build-provenance \\
+  "$RUNNER_TEMP/osconfig-candidate" "$RUNNER_TEMP/osconfig-built" \\
+  "${{ needs.final-guard.outputs.run_id }}" \\
+  "${{ needs.final-guard.outputs.run_attempt }}" \\
+  "${{ needs.final-guard.outputs.workflow_sha }}" \\
+  "${{ needs.final-guard.outputs.candidate_id }}"'''
+    if verify.get("run", "").strip() != verify_command:
+        raise ValueError("Signing job must verify its native reservation and built artifact before signing")
+
+    signing_test = step_by_name["Check signing and verifier rejection with disposable keys"][1]
+    signer = step_by_name["Sign and verify RPM and RPM-MD metadata"][1]
+    expected_test = f"bash {PREFIX}tests/signing.sh \"$RUNNER_TEMP/osconfig-built\""
+    expected_signer = (
+        f"bash {PREFIX}sign-repo.sh " + "\\\n"
+        + "  \"$RUNNER_TEMP/osconfig-built\" \"$RUNNER_TEMP/osconfig-pages\"\n"
+        + f"bash {PREFIX}verify-repo.sh " + "\\\n"
+        + "  \"$RUNNER_TEMP/osconfig-built\" \"$RUNNER_TEMP/osconfig-pages\""
+    )
+    if (signing_test.get("run", "").strip() != expected_test
+            or signer.get("run", "").strip() != expected_signer):
+        raise ValueError("Signing job must run only trusted tools and the trusted signing regression")
+    proof = step_by_name["Record the exact native signature artifact identity"][1]
+    expected_proof = (
+        "python3 -B .vps/google-osconfig-agent/patches/release.py " + "\\\n"
+        + "  write-signature-proof \"$RUNNER_TEMP/osconfig-candidate\" " + "\\\n"
+        + "  \"$RUNNER_TEMP/osconfig-built\" \"$RUNNER_TEMP/osconfig-pages/rpm\" " + "\\\n"
+        + "  \"$RUNNER_TEMP/osconfig-final-proof\"")
+    if proof.get("run", "").strip() != expected_proof:
+        raise ValueError("Signing job must record only exact trusted signature provenance")
+
+    preflight_index = step_by_name["Check the frozen native run attempt before checkout or signing tools"][0]
+    pin_index = step_by_name["Read the exact private lifecycle revision"][0]
+    receipt_index = step_by_name["Verify and receipt the exact read-only lifecycle source"][0]
+    install_index = step_by_name["Install RPM signing tools"][0]
+    verify_index = step_by_name["Verify this exact native run and built RPM receipt"][0]
+    test_index = step_by_name["Check signing and verifier rejection with disposable keys"][0]
+    pages_index, _ = upload_by_name["google-osconfig-agent-pages"]
+    proof_index = step_by_name["Record the exact native signature artifact identity"][0]
+    final_proof_index, _ = upload_by_name["google-osconfig-agent-final-proof"]
+    if not (preflight_index < checkout_index < pin_index < private_checkout_index < receipt_index
+            < install_index < download_by_name["google-osconfig-agent-built-rpm"][0]
+            < download_by_name["google-osconfig-agent-candidate"][0] < verify_index
+            < test_index < signer_index < pages_index < proof_index < final_proof_index):
+        raise ValueError("Trusted signing regression must pass before the production key is exposed")
+
+
 def collect_workflow_action_reference(value, workflow, location, references):
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"Workflow uses reference is not a string: {workflow.name}:{location}")
@@ -1542,8 +4412,120 @@ def collect_workflow_action_reference(value, workflow, location, references):
     references.add((match.group(1), match.group(2)))
 
 
-def check_policy(candidate):
-    """Check the trusted release baseline; parse proposed Python without executing it."""
+def candidate_policy_tests(candidate_tests, trusted_tests):
+    """Return only proposed policy tests whose exact bytes are new or changed."""
+    changed = []
+    for path in sorted(candidate_tests.glob("test_*.py")):
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"Publisher proposal is not a regular Python file: {path.name}")
+        trusted = trusted_tests / path.name
+        if (not trusted.is_file() or trusted.is_symlink()
+                or trusted.read_bytes() != path.read_bytes()):
+            changed.append(path)
+    return changed
+
+
+_POLICY_TEST_PREFIX = (
+    "import os,sys,unittest;report=sys.stdout;quiet=open(os.devnull,'w');"
+    "sys.stdout=quiet;sys.stderr=quiet;candidate_package,source_tests,parser_root=sys.argv[1:4];"
+    "sys.path[:0]=[path for path in parser_root.split(os.pathsep) if path];"
+    "sys.path.insert(0,source_tests);sys.path.insert(0,candidate_package);import release;"
+    "release.lifecycle_module();"
+)
+_POLICY_TEST_RESULT = (
+    "expected=suite.countTestCases();"
+    "result=unittest.TextTestRunner(stream=quiet,verbosity=0,failfast=False).run(suite);"
+    "valid=expected>0 and result.testsRun==expected and result.wasSuccessful();"
+    "report.write('OSCONFIG_POLICY_COMPLETE:'+str(result.testsRun)+':'+('pass' if valid else 'fail')+'\\n');"
+    "report.flush();sys.exit(0 if valid else 1)"
+)
+POLICY_TEST_LAUNCHER = (
+    _POLICY_TEST_PREFIX + "discover_tests=sys.argv[4];"
+    "suite=unittest.defaultTestLoader.discover(discover_tests,pattern='test_*.py');"
+    + _POLICY_TEST_RESULT
+)
+PROPOSED_POLICY_TEST_LAUNCHER = (
+    _POLICY_TEST_PREFIX + "loader=unittest.defaultTestLoader;suite=unittest.TestSuite();"
+    "suite.addTests(loader.loadTestsFromName(name) for name in sys.argv[4:]);"
+    + _POLICY_TEST_RESULT
+)
+
+
+def policy_completion_succeeded(returncode, protocol):
+    return returncode == 0 and re.fullmatch(
+        rb"OSCONFIG_POLICY_COMPLETE:[1-9][0-9]*:pass\n", protocol) is not None
+
+
+def shared_policy_test_targets(candidate_package, trusted_tests, candidate_tests,
+                               proposed_tests):
+    targets = [("Immutable trusted publisher oracle against proposed release policy",
+                POLICY_TEST_LAUNCHER, candidate_package, trusted_tests,
+                (str(trusted_tests),))]
+    if proposed_tests:
+        targets.append(("New or changed proposed publisher policy tests",
+                        PROPOSED_POLICY_TEST_LAUNCHER, candidate_package, candidate_tests,
+                        tuple(test.stem for test in proposed_tests)))
+    return targets
+
+
+def isolated_failure_message(context, returncode, stdout, stderr, *, shared):
+    if shared:
+        return f"{context} failed with status {returncode}"
+    detail = sanitize_job_log("\n".join((stdout or "", stderr or "")))
+    return f"{context} failed with status {returncode}: {detail[-2000:]}"
+
+
+def policy_test_summary(files, returncode=None, *, timeout_seconds=None):
+    names = sorted({Path(name).name for name in files})
+    if not names or any(not re.fullmatch(r"test_[A-Za-z0-9_.-]+\.py", name) for name in names):
+        raise ValueError("Policy test summary requires frozen public test filenames")
+    if timeout_seconds is not None:
+        outcome = f"FAIL timeout={timeout_seconds}s"
+    else:
+        outcome = f"{'PASS' if returncode == 0 else 'FAIL'} exit={returncode}"
+    return f"Policy tests [{', '.join(names)}]: {outcome}"
+
+
+def run_policy_tests(test_directory, *, timeout_seconds=600):
+    """Run the public policy suite without exposing its private-core tracebacks."""
+    directory = Path(test_directory).resolve()
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError("Policy test directory is missing or unsafe")
+    files = [path for path in sorted(directory.glob("test_*.py"))
+             if path.is_file() and not path.is_symlink()]
+    if not files:
+        raise ValueError("Policy test directory contains no regular test files")
+    env = {name: os.environ[name] for name in (
+        "PATH", "HOME", "TMPDIR", "TEMP", "LANG", "LC_ALL", "TZ", "PYTHONPATH",
+        "FORK_MAINTENANCE_ROOT", "CI") if name in os.environ}
+    env.update(PYTHONDONTWRITEBYTECODE="1", PYTHONNOUSERSITE="1")
+    command = [sys.executable, "-I", "-B", "-c", POLICY_TEST_LAUNCHER,
+               str(directory.parent), str(directory), env.get("PYTHONPATH", ""), str(directory)]
+    with tempfile.TemporaryFile() as protocol:
+        process = subprocess.Popen(
+            command, cwd=directory, env=env, stdout=protocol, stderr=subprocess.DEVNULL,
+            text=True, start_new_session=True,
+            preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_FSIZE, (65536, 65536)))
+        try:
+            process.communicate(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate()
+            print(policy_test_summary([path.name for path in files], timeout_seconds=timeout_seconds))
+            raise ValueError(f"Policy test suite timed out after {timeout_seconds} seconds")
+        protocol.seek(0)
+        complete = policy_completion_succeeded(process.returncode, protocol.read(129))
+    status = process.returncode if process.returncode else (0 if complete else 86)
+    print(policy_test_summary([path.name for path in files], returncode=status))
+    if not complete:
+        raise ValueError(f"Policy test suite failed or did not complete; status {status}")
+
+
+def check_policy(candidate, *, shared=False):
+    """Validate policy; shared final mode runs proposed code and tests in isolation."""
     candidate = Path(candidate).resolve()
     candidate_release = candidate / (PREFIX + "release.py")
     candidate_tests = candidate / (PREFIX + "tests")
@@ -1557,6 +4539,16 @@ def check_policy(candidate):
             or not candidate_bootstrap_requirements.is_file()
             or candidate_bootstrap_requirements.is_symlink()):
         raise ValueError("Publisher repair candidate is missing release policy, tests, or parser requirements")
+    candidate_package = candidate / PREFIX
+    if shared:
+        if candidate_package.is_symlink() or not candidate_package.is_dir():
+            raise ValueError("Shared publisher proposal has no regular package directory")
+        if any(path.is_symlink() for path in candidate_tests.rglob("*")):
+            raise ValueError("Shared publisher proposal test tree contains a symbolic link")
+        for name in ("release.py", "maintenance.py", "maintenance.lock.json"):
+            source = candidate_package / name
+            if source.is_symlink() or not source.is_file():
+                raise ValueError(f"Shared publisher proposal is missing a regular {name}")
     parser_requirement_version(candidate_requirements)
     parser_requirement_version(candidate_bootstrap_requirements)
     if candidate_requirements.read_bytes() != candidate_bootstrap_requirements.read_bytes():
@@ -1578,13 +4570,8 @@ def check_policy(candidate):
     if not workflows:
         raise ValueError("Publisher repair has no workflow to validate")
     for workflow in workflows:
-        validate_signing_workflow(workflow)
+        validate_signing_workflow(workflow, shared=shared)
     verify_workflow_action_pins(workflows)
-    unit_launcher = (
-        "import sys,unittest;sys.path.insert(0,sys.argv[1]);import release;"
-        "suite=unittest.defaultTestLoader.discover(sys.argv[2],pattern='test_*.py');"
-        "sys.exit(not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful())"
-    )
     proposed_python = [candidate_release, *sorted(candidate_tests.glob("test_*.py"))]
     for path in proposed_python:
         if not path.is_file() or path.is_symlink():
@@ -1593,6 +4580,9 @@ def check_policy(candidate):
             ast.parse(path.read_text(encoding="utf-8"), filename=path.name)
         except (SyntaxError, UnicodeError) as error:
             raise ValueError(f"Publisher proposal has invalid Python syntax in {path.name}: {error}") from error
+    changed_proposed_tests = (candidate_policy_tests(candidate_tests, trusted_tests)
+                              if shared else [])
+    shared_failures = []
     container_engine, engine_kind = policy_container_engine()
     with tempfile.TemporaryDirectory(prefix="osconfig-policy-tests-") as temporary:
         root = Path(temporary).resolve()
@@ -1619,11 +4609,9 @@ def check_policy(candidate):
         shutil.copy2(ROOT / REPOSITORY_CONF, trusted_root / REPOSITORY_CONF)
         candidate_root = root / "candidate"
         candidate_root.mkdir()
-        candidate_module = candidate_root / "release.py"
-        shutil.copy2(candidate_release, candidate_module)
-        candidate_workflow = candidate_root / "google-osconfig-agent-inventory.yml"
         workflow_source = workflow_installed if workflow_installed.is_file() else workflow_template
-        shutil.copy2(workflow_source, candidate_workflow)
+        candidate_module = candidate_release
+        candidate_workflow = workflow_source
         shutil.copy2(candidate_requirements, candidate_root / "requirements-policy.txt")
 
         writable = root / "writable"
@@ -1641,18 +4629,40 @@ def check_policy(candidate):
         env.update(PYTHONDONTWRITEBYTECODE="1", CI="true",
                    OSCONFIG_POLICY_CANDIDATE_RELEASE=str(candidate_module),
                    OSCONFIG_POLICY_CANDIDATE_WORKFLOW=str(candidate_workflow))
+        maintenance_root = os.environ.get("FORK_MAINTENANCE_ROOT")
+        if maintenance_root:
+            maintenance_root = Path(maintenance_root).resolve()
+            receipt_path = maintenance_root / ".maintenance-source.json"
+            if not receipt_path.is_file() or receipt_path.is_symlink():
+                raise ValueError("Private lifecycle checkout has no native exact-source receipt")
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            if receipt.get("repository") != "warelik/machine-maintenance":
+                raise ValueError("Private lifecycle receipt names a different repository")
+            revision = receipt.get("revision")
+            if not isinstance(revision, str) or not SHA.fullmatch(revision):
+                raise ValueError("Private lifecycle receipt has no exact source revision")
+            env["FORK_MAINTENANCE_ROOT"] = str(maintenance_root)
+        elif shared:
+            raise ValueError("Shared final policy validation requires the exact private lifecycle checkout")
 
         def isolated_run(extra_env, arguments, *, workdir=writable, network=False,
-                         context="Isolated publisher command", parser_readonly=False):
+                         context="Isolated publisher command", parser_readonly=False,
+                         completion=False):
             command = [*container_engine, "run", "--rm", "--read-only",
                        "--cap-drop=ALL", "--security-opt=no-new-privileges",
                        *( ["--userns=keep-id"] if engine_kind == "podman" else [] ),
                        "--user", f"{os.getuid()}:{os.getgid()}", "--workdir", str(workdir)]
+            if shared:
+                command += ["--log-driver=none", "--memory=2g", "--cpus=2", "--pids-limit=256"]
             if not network:
                 command.append("--network=none")
             relabel = ",relabel=shared" if engine_kind == "podman" else ""
             command += ["--mount", f"type=bind,source={root},target={root},readonly{relabel}"]
             command += ["--mount", f"type=bind,source={writable},target={writable}{relabel}"]
+            if shared:
+                command += ["--mount", f"type=bind,source={candidate},target={candidate},readonly{relabel}"]
+            if maintenance_root:
+                command += ["--mount", f"type=bind,source={maintenance_root},target={maintenance_root},readonly{relabel}"]
             if parser_readonly:
                 command += ["--mount", f"type=bind,source={parser_install},target={parser_install},readonly{relabel}"]
             for name, value in (env | extra_env).items():
@@ -1664,14 +4674,29 @@ def check_policy(candidate):
             # overlay storage part of the policy fixture and can leave root-owned
             # files that TemporaryDirectory cannot remove.  Only the explicit
             # --env arguments above enter the isolated container.
-            result = subprocess.run(command, cwd=writable, env=os.environ.copy(), check=False,
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                    timeout=300)
+            if completion:
+                with tempfile.TemporaryFile() as protocol:
+                    result = subprocess.run(
+                        command, cwd=writable, env=os.environ.copy(), check=False,
+                        stdout=protocol, stderr=subprocess.DEVNULL, text=True, timeout=300,
+                        preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_FSIZE, (65536, 65536)))
+                    protocol.seek(0)
+                    if not policy_completion_succeeded(result.returncode, protocol.read(129)):
+                        return result.returncode or 86
+            else:
+                result = subprocess.run(command, cwd=writable, env=os.environ.copy(), check=False,
+                                        stdout=(subprocess.DEVNULL if shared else subprocess.PIPE),
+                                        stderr=(subprocess.DEVNULL if shared else subprocess.PIPE), text=True,
+                                        timeout=300)
             if result.returncode != 0:
-                detail = sanitize_job_log("\n".join((result.stdout, result.stderr)))
-                raise ValueError(f"{context} failed with status {result.returncode}: {detail[-2000:]}")
+                message = isolated_failure_message(
+                    context, result.returncode, result.stdout, result.stderr, shared=shared)
+                if shared:
+                    return result.returncode
+                raise ValueError(message)
+            return 0
 
-        isolated_run(
+        status = isolated_run(
             {}, ["python3", "-B", "-m", "pip", "download", "--isolated",
                  "--disable-pip-version-check", "--no-input", "--no-cache-dir",
                  "--only-binary=:all:", "--no-deps", "--require-hashes",
@@ -1679,24 +4704,57 @@ def check_policy(candidate):
                  "-r", str(candidate_root / "requirements-policy.txt")],
             network=True, context="Official PyYAML wheel resolution",
         )
+        if status:
+            raise ValueError(f"Official PyYAML wheel resolution failed with status {status}")
         wheels = [path for path in parser_wheels.iterdir()
                   if path.is_file() and not path.is_symlink() and path.suffix == ".whl"]
         if len(wheels) != 1 or not wheels[0].name.lower().startswith("pyyaml-"):
             raise ValueError("Official PyYAML resolution did not produce exactly one wheel")
-        isolated_run(
+        status = isolated_run(
             {}, ["python3", "-B", "-m", "pip", "install", "--isolated",
                  "--disable-pip-version-check", "--no-input", "--no-cache-dir",
                  "--no-index", "--only-binary=:all:", "--no-deps", "--target",
                  str(parser_install), str(wheels[0])],
             context="Offline PyYAML wheel installation",
         )
-        isolated_run(
-            {"PYTHONPATH": str(parser_install)},
-            ["python3", "-B", "-c", unit_launcher,
-             str(trusted_root / PREFIX), str(trusted_patch / "tests")],
-            context="Isolated trusted publisher tests",
-            parser_readonly=True,
-        )
+        if status:
+            raise ValueError(f"Offline PyYAML wheel installation failed with status {status}")
+        if shared:
+            # Import candidate B before unittest adds immutable test source A to
+            # sys.path, so the trusted oracle exercises B without test shadowing.
+            for context, launcher, module_root, source_tests, test_args in shared_policy_test_targets(
+                    candidate_package, trusted_patch / "tests", candidate_tests,
+                    changed_proposed_tests):
+                if Path(source_tests) == trusted_patch / "tests":
+                    test_files = [path.name for path in sorted(Path(source_tests).glob("test_*.py"))
+                                  if path.is_file() and not path.is_symlink()]
+                else:
+                    test_files = [f"{name}.py" for name in test_args]
+                print(policy_test_summary(test_files, returncode=0).replace("PASS exit=0", "RUNNING"))
+                try:
+                    status = isolated_run(
+                        {"PYTHONPATH": str(parser_install)},
+                        ["python3", "-I", "-B", "-c", launcher,
+                         str(module_root), str(source_tests), str(parser_install), *test_args],
+                        context=context, parser_readonly=True, completion=True)
+                except subprocess.TimeoutExpired:
+                    status = 124
+                print(policy_test_summary(test_files, returncode=status))
+                if status:
+                    shared_failures.append(f"{context}: status {status}")
+        else:
+            legacy_unit_launcher = (
+                "import sys,unittest;sys.path.insert(0,sys.argv[1]);import release;"
+                "suite=unittest.defaultTestLoader.discover(sys.argv[2],pattern='test_*.py');"
+                "sys.exit(not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful())"
+            )
+            isolated_run(
+                {"PYTHONPATH": str(parser_install)},
+                ["python3", "-B", "-c", legacy_unit_launcher,
+                 str(trusted_root / PREFIX), str(trusted_patch / "tests")],
+                context="Isolated trusted publisher tests",
+                parser_readonly=True,
+            )
 
     with tempfile.TemporaryDirectory(prefix="osconfig-policy-lint-") as temporary:
         root = Path(temporary)
@@ -1711,7 +4769,26 @@ def check_policy(candidate):
             binary.write_bytes(member.read())
             binary.chmod(0o700)
         for workflow in workflows:
-            run(str(binary), "-shellcheck=", "-pyflakes=", str(workflow))
+            if shared:
+                relabel = ",relabel=shared" if engine_kind == "podman" else ""
+                command = [*container_engine, "run", "--rm", "--read-only", "--network=none",
+                    "--log-driver=none", "--cap-drop=ALL", "--security-opt=no-new-privileges",
+                    "--memory=1g", "--cpus=2", "--pids-limit=128",
+                    "--user", f"{os.getuid()}:{os.getgid()}",
+                    "--mount", f"type=bind,source={binary},target=/tools/actionlint,readonly{relabel}",
+                    "--mount", f"type=bind,source={workflow},target=/workflow.yml,readonly{relabel}",
+                    "--tmpfs", "/tmp:rw,nosuid,nodev,size=64m", "--env", "HOME=/tmp",
+                    POLICY_IMAGE, "/tools/actionlint", "-shellcheck=", "-pyflakes=", "/workflow.yml"]
+                result = subprocess.run(command,
+                    cwd=root, env=os.environ.copy(), check=False,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    text=True, timeout=300)
+                if result.returncode:
+                    shared_failures.append(f"Workflow lint {workflow.name}: status {result.returncode}")
+            else:
+                run(str(binary), "-shellcheck=", "-pyflakes=", str(workflow))
+    if shared_failures:
+        raise ValueError("Shared policy validation failed: " + "; ".join(shared_failures))
 
 
 def policy_check(candidate):
@@ -1806,6 +4883,93 @@ def adopt_policy(candidate):
     print(f"Selectively adopted reviewed publisher policy as {commit}; dispatched a fresh trusted cycle")
 
 
+def adopt_policy_pair(reviewed_dir, proposal_dir):
+    """Adopt a clean paired policy review into the same policy-only final run."""
+    repo = os.environ["GITHUB_REPOSITORY"]
+    proposal_number = int(os.environ["POLICY_PR_NUMBER"])
+    expected_head = os.environ["POLICY_HEAD_SHA"]
+    reviewed_dir, proposal_dir = Path(reviewed_dir).resolve(), Path(proposal_dir).resolve()
+    manifest = json.loads((reviewed_dir / "candidate-manifest.json").read_text(encoding="utf-8"))
+    candidate = manifest.get("candidate")
+    if not isinstance(candidate, dict):
+        raise ValueError("Paired policy adoption has no exact candidate identity")
+    full, delta, pair = review_pair_status(repo, manifest)
+    if pair.get("state") != "ready" or pair.get("complete") is not True:
+        raise ValueError(pair.get("reason", "Both exact native policy review scopes are required"))
+    run_id = int(os.environ["GITHUB_RUN_ID"])
+    run_attempt = int(os.environ.get("GITHUB_RUN_ATTEMPT", "1"))
+    reservation = current_final_reservation(
+        repo, int(manifest["candidatePr"]), candidate, run_id, run_attempt,
+        os.environ["GITHUB_SHA"])
+    if not reservation:
+        raise ValueError("Paired policy adoption lacks this run's exact native final reservation")
+    current = api(f"repos/{repo}/pulls/{proposal_number}")
+    proposal_config = (current.get("base") or {}).get("sha", "")
+    state = policy_identity(repo, current, proposal_config)
+    if (not state or state["head"] != expected_head
+            or proposal_config != manifest.get("configSha")
+            or manifest.get("proposalHeadSha") != expected_head
+            or manifest.get("proposalPr") != proposal_number):
+        raise ValueError("Publisher proposal identity changed after paired review")
+    if api(f"repos/{repo}/commits/{DEFAULT_BRANCH}").get("sha") != manifest.get("configSha"):
+        raise ValueError("Trusted default branch advanced after paired policy review")
+    changed = policy_changes(proposal_dir, proposal_config, expected_head)
+    delta_context = (manifest.get("reviewContexts") or {}).get("delta") or {}
+    reviewed_sha = candidate.get("configuration_sha")
+    delta_branch = delta_context.get("head_branch")
+    if (not SHA.fullmatch(reviewed_sha or "") or not isinstance(delta_branch, str)
+            or delta_context.get("review_sha") != reviewed_sha):
+        raise ValueError("Policy adoption lacks the exact reviewed configuration snapshot")
+    run("git", "fetch", "--no-tags", "origin", f"refs/heads/{delta_branch}", cwd=proposal_dir)
+    if run("git", "rev-parse", "FETCH_HEAD", cwd=proposal_dir) != reviewed_sha:
+        raise ValueError("Fetched policy review snapshot differs from its exact candidate SHA")
+    proposed_blobs = git_tree_map(proposal_dir, expected_head, changed)
+    reviewed_blobs = git_tree_map(proposal_dir, reviewed_sha, changed)
+    if proposed_blobs != reviewed_blobs:
+        raise ValueError("Proposed policy file blobs differ from the exact paired review snapshot")
+    run("gh", "auth", "setup-git")
+    with tempfile.TemporaryDirectory(prefix="osconfig-policy-pair-adopt-") as temporary:
+        work = Path(temporary) / "repo"
+        run("git", "clone", "--no-checkout", f"https://github.com/{repo}.git", str(work))
+        run("git", "checkout", "--detach", manifest["configSha"], cwd=work)
+        run("git", "fetch", "--no-tags", "origin", f"refs/heads/{delta_branch}", cwd=work)
+        if run("git", "rev-parse", "FETCH_HEAD", cwd=work) != reviewed_sha:
+            raise ValueError("Adoption workspace fetched a different reviewed policy snapshot")
+        delta = subprocess.run(["git", "diff", "--binary", proposal_config, expected_head,
+                                "--", *changed], cwd=proposal_dir,
+                               stdout=subprocess.PIPE, check=True).stdout
+        subprocess.run(["git", "apply", "--index", "-"], cwd=work, input=delta,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        run("git", "diff", "--cached", "--check", cwd=work)
+        run("git", "-c", "user.name=github-actions[bot]",
+            "-c", "user.email=41898282+github-actions[bot]@users.noreply.github.com",
+            "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false",
+            "commit", "-m", f"Adopt paired-reviewed OS Config policy from #{proposal_number}",
+            cwd=work)
+        adopted_sha = run("git", "rev-parse", "HEAD", cwd=work)
+        adopted_paths = set(run("git", "diff", "--name-only", manifest["configSha"],
+                                 adopted_sha, cwd=work).splitlines())
+        if adopted_paths != set(changed):
+            raise ValueError("Adoption commit contains paths outside the exact reviewed policy change set")
+        adopted_blobs = git_tree_map(work, adopted_sha, changed)
+        if adopted_blobs != proposed_blobs:
+            raise ValueError("Adopted policy blobs differ from the paired-reviewed proposal")
+        validate_reviewed_adoption(work, reviewed_sha, adopted_sha)
+        run("git", "push", "origin", f"{adopted_sha}:refs/heads/{DEFAULT_BRANCH}", cwd=work)
+
+    api(f"repos/{repo}/issues/{proposal_number}/comments", method="POST",
+        data={"body": (f"Paired exact-source review and final policy validation passed; "
+                        f"selectively adopted `{adopted_sha}` in this same final run. "
+                        "No RPM was rebuilt or provenance rewritten.")})
+    for number in (proposal_number, manifest.get("candidatePr"), manifest.get("deltaPr")):
+        if type(number) is int and number > 0:
+            pull = api(f"repos/{repo}/pulls/{number}")
+            if pull.get("state") == "open":
+                api(f"repos/{repo}/pulls/{number}", method="PATCH", data={"state": "closed"})
+    close_candidate()
+    print(f"Paired-reviewed policy blobs adopted as {adopted_sha}; signed RPM provenance remains unchanged")
+
+
 def policy_resume():
     repo = os.environ["GITHUB_REPOSITORY"]
     config = os.environ.get("GITHUB_SHA", "")
@@ -1824,44 +4988,86 @@ def policy_resume():
         print("No open publisher-policy repair for the current trusted configuration")
         return
     comments = pages(f"repos/{repo}/issues/{state['number']}/comments")
-    review_marker = f"<!-- osconfig-policy-codex:{state['head']} -->"
+    owner = repo.split("/", 1)[0]
     owner_comments = [comment for comment in comments
-                      if comment.get("user", {}).get("login") == repo.split("/")[0]
+                      if comment.get("user", {}).get("login") == owner
                       and comment.get("user", {}).get("type") == "User"]
-    review_requests = [comment for comment in owner_comments
-                       if review_marker in (comment.get("body") or "")]
-    if review_requests:
-        ready, reason = policy_review_status(repo, state, comments)
-        if ready:
-            api(f"repos/{repo}/actions/workflows/google-osconfig-agent-inventory.yml/dispatches",
-                method="POST", data={"ref": DEFAULT_BRANCH,
-                                      "inputs": {"policy_pr": str(state["number"])}})
-            print("Dispatched a fresh isolated check and adoption attempt for the exact reviewed policy SHA")
+    pair_records = []
+    for comment in owner_comments:
+        body = _owner_protocol_comment_body(owner, comment)
+        if not POLICY_PAIR_MARKER.search(body):
+            continue
+        record = _marker_value(POLICY_PAIR_MARKER, body,
+                               "paired policy review context")
+        if (record.get("schema") == 1 and record.get("proposalPr") == state["number"]
+                and record.get("proposalHeadSha") == state["head"]):
+            pair_records.append((parse_utc(comment.get("created_at", "")), record))
+    if not pair_records:
+        active = [item for item in native_workflow_runs(repo)
+                  if item.get("id") != int(os.environ.get("GITHUB_RUN_ID", "0"))
+                  and item.get("status") in {"queued", "in_progress"}]
+        if active:
+            print("An exact policy workflow run is already active; no duplicate dispatch was created")
             return
-        if reason != WAITING:
-            request_policy_task(repo, state, reason, owner_token(repo))
-            return
-        if review_followup_due(owner_comments, sha=state["head"], now=datetime.now(timezone.utc)):
-            token = owner_token(repo)
-            timestamp = int(datetime.now(timezone.utc).timestamp())
-            api(f"repos/{repo}/issues/{state['number']}/comments", method="POST", token=token,
-                data={"body": ("@codex review\n\nContinue this exact-SHA publisher-policy review. "
-                               "The isolated trusted/proposed checks passed before the initial request; "
-                               "re-read the current diff and report all findings or a clean result. "
-                               "Elapsed time is only a bounded review window, not a reason to stop.\n\n"
-                               f"<!-- osconfig-review-window:v1 {state['head']} {timestamp} -->")})
-            print(f"Requested a scheduled exact-SHA review continuation on PR #{state['number']}")
-        else:
-            print("Exact-SHA review remains within its bounded window")
+        api(f"repos/{repo}/actions/workflows/google-osconfig-agent-inventory.yml/dispatches",
+            method="POST", data={"ref": DEFAULT_BRANCH,
+                                  "inputs": {"policy_pr": str(state["number"])}})
+        print(f"Dispatched exact paired policy review preparation for PR #{state['number']}")
         return
-    request_policy_task(
-        repo, state,
-        "The publisher proposal has no owner-authenticated exact-SHA review request. "
-        "Inspect recent workflow runs and repair any isolated test, workflow, or policy failure. "
-        "If the exact cause is missing authorization or a disabled GitHub permission, report that "
-        "specific blocker instead of changing code or weakening gates.",
-        owner_token(repo),
-    )
+
+    record = max(pair_records, key=lambda item: item[0])[1]
+    manifest = {key: record[key] for key in (
+        "candidate", "candidateIdentity", "acceptedBaselineProof", "findingHistory",
+        "findingDispositions", "reviewContexts", "configSha", "proposalPr",
+        "proposalHeadSha", "candidatePr", "deltaPr")}
+    if lifecycle_module().candidate_identity(manifest["candidate"]) != manifest["candidateIdentity"]:
+        raise ValueError("Saved paired policy context does not match its exact candidate identity")
+    full, delta, pair = review_pair_status(repo, manifest)
+    if pair.get("state") == "ready" and pair.get("complete") is True:
+        active = [item for item in native_workflow_runs(repo)
+                  if item.get("id") != int(os.environ.get("GITHUB_RUN_ID", "0"))
+                  and item.get("status") in {"queued", "in_progress"}]
+        if active:
+            print("An exact policy final run is already active; no duplicate dispatch was created")
+            return
+        api(f"repos/{repo}/actions/workflows/google-osconfig-agent-inventory.yml/dispatches",
+            method="POST", data={"ref": DEFAULT_BRANCH,
+                                  "inputs": {"policy_pr": str(state["number"])}})
+        print("Both exact policy review scopes are clean; dispatched the same-run final validation/adoption path")
+        return
+    if pair.get("state") in {"findings", "invalid"}:
+        evidence = json.dumps({"pair": pair, "full": full, "delta": delta},
+                              ensure_ascii=False, sort_keys=True, indent=2)
+        request_policy_pr_fix(state["number"], state["head"], evidence)
+        return
+
+    token = owner_token(repo)
+    now = datetime.now(timezone.utc)
+    candidate_id = manifest["candidateIdentity"]
+    for scope, result in (("full", full), ("delta", delta)):
+        context = manifest["reviewContexts"][scope]
+        pull = api(f"repos/{repo}/pulls/{context['pr']}")
+        review_comments = pages(f"repos/{repo}/issues/{context['pr']}/comments")
+        review_owners = [item for item in review_comments
+                         if item.get("user", {}).get("login") == owner
+                         and item.get("user", {}).get("type") == "User"]
+        marker = owner_review_marker(candidate_id, scope, context["review_sha"], context["base_sha"])
+        if not any(marker in _owner_protocol_comment_body(owner, item)
+                   for item in review_owners):
+            request_lifecycle_review(repo, pull, manifest["candidate"], candidate_id, scope,
+                                     context["review_sha"], context["base_sha"], token)
+            continue
+        if review_followup_due(review_owners, sha=context["review_sha"], now=now):
+            timestamp = int(now.timestamp())
+            continuation = (
+                "@codex review\n\nContinue the exact paired policy review for the complete finding list. "
+                "Re-read the exact source snapshot and report every finding or a clean completion.\n\n"
+                + marker + "\n"
+                + f"<!-- osconfig-review-window:v1 {context['review_sha']} {timestamp} -->"
+            )
+            api(f"repos/{repo}/issues/{context['pr']}/comments", method="POST", token=token,
+                data={"body": continuation})
+    print("Paired policy review remains pending; no tests or policy adoption ran")
 
 
 def verify_candidate_artifact(candidate_dir, pages_dir, *, allow_default_advanced=False):
@@ -1874,10 +5080,28 @@ def verify_candidate_artifact(candidate_dir, pages_dir, *, allow_default_advance
             or settings["github_repo"] != repository.lower()
             or settings["signing_fingerprint"] != fingerprint):
         raise ValueError("Adoption repository and signing identity differ from repository.conf")
-    ready, reason = review_status(repo, int(manifest["candidatePr"]), manifest["candidateSha"],
-                                  manifest["upstreamCommit"], manifest["candidateBranch"])
-    if not ready:
-        raise ValueError(reason)
+    full, delta, pair = review_pair_status(repo, manifest)
+    if pair.get("state") != "ready" or pair.get("complete") is not True:
+        raise ValueError(pair.get("reason", "Both exact native review scopes are required"))
+    identity = manifest.get("candidate") or {}
+    review_contexts = manifest.get("reviewContexts") or {}
+    full_context = review_contexts.get("full") or {}
+    delta_context = review_contexts.get("delta") or {}
+    baseline_proof = manifest.get("acceptedBaselineProof") or {}
+    baseline_variable = baseline_proof.get("variable") or {}
+    try:
+        accepted_candidate = json.loads(baseline_variable.get("value", "{}")).get("candidate")
+    except (TypeError, ValueError):
+        accepted_candidate = None
+    expected_delta_sha = (identity.get("application_sha")
+                          if isinstance(accepted_candidate, dict)
+                          and identity.get("configuration_sha") == accepted_candidate.get("configuration_sha")
+                          else identity.get("configuration_sha"))
+    if (identity.get("application_sha") != manifest.get("candidateApplicationSha")
+            or identity.get("upstream_sha") != manifest.get("upstreamCommit")
+            or expected_delta_sha != delta_context.get("review_sha")
+            or manifest.get("candidateSha") != full_context.get("review_sha")):
+        raise ValueError("Signed candidate manifest differs from its paired review identities")
     config = manifest["configSha"]
     latest = api(f"repos/{repo}/commits/{DEFAULT_BRANCH}")["sha"]
     if latest != config and not allow_default_advanced:
@@ -1928,7 +5152,9 @@ def adopt(candidate_dir, pages_dir):
         )
         if not already_adopted:
             raise ValueError("Default branch advanced with different package state; refusing stale adoption")
+        advance_accepted_baseline(repo, manifest, published, owner_token(repo))
         os.environ["CANDIDATE_PR"] = str(manifest["candidatePr"])
+        os.environ["DELTA_PR"] = str(manifest.get("deltaPr", ""))
         close_candidate()
         print("Exact reviewed package and signed EVR are already adopted")
         return
@@ -1958,7 +5184,9 @@ def adopt(candidate_dir, pages_dir):
             run("git", "push", "origin", f"HEAD:{DEFAULT_BRANCH}", cwd=work)
         elif status.returncode != 0:
             raise ValueError("Unable to inspect patch adoption")
+    advance_accepted_baseline(repo, manifest, published, owner_token(repo))
     os.environ["CANDIDATE_PR"] = str(manifest["candidatePr"])
+    os.environ["DELTA_PR"] = str(manifest.get("deltaPr", ""))
     close_candidate()
     print(f"Reviewed package {package_evr}, exact source lock and minimum EVR stored on {DEFAULT_BRANCH}")
 
@@ -1993,11 +5221,173 @@ def policy_container_engine():
 
 def close_candidate():
     repo = os.environ["GITHUB_REPOSITORY"]
-    number = os.environ.get("CANDIDATE_PR", "")
-    if number.isdigit():
-        pull = api(f"repos/{repo}/pulls/{number}")
-        if pull["state"] == "open":
-            api(f"repos/{repo}/pulls/{number}", method="PATCH", data={"state": "closed"})
+    owner = repo.split("/", 1)[0]
+    for pull in pages(f"repos/{repo}/pulls?state=open"):
+        head, base = pull.get("head") or {}, pull.get("base") or {}
+        body = pull.get("body") or ""
+        owned_review = (
+            (pull.get("user", {}).get("login") == "github-actions[bot]"
+             and pull.get("user", {}).get("type") == "Bot")
+            or (pull.get("user", {}).get("login") == owner
+                and pull.get("user", {}).get("type") == "User")
+        )
+        is_review = ((head.get("ref") or "").startswith("review/")
+                     and re.fullmatch(r"review-base/[0-9a-f]{40}", base.get("ref", ""))
+                     and ("osconfig-candidate:v2" in body
+                          or "osconfig-delta:v2" in body
+                          or "osconfig-policy-candidate:v1" in body))
+        if owned_review and is_review:
+            api(f"repos/{repo}/pulls/{pull['number']}", method="PATCH",
+                data={"state": "closed"})
+    cleanup_review_refs(repo)
+
+
+def cleanup_review_refs(repo):
+    """Delete only archived, closed review refs approved by the shared cleanup gate."""
+    core = lifecycle_module()
+    pulls = pages(f"repos/{repo}/pulls?state=all")
+    open_refs = []
+    for pull in pulls:
+        if pull.get("state") != "open":
+            continue
+        head, base = pull.get("head") or {}, pull.get("base") or {}
+        open_refs.append({"head_ref": head.get("ref"), "base_ref": base.get("ref")})
+    records = []
+    owner = repo.split("/", 1)[0]
+    for pull in pulls:
+        if pull.get("state") != "closed":
+            continue
+        head, base = pull.get("head") or {}, pull.get("base") or {}
+        body = pull.get("body") or ""
+        owned_review = (
+            (pull.get("user", {}).get("login") == "github-actions[bot]"
+             and pull.get("user", {}).get("type") == "Bot")
+            or (pull.get("user", {}).get("login") == owner
+                and pull.get("user", {}).get("type") == "User")
+        )
+        if (not owned_review or (head.get("repo") or {}).get("full_name") != repo
+                or (base.get("repo") or {}).get("full_name") != repo
+                or not isinstance(head.get("ref"), str)
+                or not isinstance(base.get("ref"), str)
+                or not re.fullmatch(r"review/(?:[0-9a-f]{40}(?:-[0-9a-f]{64})?|"
+                                    r"changes-[0-9a-f]{40})", head["ref"])
+                or not re.fullmatch(r"review-base/[0-9a-f]{40}", base["ref"])
+                or not ("osconfig-candidate:v2" in body
+                        or "osconfig-delta:v2" in body
+                        or "osconfig-policy-candidate:v1" in body)):
+            continue
+        head_archive_ref = f"refs/pull/{pull['number']}/head"
+        archived = run("git", "ls-remote", f"https://github.com/{repo}.git", head_archive_ref)
+        if not archived:
+            continue
+        archive_sha = archived.split()[0]
+        if archive_sha != head.get("sha"):
+            continue
+        try:
+            archive_commit = api(f"repos/{repo}/commits/{archive_sha}")
+            if archive_commit.get("sha") != archive_sha:
+                continue
+            compare = api(f"repos/{repo}/compare/{base.get('sha')}...{head.get('sha')}")
+        except (subprocess.CalledProcessError, json.JSONDecodeError):
+            continue
+        pull_archive = {"ref": head_archive_ref,
+                        "object": {"type": "commit", "sha": archive_sha}}
+        review_requests = pages(f"repos/{repo}/issues/{pull['number']}/comments")
+        for side, ref in (("head", head), ("base", base)):
+            name, expected = ref.get("ref"), ref.get("sha")
+            if not isinstance(name, str) or not isinstance(expected, str) or not SHA.fullmatch(expected):
+                continue
+            try:
+                native_ref = api(f"repos/{repo}/git/ref/{quote('heads/' + name, safe='/')}")
+            except (subprocess.CalledProcessError, json.JSONDecodeError):
+                continue
+            if ((native_ref.get("ref") != f"refs/heads/{name}")
+                    or (native_ref.get("object") or {}).get("type") != "commit"
+                    or (native_ref.get("object") or {}).get("sha") != expected):
+                continue
+            records.append({
+                "name": name,
+                "expected_oid": expected,
+                "ref_object": native_ref["object"],
+                "pull": pull,
+                "pull_ref_archive": pull_archive,
+                "open_pull_refs": open_refs,
+                "review_requests": review_requests,
+                "base_compare": compare,
+            })
+    try:
+        plan = core.cleanup_plan(records, active_refs=open_refs,
+                                 protected_refs={DEFAULT_BRANCH, "main", "downstream"})
+    except (TypeError, ValueError) as error:
+        print(f"Review branch cleanup retained all refs because native evidence was incomplete: {error}")
+        return
+    if not plan:
+        print("No closed review refs have complete native archive and compare evidence for cleanup")
+        return
+    records_by_name = {}
+    for record in records:
+        records_by_name.setdefault(record["name"], []).append(record)
+    with tempfile.TemporaryDirectory(prefix="osconfig-review-ref-cleanup-") as temporary:
+        work = Path(temporary) / "repo"
+        run("git", "init", str(work))
+        run("git", "remote", "add", "origin", f"https://github.com/{repo}.git", cwd=work)
+        run("gh", "auth", "setup-git", cwd=work)
+        removed = 0
+        for item in plan:
+            name, expected = item["name"], item["expected_oid"]
+            current_open = pages(f"repos/{repo}/pulls?state=open")
+            current_open_refs = [{"head_ref": (pull.get("head") or {}).get("ref"),
+                                  "base_ref": (pull.get("base") or {}).get("ref")}
+                                 for pull in current_open]
+            if any(name in {record.get("head_ref"), record.get("base_ref")}
+                   for record in current_open_refs):
+                continue
+            refreshed = []
+            for old in records_by_name.get(name, []):
+                old_pull = old["pull"]
+                number = old_pull["number"]
+                try:
+                    pull = api(f"repos/{repo}/pulls/{number}")
+                    pull_head, pull_base = pull.get("head") or {}, pull.get("base") or {}
+                    if (pull.get("state") != "closed"
+                            or pull_head.get("ref") != (old_pull.get("head") or {}).get("ref")
+                            or pull_head.get("sha") != (old_pull.get("head") or {}).get("sha")
+                            or pull_base.get("ref") != (old_pull.get("base") or {}).get("ref")
+                            or pull_base.get("sha") != (old_pull.get("base") or {}).get("sha")):
+                        continue
+                    archive_ref = f"refs/pull/{number}/head"
+                    archive = run("git", "ls-remote", f"https://github.com/{repo}.git", archive_ref)
+                    if not archive or archive.split()[0] != pull_head.get("sha"):
+                        continue
+                    native_ref = api(f"repos/{repo}/git/ref/{quote('heads/' + name, safe='/')}")
+                    if ((native_ref.get("object") or {}).get("type") != "commit"
+                            or (native_ref.get("object") or {}).get("sha") != expected):
+                        continue
+                    copy = {**old, "pull": pull, "ref_object": native_ref["object"],
+                            "review_requests": pages(f"repos/{repo}/issues/{number}/comments"),
+                            "pull_ref_archive": {"ref": archive_ref,
+                                                 "object": {"type": "commit", "sha": archive.split()[0]}},
+                            "open_pull_refs": current_open_refs}
+                    if name.startswith("review-base/"):
+                        copy["base_compare"] = api(
+                            f"repos/{repo}/compare/{pull_base.get('sha')}...{pull_head.get('sha')}")
+                    refreshed.append(copy)
+                except (subprocess.CalledProcessError, json.JSONDecodeError, ValueError):
+                    continue
+            if not refreshed:
+                continue
+            rechecked = core.cleanup_plan(refreshed, active_refs=current_open_refs,
+                                          protected_refs={DEFAULT_BRANCH, "main", "downstream"})
+            if not any(candidate.get("name") == name
+                       and candidate.get("expected_oid") == expected for candidate in rechecked):
+                continue
+            try:
+                run("git", "push", f"--force-with-lease=refs/heads/{name}:{expected}",
+                    "origin", f":refs/heads/{name}", cwd=work)
+            except (subprocess.CalledProcessError, OSError):
+                continue
+            removed += 1
+    print(f"Removed {removed} archived, closed review refs using expected-OID leases")
 
 
 def main():
@@ -2011,10 +5401,16 @@ def main():
         target.write_text(failed_job_evidence(os.environ["GITHUB_REPOSITORY"], sys.argv[2]), encoding="utf-8")
         return
     path = Path(sys.argv[2]).resolve()
-    if command == "prepare":
+    if command == "candidate-preflight":
+        candidate_preflight()
+    elif command == "prepare":
         prepare(path)
+    elif command == "prepare-policy":
+        prepare_policy_candidate(path)
     elif command == "review":
         review(path)
+    elif command == "review-pair":
+        review_pair(path)
     elif command == "repair":
         request_fix(path, Path(sys.argv[3]).read_text())
     elif command == "repair-policy":
@@ -2030,8 +5426,45 @@ def main():
         policy_check(path)
     elif command == "policy-review":
         policy_review(path)
+    elif command == "policy-validate":
+        check_policy(path)
+        print("Isolated trusted publisher tests and workflow checks passed after paired review")
+    elif command == "policy-validate-shared":
+        check_policy(path, shared=True)
+        print("Immutable publisher oracle, changed proposal tests, and workflow checks passed after paired review")
+    elif command == "policy-tests":
+        run_policy_tests(path)
     elif command == "adopt-policy":
         adopt_policy(path)
+    elif command == "adopt-policy-pair":
+        if len(sys.argv) != 4:
+            raise ValueError("Usage: release.py adopt-policy-pair REVIEW_ARTIFACT_DIR PROPOSAL_CHECKOUT_DIR")
+        adopt_policy_pair(path, Path(sys.argv[3]).resolve())
+    elif command == "authorize-final":
+        authorize_final(path)
+    elif command == "verify-final-run":
+        if len(sys.argv) != 7:
+            raise ValueError("Usage: release.py verify-final-run CANDIDATE_DIR RUN_ID RUN_ATTEMPT WORKFLOW_SHA CANDIDATE_ID")
+        verify_final_run(path, sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6])
+    elif command == "write-build-provenance":
+        if len(sys.argv) != 4:
+            raise ValueError("Usage: release.py write-build-provenance CANDIDATE_DIR BUILT_DIR")
+        write_build_provenance(path, Path(sys.argv[3]).resolve())
+    elif command == "verify-build-provenance":
+        if len(sys.argv) != 8:
+            raise ValueError("Usage: release.py verify-build-provenance CANDIDATE_DIR BUILT_DIR RUN_ID RUN_ATTEMPT WORKFLOW_SHA CANDIDATE_ID")
+        verify_build_provenance(path, Path(sys.argv[3]).resolve(), *sys.argv[4:])
+    elif command == "write-signature-proof":
+        if len(sys.argv) != 6:
+            raise ValueError("Usage: release.py write-signature-proof CANDIDATE_DIR BUILT_DIR PAGES_DIR PROOF_DIR")
+        write_signature_proof(path, Path(sys.argv[3]).resolve(),
+                              Path(sys.argv[4]).resolve(), Path(sys.argv[5]).resolve())
+    elif command == "verify-reusable-artifacts":
+        if len(sys.argv) != 11 or sys.argv[10] not in {"true", "false"}:
+            raise ValueError("Usage: release.py verify-reusable-artifacts CANDIDATE_DIR BUILT_DIR PAGES_DIR PROOF_DIR RUN_ID RUN_ATTEMPT WORKFLOW_SHA CANDIDATE_ID ALLOW_LEGACY_ATTEMPT_ONE")
+        verify_reusable_artifacts(
+            path, Path(sys.argv[3]).resolve(), Path(sys.argv[4]).resolve(),
+            Path(sys.argv[5]).resolve(), *sys.argv[6:10], sys.argv[10] == "true")
     elif command == "policy-resume":
         policy_resume()
     elif command == "verify":

@@ -15,8 +15,9 @@ The bootstrap source is upstream release `20261015.00`, commit
 ordered downstream patch fixes RPM `noarch` architecture reporting and ignores
 DNF5 `replacing` rows in available-update inventory. It adds focused regressions
 for both behaviors and makes the async task test explicitly dry-run with reboot
-disabled, avoiding an OS action in the test fixture. Patch SHA-256:
-`5b2ce54d5fd442558aaa87ae9a0f8b2aa2833c0f4a695471711f5af5be48cd0c`.
+disabled, avoiding an OS action in the test fixture. The last verified signed
+production manifest records patch SHA-256
+`c7b7de53fcf23d2c9d53733b0389ecbd59e752b2f323e991390f242df22d6515`.
 
 ## Package and release boundary
 
@@ -33,12 +34,55 @@ The workflow uses public candidate branches and keeps build/review/publisher
 policy repairs machine-maintained. It publishes only the package repository
 artifacts, not server configuration, VM inventory, or credentials.
 
+The public adapter pins the private `warelik/machine-maintenance` lifecycle
+module by exact commit and SHA-256 in `maintenance.lock.json`. Jobs that call
+the shared lifecycle adapter acquire that revision with a read-only deploy key
+and disable checkout credential persistence. The private source is used from
+its temporary checkout; it is not copied into the RPM, artifact, or repository.
+
+Application candidates receive two independent native reviews: the full review
+reads the assembled patched Go source against the exact upstream commit, while
+the delta review reads the changed downstream configuration or application
+delta against the protected last-accepted baseline. Findings carry forward until
+an owner-authenticated disposition identifies the exact repaired source and
+code/regression evidence. Tests and dependency installation begin only after
+both complete review lists are clean. The RPM recipe runs the mandatory Go
+regressions once in the final build job; the workflow does not run
+`check-upstream.sh` as a second test pass. A policy-only change skips RPM build
+and preserves the published package provenance when all product/build inputs
+match the signed baseline.
+
+The application-attempt budget covers only the native `build-rpm` and `sign`
+jobs. The separate `policy-validation` result is tracked by exact candidate,
+run ID, and run attempt: an active unit waits, a failed unit blocks that exact
+source, and one successful unit can be reused without repeating its tests.
+Changing policy does not refund a started application attempt.
+
+Build and signature artifacts carry source, workflow, run-attempt, and file-hash
+receipts. An `already-validated` decision continues through metadata checks and
+publication only after those receipts, the exact source identity, the signed
+manifest, RPM, and RPM-MD signatures verify. A legacy artifact can be recovered
+only from a run with a single native attempt; artifacts without enough exact
+provenance stop publication and never trigger another application build or
+signing run.
+
 Policy adoption checks run the proposed CLI against trusted regressions in a
 container without network access or credentials. The parser dependency is
 installed before this check and mounted read-only with the trusted test inputs,
 so the candidate cannot alter the parser used to judge its output. A native
 regression checks that existing parser files and adjacent new files cannot be
 written.
+
+The paired-review final policy command imports the proposed release module in
+that read-only sandbox before running the immutable trusted test suite against
+it, then runs only proposed test files whose bytes are new or changed. Legacy
+diagnostic commands keep their trusted-baseline behavior. For policy-only
+migration, the final metadata guard can reuse a native exact-source receipt from
+the private shared-validation run; it rechecks the full/delta review evidence
+and private native workflow run before skipping that already-completed policy
+test pass. In shared mode, subprocess output and container logs are discarded;
+public logs report only the frozen public test filenames and pass/fail status.
+This proof never permits an application build or artifact reuse.
 
 The signing job checks out the exact trusted workflow commit and executes its
 signer, verifier, and disposable-key regression. Application repair artifacts

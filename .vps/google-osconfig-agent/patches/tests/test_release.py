@@ -310,7 +310,9 @@ class SigningWorkflowTrustTests(unittest.TestCase):
     def test_signer_rejects_action_subdirectory_override(self):
         with tempfile.TemporaryDirectory() as temporary:
             yaml, document, path = self.load_document(temporary)
-            checkout = document["jobs"]["sign"]["steps"][0]
+            checkout = next(step for step in document["jobs"]["sign"]["steps"]
+                            if str(step.get("uses", "")).startswith("actions/checkout@")
+                            and (step.get("with") or {}).get("ref") == "${{ github.sha }}")
             checkout["uses"] = checkout["uses"].replace("actions/checkout@", "actions/checkout/other@")
             path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
             with self.assertRaises(ValueError):
@@ -364,8 +366,10 @@ class SigningWorkflowTrustTests(unittest.TestCase):
         repair = document["jobs"]["repair-publisher"]
         self.assertIn("review", repair["needs"])
         self.assertIn("sign", repair["needs"])
+        self.assertIn("recover-validated", repair["needs"])
         self.assertIn("needs.review.result == 'failure'", repair["if"])
         self.assertIn("needs.sign.result == 'failure'", repair["if"])
+        self.assertIn("needs.recover-validated.result == 'failure'", repair["if"])
         self.assertIn("release.py repair-policy", repair["steps"][-1].get("run", ""))
 
 
@@ -399,7 +403,39 @@ class ParserRequirementTests(unittest.TestCase):
                 release.parser_requirement_version(content)
 
 
-class PolicyBootstrapWorkflowTests(unittest.TestCase):
+class PolicyWorkflowAndSharedValidationTests(unittest.TestCase):
+    repo = "warelik/osconfig"
+
+    def test_owner_metadata_callers_get_the_owner_token_only_at_trusted_steps(self):
+        workflow = Path(os.environ.get("OSCONFIG_POLICY_CANDIDATE_WORKFLOW") or
+                        (release.PATCH_DIR / "workflows/google-osconfig-agent-inventory.yml"))
+        document = release.yaml_module().safe_load(workflow.read_text(encoding="utf-8"))
+        jobs = document["jobs"]
+        trusted_calls = (
+            ("adopt-policy", "Adopt only exact reviewed policy blobs without starting a second cycle"),
+            ("recover-validated", "Verify exact prior run-attempt artifacts and signed metadata"),
+            ("publish", "Recheck exact review and signed repository before publication"),
+        )
+        for job_name, step_name in trusted_calls:
+            with self.subTest(job=job_name, step=step_name):
+                matches = [step for step in jobs[job_name]["steps"]
+                           if step.get("name") == step_name]
+                self.assertEqual(len(matches), 1)
+                env = matches[0].get("env", {})
+                self.assertEqual(env.get("GH_TOKEN"), "${{ github.token }}")
+                self.assertEqual(env.get("CODEX_REQUEST_TOKEN"),
+                                 "${{ secrets.CODEX_REQUEST_TOKEN }}")
+
+        self.assertNotIn("CODEX_REQUEST_TOKEN", document.get("env", {}))
+        proposal_tests = next(
+            step for step in jobs["prepare"]["steps"]
+            if step.get("name") == "Sandbox and test the proposed publisher policy after both reviews")
+        self.assertNotIn("CODEX_REQUEST_TOKEN", proposal_tests.get("env", {}))
+        for job_name in ("build-rpm", "sign"):
+            for step in jobs[job_name]["steps"]:
+                with self.subTest(job=job_name, step=step.get("name")):
+                    self.assertNotIn("CODEX_REQUEST_TOKEN", step.get("env", {}))
+
     def test_policy_check_bootstrap_does_not_read_mutable_candidate_requirements(self):
         workflow = Path(os.environ.get("OSCONFIG_POLICY_CANDIDATE_WORKFLOW") or
                         (release.PATCH_DIR / "workflows/google-osconfig-agent-inventory.yml"))
@@ -412,20 +448,256 @@ class PolicyBootstrapWorkflowTests(unittest.TestCase):
         self.assertIn("-r .vps/google-osconfig-agent/patches/requirements-policy.txt",
                       declared_install[0]["run"])
         steps = document["jobs"]["policy-check"]["steps"]
-        bootstrap = [step for step in steps
-                     if step.get("name") == "Install independent policy bootstrap parser"]
-        self.assertEqual(len(bootstrap), 1)
-        install = bootstrap[0]["run"]
-        self.assertIn("pip install", install)
-        self.assertIn("--only-binary=:all:", install)
-        self.assertIn("--require-hashes", install)
-        self.assertIn("osconfig-policy-bootstrap", install)
-        self.assertIn("-r trusted/.vps/google-osconfig-agent/patches/requirements-policy-bootstrap.txt", install)
-        self.assertNotIn("trusted/.vps/google-osconfig-agent/patches/requirements-policy.txt", install)
-        self.assertNotIn(">=6,<7", install)
-        check = [step for step in steps if "release.py policy-check candidate" in step.get("run", "")]
+        self.assertFalse(any("pip install" in step.get("run", "")
+                             or "release.py policy-check candidate" in step.get("run", "")
+                             for step in steps))
+        review_steps = document["jobs"]["policy-review"]["steps"]
+        paired_review = [step for step in review_steps
+                         if "release.py review-pair" in step.get("run", "")]
+        self.assertEqual(len(paired_review), 1)
+        self.assertIn("policy-final-guard", document["jobs"]["prepare"]["needs"])
+        self.assertIn("policy-review", document["jobs"]["prepare"]["needs"])
+        final_authorize = next(step for step in document["jobs"]["final-guard"]["steps"]
+                               if step.get("id") == "authorize")
+        self.assertIn("CODEX_REQUEST_TOKEN", final_authorize.get("env", {}))
+        policy_authorize = next(step for step in document["jobs"]["policy-final-guard"]["steps"]
+                                if step.get("id") == "authorize")
+        self.assertIn("CODEX_REQUEST_TOKEN", policy_authorize.get("env", {}))
+        build_verify = next(step for step in document["jobs"]["build-rpm"]["steps"]
+                            if "release.py verify-final-run" in step.get("run", ""))
+        self.assertNotIn("CODEX_REQUEST_TOKEN", build_verify.get("env", {}))
+        self.assertIn("validated_bundle", document["jobs"]["final-guard"]["outputs"])
+        self.assertIn("validated_bundle", document["jobs"]["policy-final-guard"]["outputs"])
+        self.assertEqual(document["jobs"]["policy-check"]["outputs"]["candidate_id"],
+                         "${{ steps.check.outputs.candidate_id }}")
+        preflight = next(step for step in document["jobs"]["candidate-source"]["steps"]
+                         if step.get("id") == "preflight")
+        self.assertIn("release.py candidate-preflight", preflight.get("run", ""))
+        check = [step for step in steps if "release.py prepare-policy candidate" in step.get("run", "")]
         self.assertEqual(len(check), 1)
-        self.assertIn("osconfig-policy-bootstrap", check[0].get("env", {}).get("PYTHONPATH", ""))
+        self.assertIn("CODEX_REQUEST_TOKEN", check[0].get("env", {}))
+        proposal = [step for step in prepare_steps
+                    if step.get("name") == "Sandbox and test the proposed publisher policy after both reviews"]
+        self.assertEqual(len(proposal), 1)
+        self.assertIn("policy-validate-shared", proposal[0].get("run", ""))
+        self.assertIn("validated_bundle != 'true'", proposal[0].get("if", ""))
+        reuse = [step for step in prepare_steps
+                 if step.get("id") == "policy-proposal-reuse"]
+        self.assertEqual(len(reuse), 1)
+        self.assertIn("validated_bundle == 'true'", reuse[0].get("if", ""))
+        self.assertIn("policy-proposal-reuse.outputs.policy_validated",
+                      document["jobs"]["prepare"]["outputs"]["policy_validated"])
+
+    def test_workflow_copies_have_unique_yaml_keys_and_exact_resume_permissions(self):
+        yaml = release.yaml_module()
+
+        class UniqueKeyLoader(yaml.SafeLoader):
+            pass
+
+        def unique_mapping(loader, node, deep=False):
+            values = {}
+            for key_node, value_node in node.value:
+                key = loader.construct_object(key_node, deep=deep)
+                if key in values:
+                    raise ValueError(f"duplicate YAML key {key!r}")
+                values[key] = loader.construct_object(value_node, deep=deep)
+            return values
+
+        UniqueKeyLoader.add_constructor(
+            yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, unique_mapping)
+        installed = Path(__file__).resolve().parents[4] / ".github/workflows/google-osconfig-agent-inventory.yml"
+        template = release.PATCH_DIR / "workflows/google-osconfig-agent-inventory.yml"
+        self.assertEqual(installed.read_bytes(), template.read_bytes())
+        documents = [yaml.load(path.read_text(encoding="utf-8"), Loader=UniqueKeyLoader)
+                     for path in (installed, template)]
+        expected = {"contents": "read", "issues": "write", "actions": "write",
+                    "pull-requests": "read"}
+        self.assertEqual(documents[0]["jobs"]["policy-resume"]["permissions"], expected)
+        self.assertEqual(documents[1]["jobs"]["policy-resume"]["permissions"], expected)
+
+
+    def test_only_new_or_byte_changed_proposal_tests_are_selected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            candidate_tests = root / "candidate" / "tests"
+            trusted_tests = root / "trusted" / "tests"
+            candidate_tests.mkdir(parents=True)
+            trusted_tests.mkdir(parents=True)
+            (trusted_tests / "test_same.py").write_text("assert True\n", encoding="utf-8")
+            (candidate_tests / "test_same.py").write_text("assert True\n", encoding="utf-8")
+            (trusted_tests / "test_changed.py").write_text("assert True\n", encoding="utf-8")
+            (candidate_tests / "test_changed.py").write_text("assert False\n", encoding="utf-8")
+            (candidate_tests / "test_new.py").write_text("assert True\n", encoding="utf-8")
+
+            self.assertEqual(
+                [path.name for path in release.candidate_policy_tests(candidate_tests, trusted_tests)],
+                ["test_changed.py", "test_new.py"],
+            )
+
+    def test_accepted_config_comparison_reads_product_and_policy_roots_separately(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            product_root = root / "product"
+            policy_root = root / "policy"
+            product_file = product_root / release.PREFIX / "build-rpm.sh"
+            policy_file = policy_root / release.PREFIX / "release.py"
+            product_file.parent.mkdir(parents=True)
+            policy_file.parent.mkdir(parents=True)
+            product_file.write_text("product recipe\n", encoding="utf-8")
+            policy_file.write_text("trusted controller\n", encoding="utf-8")
+            hashes = {str(product_file): "a" * 40, str(policy_file): "b" * 40}
+            tree = {"truncated": False, "tree": [
+                {"path": release.PREFIX + "build-rpm.sh", "mode": "100644", "sha": "a" * 40,
+                 "type": "blob"},
+                {"path": release.PREFIX + "release.py", "mode": "100644", "sha": "b" * 40,
+                 "type": "blob"},
+            ]}
+            with patch.object(release, "api", return_value=tree), \
+                    patch.object(release, "run", side_effect=lambda *args, **kwargs: hashes[str(args[-1])]):
+                self.assertTrue(release.candidate_config_inputs_match(
+                    self.repo, "c" * 40, product_root, policy_root))
+
+    def test_candidate_module_is_imported_before_immutable_test_discovery(self):
+        launcher = release.POLICY_TEST_LAUNCHER
+        self.assertLess(launcher.index("import release;"), launcher.index("release.lifecycle_module();"))
+        self.assertLess(launcher.index("release.lifecycle_module();"),
+                        launcher.index("discover(discover_tests"))
+        with tempfile.TemporaryDirectory() as temporary:
+            changed = Path(temporary) / "test_changed.py"
+            new = Path(temporary) / "test_new.py"
+            targets = release.shared_policy_test_targets(
+                Path("candidate/patches"), Path("trusted/tests"),
+                Path("candidate/tests"), [changed, new],
+            )
+            self.assertEqual(len(targets), 2)
+            self.assertEqual(targets[0][1], release.POLICY_TEST_LAUNCHER)
+            self.assertEqual(targets[0][3:], (Path("trusted/tests"), ("trusted/tests",)))
+            self.assertEqual(targets[1][1], release.PROPOSED_POLICY_TEST_LAUNCHER)
+            self.assertEqual(targets[1][3:], (Path("candidate/tests"), ("test_changed", "test_new")))
+            self.assertLess(targets[1][1].index("import release;"),
+                            targets[1][1].index("release.lifecycle_module();"))
+            self.assertLess(targets[1][1].index("release.lifecycle_module();"),
+                            targets[1][1].index("loadTestsFromName(name)"))
+
+    def test_bundle_reuse_uses_owner_authenticated_read_only_native_callback(self):
+        repo = "warelik/osconfig"
+        candidate = {"schema": 1, "repository": repo}
+        comments = [{"id": 91, "body": "exact full review thread"}]
+        native_response = {"id": 701}
+
+        class Core:
+            @staticmethod
+            def validated_bundle(value, native_comments, read_native):
+                self.assertEqual(value, candidate)
+                self.assertEqual(native_comments, comments)
+                self.assertEqual(read_native("repos/warelik/machine-maintenance/actions/runs/1"),
+                                 native_response)
+                return {"decision": "reuse-policy-validation"}
+
+        with patch.object(release, "owner_token", return_value="owner-read-token"), \
+             patch.object(release, "pages", return_value=comments) as native_comments, \
+             patch.object(release, "api", return_value=native_response) as native_get, \
+             patch.object(release, "lifecycle_module", return_value=Core):
+            self.assertTrue(release.validated_policy_bundle(repo, candidate, 91))
+        native_comments.assert_called_once_with(
+            "repos/warelik/osconfig/issues/91/comments", token="owner-read-token")
+        native_get.assert_called_once_with(
+            "repos/warelik/machine-maintenance/actions/runs/1", token="owner-read-token")
+
+    def test_expensive_steps_recheck_the_frozen_native_run_attempt(self):
+        workflow = Path(os.environ.get("OSCONFIG_POLICY_CANDIDATE_WORKFLOW") or
+                        (release.PATCH_DIR / "workflows/google-osconfig-agent-inventory.yml"))
+        document = release.yaml_module().safe_load(workflow.read_text(encoding="utf-8"))
+        jobs = document["jobs"]
+        self.assertIn("run_attempt", jobs["final-guard"]["outputs"])
+        self.assertIn("run_id", jobs["final-guard"]["outputs"])
+        self.assertIn("workflow_sha", jobs["final-guard"]["outputs"])
+        build_steps = jobs["build-rpm"]["steps"]
+        final_guard = next(index for index, step in enumerate(build_steps)
+                           if "release.py verify-final-run" in step.get("run", ""))
+        build = next(index for index, step in enumerate(build_steps)
+                     if step.get("name") == "Build the Fedora RPM")
+        self.assertLess(final_guard, build)
+        build_initial = build_steps[0]
+        self.assertIn("before checkout or Fedora tools", build_initial.get("name", ""))
+        self.assertIn("GITHUB_RUN_ATTEMPT", build_initial.get("run", ""))
+        self.assertLess(build_steps.index(build_initial), next(
+            index for index, step in enumerate(build_steps)
+            if step.get("name") == "Install Fedora build tools"))
+        self.assertIn("github.run_attempt", jobs["sign"]["if"])
+        sign_steps = jobs["sign"]["steps"]
+        self.assertIn("before checkout or signing tools", sign_steps[0].get("name", ""))
+        self.assertIn("GITHUB_RUN_ATTEMPT", sign_steps[0].get("run", ""))
+        recovery = jobs["recover-validated"]
+        self.assertIn("already-validated", recovery["if"])
+        recovery_downloads = [step.get("with", {}) for step in recovery["steps"]
+                             if str(step.get("uses", "")).startswith("actions/download-artifact@")]
+        self.assertTrue(any(item.get("run-id") == "${{ needs.final-guard.outputs.reuse_run_id }}"
+                            for item in recovery_downloads))
+        self.assertTrue(any("verify-reusable-artifacts" in step.get("run", "")
+                            for step in recovery["steps"]))
+        self.assertIn("always()", jobs["publish"]["if"])
+        self.assertEqual(release.FINAL_REQUIRED_JOBS, ("build-rpm", "sign"))
+        policy_test = next(step for step in jobs["prepare"]["steps"]
+                           if step.get("name") == "Test trusted release gate after both reviews")
+        self.assertIn("release.py policy-tests", policy_test.get("run", ""))
+        self.assertNotIn("unittest discover", policy_test.get("run", ""))
+
+    def test_final_history_ignores_only_timestamped_native_skipped_placeholders(self):
+        self.assertFalse(release.native_heavy_job_started({
+            "started_at": "2026-10-19T00:00:00Z", "conclusion": "skipped", "steps": [],
+        }))
+        self.assertFalse(release.native_heavy_job_started({
+            "started_at": None, "conclusion": "skipped", "steps": [],
+        }))
+        self.assertTrue(release.native_heavy_job_started({
+            "started_at": "2026-10-19T00:00:00Z", "conclusion": "skipped",
+            "steps": [{"name": "real work", "conclusion": "skipped"}],
+        }))
+
+
+class AcceptedBaselineProofTests(unittest.TestCase):
+    def test_checkpoint_must_match_the_verified_signed_deployment(self):
+        repo = "warelik/osconfig"
+        candidate = {
+            "schema": 1, "repository": repo,
+            "upstream_sha": "a" * 40, "application_sha": "b" * 40,
+            "configuration_sha": "c" * 40, "patchset_sha256": "d" * 64,
+            "recipe_sha256": "e" * 64, "platform": "fedora-44/x86_64",
+        }
+        baseline = {
+            "candidate": candidate, "candidate_id": "f" * 64,
+            "release_id": 701, "published_at": "2026-10-19T12:00:00Z",
+            "manifest_sha256": "1" * 64,
+        }
+        value = {
+            "schema": 1, "repository": repo, "candidate": candidate,
+            "publication": {
+                "kind": "signed-repository", "id": 701,
+                "published_at": baseline["published_at"],
+                "metadata_sha256": baseline["manifest_sha256"],
+            },
+        }
+        variable = {
+            "name": "FORK_ACCEPTED_BASELINE",
+            "value": json.dumps(value, sort_keys=True, separators=(",", ":")),
+            "created_at": "2026-10-19T12:01:00Z",
+            "updated_at": "2026-10-19T12:01:00Z",
+        }
+
+        class Core:
+            @staticmethod
+            def candidate_identity(_candidate):
+                return "f" * 64
+
+        with patch.object(release, "lifecycle_module", return_value=Core()):
+            proof = release.accepted_baseline_proof(repo, variable, baseline)
+            self.assertEqual(proof["endpoint"],
+                             "repos/warelik/osconfig/actions/variables/FORK_ACCEPTED_BASELINE")
+            value["publication"]["metadata_sha256"] = "2" * 64
+            variable["value"] = json.dumps(value, sort_keys=True, separators=(",", ":"))
+            with self.assertRaisesRegex(ValueError, "differs from the latest verified"):
+                release.accepted_baseline_proof(repo, variable, baseline)
 
 
 class PackageIdentityTests(unittest.TestCase):
@@ -634,8 +906,12 @@ class PublisherPolicyScopeTests(unittest.TestCase):
     def test_release_policy_files_are_separate_from_application_patch(self):
         expected = {
             ".vps/google-osconfig-agent/patches/release.py",
+            ".vps/google-osconfig-agent/patches/README.md",
+            ".vps/google-osconfig-agent/patches/maintenance.py",
+            ".vps/google-osconfig-agent/patches/maintenance.lock.json",
             ".vps/google-osconfig-agent/patches/tests/test_release.py",
             ".vps/google-osconfig-agent/patches/tests/test_policy_isolation.py",
+            ".vps/google-osconfig-agent/patches/tests/test_maintenance_adapter.py",
             ".vps/google-osconfig-agent/patches/tests/signing.sh",
             ".vps/google-osconfig-agent/patches/sign-repo.sh",
             ".vps/google-osconfig-agent/patches/verify-repo.sh",
@@ -647,6 +923,8 @@ class PublisherPolicyScopeTests(unittest.TestCase):
         self.assertEqual(release.POLICY_FILES, expected)
         allowed = sorted(expected)
         self.assertEqual(release.validate_policy_paths([allowed[0]]), [allowed[0]])
+        adapter_test = ".vps/google-osconfig-agent/patches/tests/test_maintenance_adapter.py"
+        self.assertEqual(release.validate_policy_paths([adapter_test]), [adapter_test])
         with self.assertRaisesRegex(ValueError, "allowlisted"):
             release.validate_policy_paths([
                 ".vps/google-osconfig-agent/patches/release.py",
@@ -931,6 +1209,117 @@ class PublisherPolicyDiffTests(unittest.TestCase):
                 release.policy_changes(work, seed, head)
 
 
+class DeltaSnapshotProductModeTests(unittest.TestCase):
+    baseline = "a" * 40
+    application_sha = "b" * 40
+    config_sha = "c" * 40
+    delta_tree = "d" * 40
+    delta_sha = "e" * 40
+
+    def product_trees(self, *, invalid=None):
+        config, application = {}, {}
+        for index, path in enumerate(release.FULL_PRODUCT_PATHS, start=1):
+            config[path] = {
+                "mode": ("100755" if Path(path).name in {"build-rpm.sh", "prepare-source.sh"}
+                         else "100644"),
+                "blob_sha": f"{index:040x}",
+            }
+            application[path] = {"mode": "100644", "blob_sha": f"{index + 100:040x}"}
+        if invalid:
+            side, kind, path = invalid
+            if kind == "missing":
+                (config if side == "config" else application).pop(path)
+            elif kind == "mode":
+                (config if side == "config" else application)[path]["mode"] = "120000"
+        return config, application
+
+    def run_delta(self, *, invalid=None):
+        config_tree, application_tree = self.product_trees(invalid=invalid)
+        config_path = Path("/source-config")
+        commands = []
+
+        def ls_tree(tree):
+            return "\n".join(
+                f"{entry['mode']} blob {entry['blob_sha']}\t{path}"
+                for path, entry in sorted(tree.items()))
+
+        def fake_run(*args, cwd=None, env=None, input=None):
+            commands.append(args)
+            if args[:3] == ("git", "rev-parse", "FETCH_HEAD"):
+                return self.baseline
+            if args[:2] == ("git", "ls-tree"):
+                tree = config_tree if args[4] == self.config_sha else application_tree
+                return ls_tree(tree)
+            if args[:2] == ("git", "write-tree"):
+                return self.delta_tree
+            if args[:2] == ("git", "commit-tree"):
+                return self.delta_sha
+            return ""
+
+        with patch.object(release, "run", side_effect=fake_run), \
+             patch.object(release, "ensure_review_base"), \
+             patch.object(release, "downstream_context_paths", return_value=[]), \
+             patch.object(release, "copy_checked_out_review_files", return_value=[]):
+            result = release.create_delta_snapshot(
+                Path("/application"), baseline_config=self.baseline,
+                application_sha=self.application_sha,
+                source_root=config_path, source_config_sha=self.config_sha,
+                repo="warelik/osconfig")
+        return result, commands, config_tree, application_tree
+
+    def test_delta_uses_configuration_modes_and_exact_application_blobs(self):
+        (delta_sha, _), commands, config_tree, application_tree = self.run_delta()
+        cacheinfo = {args[3] for args in commands
+                     if args[:3] == ("git", "update-index", "--cacheinfo")}
+        expected = {
+            f"{config_tree[path]['mode']},{application_tree[path]['blob_sha']},{path}"
+            for path in release.FULL_PRODUCT_PATHS
+        }
+        self.assertEqual(cacheinfo, expected)
+        self.assertIn(("git", "checkout-index", "--force", "--", *release.FULL_PRODUCT_PATHS),
+                      commands)
+        self.assertEqual(delta_sha, self.delta_sha)
+
+    def test_incomplete_or_nonregular_product_maps_fail_before_delta_checkout(self):
+        cases = (
+            ("missing-config", "config", "missing"),
+            ("nonregular-config", "config", "mode"),
+            ("missing-application", "application", "missing"),
+            ("nonregular-application", "application", "mode"),
+        )
+        for label, side, kind in cases:
+            with self.subTest(case=label):
+                invalid_path = release.FULL_PRODUCT_PATHS[0]
+                invalid = (side, kind, invalid_path)
+                config_path, application_path = Path("/source-config"), Path("/application")
+                config_tree, application_tree = self.product_trees(invalid=invalid)
+                commands = []
+
+                def fake_run(*args, cwd=None, env=None, input=None):
+                    commands.append(args)
+                    if args[:3] == ("git", "rev-parse", "FETCH_HEAD"):
+                        return self.baseline
+                    if args[:2] == ("git", "ls-tree"):
+                        tree = config_tree if args[4] == self.config_sha else application_tree
+                        return "\n".join(
+                            f"{entry['mode']} blob {entry['blob_sha']}\t{path}"
+                            for path, entry in sorted(tree.items()))
+                    return ""
+
+                with patch.object(release, "run", side_effect=fake_run), \
+                     patch.object(release, "ensure_review_base") as ensure_base:
+                    expected = "non-regular or malformed" if kind == "mode" else "incomplete"
+                    with self.assertRaisesRegex(ValueError, expected):
+                        release.create_delta_snapshot(
+                            application_path, baseline_config=self.baseline,
+                            application_sha=self.application_sha,
+                            source_root=config_path, source_config_sha=self.config_sha,
+                            repo="warelik/osconfig")
+                ensure_base.assert_not_called()
+                self.assertFalse(any(args[:3] == ("git", "checkout", "-B")
+                                     for args in commands))
+
+
 class FailedJobEvidenceTests(unittest.TestCase):
     repo = "warelik/osconfig"
     run_id = "4294967296"
@@ -1028,6 +1417,25 @@ class FailedJobEvidenceTests(unittest.TestCase):
         ))
 
 class PaginationAndApiDiagnosticsTests(unittest.TestCase):
+    repo = "warelik/osconfig"
+
+    def test_candidate_preflight_checks_late_open_policy_pull_requests(self):
+        pulls = [{"head": {"ref": f"feature/{number}",
+                           "repo": {"full_name": self.repo}}} for number in range(100)]
+        pulls.append({"head": {"ref": "repair/osconfig-policy-example",
+                                "repo": {"full_name": self.repo}}})
+        with patch.object(release, "pages", return_value=pulls) as page_reader:
+            self.assertTrue(release.active_policy_candidate_exists(self.repo))
+        page_reader.assert_called_once_with(
+            f"repos/{self.repo}/pulls?state=open&base={release.DEFAULT_BRANCH}")
+
+    def test_native_pagination_fails_closed_at_its_page_bound(self):
+        with patch.object(release, "MAX_API_PAGES", 2), \
+                patch.object(release, "api", return_value=[{} for _ in range(100)]) as github_api:
+            with self.assertRaisesRegex(ValueError, "pagination did not terminate"):
+                release.pages(f"repos/{self.repo}/pulls?state=open")
+        self.assertEqual(github_api.call_count, 2)
+
     def test_real_cli_reports_api_denial_without_the_token(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1145,19 +1553,12 @@ class PublisherRepairDeliveryTests(unittest.TestCase):
             checkout = next(step for step in steps
                             if step.get("with", {}).get("path") == "candidate")
             self.assertEqual(checkout["with"].get("fetch-depth"), 0, path)
-            ancestry = next(step for step in steps
-                            if step.get("name") ==
-                            "Verify the exact proposal has complete ancestry")
-            self.assertEqual(ancestry["env"]["POLICY_BASE_SHA"],
-                             "${{ steps.identity.outputs.config }}", path)
-            self.assertEqual(ancestry["env"]["POLICY_HEAD_SHA"],
+            prepare = next(step for step in steps
+                           if "release.py prepare-policy candidate" in step.get("run", ""))
+            self.assertEqual(prepare["env"]["POLICY_HEAD_SHA"],
                              "${{ steps.identity.outputs.head }}", path)
-            self.assertEqual(
-                ancestry["run"],
-                'git -C candidate merge-base --is-ancestor '
-                '"$POLICY_BASE_SHA" "$POLICY_HEAD_SHA"',
-                path,
-            )
+            source = (release.PATCH_DIR / "release.py").read_text(encoding="utf-8")
+            self.assertIn("policy_changes(candidate_dir, proposal_config, expected_head", source)
 
     def test_checkout_history_assertion_reads_the_proposed_workflow(self):
         yaml = release.yaml_module()
@@ -1229,6 +1630,138 @@ class ReusableCommitIdentityTests(unittest.TestCase):
             release.api("repos/warelik/osconfig/pulls")
         self.assertIn("permission denied", raised.exception.stderr)
         self.assertNotIn("top-secret", raised.exception.stderr)
+
+
+class FinalAttemptReuseTests(unittest.TestCase):
+    candidate_id = "c" * 64
+    run_sha = "a" * 40
+
+    def attempt(self, *, candidate_id=None, job_status="completed", job_conclusion="success",
+                step_status="completed", step_conclusion="success", started=True):
+        step = {"name": release.POLICY_VALIDATION_STEP, "status": step_status,
+                "conclusion": step_conclusion,
+                "started_at": "2026-10-19T12:01:00Z" if started else None}
+        return {"candidate_id": candidate_id or self.candidate_id,
+                "run": {"id": 701, "run_attempt": 2},
+                "jobs": [{"name": release.POLICY_VALIDATION_JOB,
+                          "status": job_status, "conclusion": job_conclusion,
+                          "steps": [step]}]}
+
+    def history(self, *attempts):
+        return {"complete": True, "attempts": list(attempts)}
+
+    def test_policy_validation_is_separate_from_the_application_heavy_budget(self):
+        self.assertEqual(release.FINAL_REQUIRED_JOBS, ("build-rpm", "sign"))
+        self.assertFalse(release.policy_validation_state(
+            self.history(), self.candidate_id)["validated"])
+        self.assertFalse(release.native_policy_job_started({
+            "started_at": "2026-10-19T12:00:00Z", "conclusion": "skipped", "steps": [],
+        }))
+        self.assertTrue(release.native_policy_job_started({
+            "started_at": "2026-10-19T12:00:00Z", "conclusion": "failure",
+            "steps": [{"name": release.POLICY_VALIDATION_STEP}],
+        }))
+
+    def test_successful_policy_unit_is_reused_only_for_its_exact_candidate(self):
+        state = release.policy_validation_state(
+            self.history(self.attempt(), self.attempt(candidate_id="d" * 64)),
+            self.candidate_id)
+        self.assertTrue(state["validated"])
+        self.assertFalse(state["failed"])
+
+    def test_active_failed_skipped_and_duplicate_policy_units_are_distinguished(self):
+        active = release.policy_validation_state(
+            self.history(self.attempt(job_status="in_progress", job_conclusion=None,
+                                      step_status="in_progress", step_conclusion=None)),
+            self.candidate_id)
+        self.assertTrue(active["active"])
+        failed = release.policy_validation_state(
+            self.history(self.attempt(step_conclusion="failure")), self.candidate_id)
+        self.assertTrue(failed["failed"])
+        skipped = self.attempt(job_conclusion="skipped", step_status="completed",
+                               step_conclusion="skipped", started=False)
+        skipped["jobs"][0]["steps"] = []
+        self.assertFalse(release.policy_validation_state(
+            self.history(skipped), self.candidate_id)["validated"])
+        duplicate = release.policy_validation_state(
+            self.history(self.attempt(), self.attempt()), self.candidate_id)
+        self.assertTrue(duplicate["failed"])
+
+    def test_successful_bundle_receipt_is_reused_without_charging_a_policy_unit(self):
+        attempt = self.attempt()
+        attempt["jobs"][0]["steps"] = [{
+            "name": "Reuse exact private bundle policy validation",
+            "status": "completed", "conclusion": "success",
+        }]
+        state = release.policy_validation_state(self.history(attempt), self.candidate_id)
+        self.assertTrue(state["validated"])
+        self.assertFalse(state["failed"])
+
+    def test_existing_reservation_preserves_policy_only_and_exact_owner_grant(self):
+        grant_id = 92
+        comment = {"body": "<!-- fork-final:v1 " + json.dumps({
+            "schema": 1, "candidate_id": self.candidate_id,
+            "run_id": 701, "run_attempt": 2, "workflow_sha": self.run_sha,
+            "retry_grant_id": grant_id,
+        }) + " -->"}
+        decision = {"decision": "policy-only", "grant_id": grant_id}
+        self.assertEqual(release.existing_reservation_decision(comment, decision), "policy-only")
+        with self.assertRaisesRegex(ValueError, "exact authorization grant"):
+            release.existing_reservation_decision(comment, {"decision": "policy-only"})
+
+    def test_build_artifact_provenance_binds_files_to_exact_run_attempt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            candidate_dir = root / "candidate"
+            built_dir = root / "built"
+            candidate_dir.mkdir()
+            built_dir.mkdir()
+            candidate = {"schema": 1}
+            (candidate_dir / "candidate-manifest.json").write_text(json.dumps({
+                "candidate": candidate, "candidateIdentity": self.candidate_id,
+                "candidateSha": self.run_sha,
+            }), encoding="utf-8")
+            rpm = built_dir / "agent.rpm"
+            rpm.write_bytes(b"verified-rpm-bytes")
+            class Core:
+                @staticmethod
+                def candidate_identity(value):
+                    return "c" * 64 if value == candidate else "d" * 64
+            with patch.object(release, "lifecycle_module", return_value=Core), \
+                    patch.dict(os.environ, {
+                        "GITHUB_RUN_ID": "701", "GITHUB_RUN_ATTEMPT": "2",
+                        "GITHUB_SHA": self.run_sha,
+                        "EXPECTED_CANDIDATE_ID": self.candidate_id,
+                    }):
+                release.write_build_provenance(candidate_dir, built_dir)
+                proof = release.verify_build_provenance(
+                    candidate_dir, built_dir, 701, 2, self.run_sha, self.candidate_id)
+                self.assertEqual(proof["run_attempt"], 2)
+                rpm.write_bytes(b"changed-rpm-bytes")
+                with self.assertRaisesRegex(ValueError, "differ from their exact attempt receipt"):
+                    release.verify_build_provenance(
+                        candidate_dir, built_dir, 701, 2, self.run_sha, self.candidate_id)
+
+
+class PolicyLogPrivacyTests(unittest.TestCase):
+    def test_shared_failure_hides_private_subprocess_output_without_changing_legacy_detail(self):
+        private_detail = "/machine-maintenance/private-source.py: secret traceback text"
+        shared = release.isolated_failure_message(
+            "Immutable trusted publisher oracle", 1, private_detail, private_detail,
+            shared=True)
+        self.assertEqual(shared, "Immutable trusted publisher oracle failed with status 1")
+        self.assertNotIn("private-source.py", shared)
+        legacy = release.isolated_failure_message(
+            "Isolated trusted publisher tests", 1, private_detail, private_detail,
+            shared=False)
+        self.assertIn("private-source.py", legacy)
+
+    def test_public_test_summary_contains_only_frozen_filenames_and_exit_status(self):
+        summary = release.policy_test_summary(
+            ["/tmp/private-tree/test_release.py", "test_maintenance_adapter.py"],
+            returncode=1)
+        self.assertEqual(summary,
+                         "Policy tests [test_maintenance_adapter.py, test_release.py]: FAIL exit=1")
 
 
 if __name__ == "__main__":

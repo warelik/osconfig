@@ -117,6 +117,7 @@ func parseYumUpdates(data []byte) []*PkgInfo {
 
 	var pkgs []*PkgInfo
 	var upgrading bool
+	packageIndent := -1
 	packagesInstallOrUpdateKeywords := []string{"Upgrading:", "Updating:", "Installing:", "Installing dependencies:", "Installing weak dependencies:"}
 	for _, ln := range lines {
 		pkg := bytes.Fields(ln)
@@ -127,16 +128,23 @@ func parseYumUpdates(data []byte) []*PkgInfo {
 		// Yum has this as Updating, dnf is Upgrading.
 		if slices.Contains(packagesInstallOrUpdateKeywords, string(bytes.Join(pkg, []byte(" ")))) {
 			upgrading = true
+			packageIndent = -1
 			continue
 		} else if !upgrading {
 			continue
 		}
-		// A package line should have 6 fields, break unless this is a 'replacing' entry.
+		// DNF5 indents replacement annotations beneath their package row. An
+		// empty repository can leave six fields, just like a real package named replacing.
+		indent := len(ln) - len(bytes.TrimLeft(ln, " \t"))
+		if string(pkg[0]) == "replacing" && (len(pkg) != 6 || (packageIndent >= 0 && indent > packageIndent)) {
+			continue
+		}
+		// A package line should have 6 fields; shorter rows end the update list.
 		if len(pkg) < 6 {
-			if string(pkg[0]) == "replacing" {
-				continue
-			}
 			break
+		}
+		if packageIndent < 0 {
+			packageIndent = indent
 		}
 
 		pkgs = append(pkgs, &PkgInfo{Name: string(pkg[0]), Arch: osinfo.NormalizeArchitecture(string(pkg[1])), RawArch: string(pkg[1]), Version: string(pkg[2]), Type: typeRPM})

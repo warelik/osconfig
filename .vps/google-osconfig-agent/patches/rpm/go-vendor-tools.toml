@@ -1,0 +1,50 @@
+[archive]
+
+[licensing]
+detector = "askalono"
+exclude_files = ["vendor/modernc.org/memory/LICENSE-LOGO"]
+
+[[licensing.licenses]]
+path = "vendor/github.com/spdx/tools-golang/LICENSE.code"
+sha256sum = "e914fb1f3927226e04b0438e0b541b3c6e3c65de4d64aa8f5cdaa803f05448fd"
+expression = "(Apache-2.0 OR GPL-2.0-or-later) AND Apache-2.0 AND GPL-2.0-only"
+
+[[licensing.licenses]]
+path = "vendor/modernc.org/sqlite/SQLITE-LICENSE"
+sha256sum = "8438c9c89b849131ead81d5435cb97fcf052df5b0b286dda8a2d4c29e6cb3fd0"
+expression = "LicenseRef-Fedora-Public-Domain"
+
+[[licensing.licenses]]
+path = "vendor/github.com/shirou/gopsutil/LICENSE"
+sha256sum = "8db64481897d4b1604821103bf9621244fa257c0a80eecb643630ae22e890289"
+expression = "BSD-3-Clause"
+
+[[licensing.licenses]]
+path = "vendor/go.yaml.in/yaml/v4/LICENSE"
+sha256sum = "4a4e095045f46875715234a884741acd2b61b88959d6f47a243ae03ef95c4e76"
+expression = "Apache-2.0 AND MIT"
+
+[[licensing.licenses]]
+path = "vendor/modernc.org/libc/LICENSE-3RD-PARTY.md"
+sha256sum = "f597097efe3d97021f89170746bd3a0fb9a8b6fb26b82043ed68a4e0283bee6c"
+expression = "MIT AND BSD-2-Clause AND BSD-3-Clause"
+
+[[licensing.licenses]]
+path = "vendor/gopkg.in/yaml.v3/LICENSE"
+sha256sum = "d18f6323b71b0b768bb5e9616e36da390fbd39369a81807cca352de4e4e6aa0b"
+expression = "MIT AND (MIT AND Apache-2.0)"
+
+[[licensing.licenses]]
+path = "vendor/github.com/cloudflare/circl/LICENSE"
+sha256sum = "b0da1764fe4d13d610b695536fc3f2ebc362482d053a1cd258e36975bc6b97a7"
+expression = "BSD-3-Clause"
+
+[[licensing.licenses]]
+path = "vendor/github.com/emirpasic/gods/LICENSE"
+sha256sum = "871b440e9b348d6b2485c72e15f1d18f4cf8ee7bb424cbcd854b6a4a772b61d8"
+expression = "BSD-2-Clause AND ISC"
+
+[[licensing.licenses]]
+path = "vendor/github.com/kevinburke/ssh_config/LICENSE"
+sha256sum = "a15a6f732df3a033a71853ce1d255bd671f00fbc537fa629b78d71baecda0ace"
+expression = "MIT"

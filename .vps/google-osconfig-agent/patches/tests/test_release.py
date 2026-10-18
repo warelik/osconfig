@@ -755,11 +755,13 @@ class PublisherPolicyDiffTests(unittest.TestCase):
             candidate = root / "candidate"
             candidate.mkdir()
             for relative in release.PACKAGE_FILES:
-                # The isolated trusted-policy suite intentionally contains only
-                # policy code and its tests.  Adoption validates candidate bytes,
-                # not the contents of the trusted checkout, so use deterministic
-                # fixtures rather than coupling this regression to package inputs.
-                payload = f"fixture for {relative}\n".encode()
+                # Keep deterministic data independent of package inputs, including
+                # a real unified diff with blank context for the whitespace guard.
+                if relative == "osconfig-inventory.patch":
+                    payload = (b"--- a/example.txt\n+++ b/example.txt\n"
+                               b"@@ -1,2 +1,2 @@\n \n-before\n+after\n")
+                else:
+                    payload = f"fixture for {relative}\n".encode()
                 if bad_ordinary_file and relative == "build-rpm.sh":
                     payload += b"# ordinary trailing whitespace \n"
                 candidate_file = candidate / Path(relative).name

@@ -669,6 +669,7 @@ class PublisherPolicyDiffTests(unittest.TestCase):
                 path = work / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("trusted policy input\n", encoding="utf-8")
+            (work / (release.PREFIX + "release.py")).chmod(0o755)
             self.git("add", "--all", cwd=work)
             self.git("commit", "-m", "trusted config", cwd=work)
             seed = self.git("rev-parse", "HEAD", cwd=work)
@@ -684,6 +685,16 @@ class PublisherPolicyDiffTests(unittest.TestCase):
                 release.policy_changes(work, seed, allowed_head),
                 [release.PREFIX + "release.py"],
             )
+
+            release_file.chmod(0o644)
+            self.git("add", "--", release.PREFIX + "release.py", cwd=work)
+            self.git("commit", "-m", "change policy mode", cwd=work)
+            mode_head = self.git("rev-parse", "HEAD", cwd=work)
+            self.git("push", "origin", f"{mode_head}:refs/heads/mode-change", cwd=work)
+            with self.assertRaisesRegex(ValueError, "cannot change policy file mode"):
+                release.policy_changes(work, seed, mode_head)
+
+            self.git("checkout", "--detach", allowed_head, cwd=work)
 
             app_patch = work / (release.PREFIX + "osconfig-inventory.patch")
             app_patch.write_text("application change\n", encoding="utf-8")

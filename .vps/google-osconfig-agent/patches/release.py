@@ -1211,10 +1211,16 @@ def policy_changes(repo_dir, config, head_sha, *, allow_empty=False):
     elif not allow_empty:
         raise ValueError("Publisher repair must change only the allowlisted policy files")
     for path in changed:
-        if not run("git", "ls-tree", "-r", head_sha, "--", path, cwd=repo_dir).startswith("100644 blob "):
+        proposed_entry = run("git", "ls-tree", "-r", head_sha, "--", path, cwd=repo_dir)
+        trusted_entry = run("git", "ls-tree", "-r", config, "--", path, cwd=repo_dir)
+        proposed_mode = proposed_entry.split(maxsplit=1)[0] if proposed_entry else ""
+        trusted_mode = trusted_entry.split(maxsplit=1)[0] if trusted_entry else ""
+        if proposed_mode not in {"100644", "100755"}:
             raise ValueError(f"Publisher repair path is not a regular tracked file: {path}")
-        if not run("git", "ls-tree", "-r", config, "--", path, cwd=repo_dir).startswith("100644 blob "):
+        if trusted_mode not in {"100644", "100755"}:
             raise ValueError(f"Publisher repair cannot add or replace an untracked policy file: {path}")
+        if proposed_mode != trusted_mode:
+            raise ValueError(f"Publisher repair cannot change policy file mode: {path}")
     return changed
 
 

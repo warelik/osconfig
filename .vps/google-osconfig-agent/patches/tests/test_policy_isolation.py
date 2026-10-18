@@ -779,6 +779,8 @@ class PolicyGateIsolationTests(unittest.TestCase):
                 "PyYAML==6.0.3 --hash=sha256:" + "a" * 64 + "\n", encoding="utf-8",
             )
             (trusted / release.PREFIX / "release.py").write_text("# trusted fixture\n", encoding="utf-8")
+            trusted_package_input = trusted / release.PREFIX / "build-rpm.sh"
+            trusted_package_input.write_text("#!/bin/sh\n", encoding="utf-8")
             (trusted_tests / "test_release.py").write_text("# trusted test fixture\n", encoding="utf-8")
             (trusted_tests / "test_policy_isolation.py").write_text("# trusted isolation fixture\n", encoding="utf-8")
             (trusted / release.REPOSITORY_CONF).parent.mkdir(parents=True, exist_ok=True)
@@ -797,11 +799,18 @@ class PolicyGateIsolationTests(unittest.TestCase):
             commands = []
             container_host_environments = []
             requested_requirements = []
+            isolated_package_inputs = []
 
             def completed(command, **kwargs):
                 commands.append(command)
                 if command and command[0].endswith("/docker") and command[1] == "run":
                     container_host_environments.append(kwargs["env"])
+                    if "-c" in command:
+                        mount = next(value for value in command if value.startswith("type=bind,source=")
+                                     and ",readonly" in value)
+                        isolated_root = Path(mount.split("source=", 1)[1].split(",target=", 1)[0])
+                        isolated_package_inputs.append(
+                            (isolated_root / "trusted" / release.PREFIX / "build-rpm.sh").read_bytes())
                     if "download" in command:
                         requirements_path = Path(command[command.index("-r") + 1])
                         requested_requirements.append(requirements_path.read_text(encoding="utf-8"))
@@ -824,6 +833,7 @@ class PolicyGateIsolationTests(unittest.TestCase):
                                if command[0].endswith("/docker") and command[1] == "run"]
             self.assertEqual(len(docker_commands), 3)
             self.assertEqual(len(container_host_environments), 3)
+            self.assertEqual(isolated_package_inputs, [b"#!/bin/sh\n"])
             for host_environment in container_host_environments:
                 self.assertEqual(host_environment.get("HOME"), os.environ.get("HOME"))
                 self.assertEqual(host_environment.get("XDG_DATA_HOME"), os.environ.get("XDG_DATA_HOME"))

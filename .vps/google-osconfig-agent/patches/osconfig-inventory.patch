@@ -1,14 +1,16 @@
-diff --git a/agentendpoint/agentendpoint_test.go b/agentendpoint/agentendpoint_test.go
 --- a/agentendpoint/agentendpoint_test.go
 +++ b/agentendpoint/agentendpoint_test.go
-@@ -35,4 +35,6 @@ import (
+@@ -34,7 +34,9 @@
+ 
  	agentendpoint "cloud.google.com/go/osconfig/agentendpoint/apiv1"
  	"github.com/GoogleCloudPlatform/guest-logging-go/logger"
 +	"github.com/GoogleCloudPlatform/osconfig/packages"
  	utilmocks "github.com/GoogleCloudPlatform/osconfig/util/mocks"
 +	"github.com/golang/mock/gomock"
  	"golang.org/x/oauth2/jws"
-@@ -196,7 +198,18 @@ func (s *agentEndpointServiceTestServer) StartNextTask(ctx context.Context, req
+ 	"google.golang.org/api/option"
+ 	"google.golang.org/grpc"
+@@ -196,7 +198,18 @@
  	case !s.execTaskComplete:
  		return &agentendpointpb.StartNextTaskResponse{Task: &agentendpointpb.Task{TaskType: agentendpointpb.TaskType_EXEC_STEP_TASK, TaskId: "TaskType_EXEC_STEP_TASK"}}, nil
  	case !s.patchTaskComplete:
@@ -28,42 +30,33 @@ diff --git a/agentendpoint/agentendpoint_test.go b/agentendpoint/agentendpoint_t
  	case !s.applyConfigTaskComplete:
  		return &agentendpointpb.StartNextTaskResponse{Task: &agentendpointpb.Task{TaskType: agentendpointpb.TaskType_APPLY_CONFIG_TASK, TaskId: "TaskType_APPLY_CONFIG_TASK"}}, nil
  	default:
-@@ -252,2 +265,19 @@ func TestWaitForTask(t *testing.T) {
+@@ -250,6 +263,23 @@
+ }
+ 
  func TestWaitForTask(t *testing.T) {
 +	previousRunner := packages.GetCommandRunner()
 +	previousPtyRunner := packages.GetPtyCommandRunner()
-+	previousRebootProbe := systemRebootRequired
++	previousAptExists := packages.AptExists
 +	mockController := gomock.NewController(t)
 +	runner := utilmocks.NewMockCommandRunner(mockController)
 +	ptyRunner := utilmocks.NewMockCommandRunner(mockController)
-+	// Keep this RPC-loop test from invoking host package-manager or reboot-probe commands.
++	// Use the existing Debian-detection test seam to avoid host RPM probe commands.
 +	runner.EXPECT().Run(gomock.Any(), gomock.Any()).Return(nil, nil, nil).AnyTimes()
 +	ptyRunner.EXPECT().Run(gomock.Any(), gomock.Any()).Return(nil, nil, nil).AnyTimes()
 +	packages.SetCommandRunner(runner)
 +	packages.SetPtyCommandRunner(ptyRunner)
-+	systemRebootRequired = func(context.Context) (bool, error) { return false, nil }
++	packages.AptExists = true
 +	t.Cleanup(func() {
 +		packages.SetCommandRunner(previousRunner)
 +		packages.SetPtyCommandRunner(previousPtyRunner)
-+		systemRebootRequired = previousRebootProbe
++		packages.AptExists = previousAptExists
 +	})
  	ctx := context.Background()
-diff --git a/agentendpoint/patch_task.go b/agentendpoint/patch_task.go
---- a/agentendpoint/patch_task.go
-+++ b/agentendpoint/patch_task.go
-@@ -30,5 +30,3 @@
--func systemRebootRequired(ctx context.Context) (bool, error) {
--	return ospatch.SystemRebootRequired(ctx)
--}
--
-+var systemRebootRequired = ospatch.SystemRebootRequired
-+
- type patchStep string
-diff --git a/agentendpoint/inventory.go b/agentendpoint/inventory.go
-index b4af6b0..9620638 100644
+ 	srv := newAgentEndpointServiceTestServer()
+ 	tc, err := newTestClient(ctx, srv)
 --- a/agentendpoint/inventory.go
 +++ b/agentendpoint/inventory.go
-@@ -606,10 +606,14 @@ func formatGooGetPackage(pkg *packages.PkgInfo) *agentendpointpb.Inventory_Softw
+@@ -606,10 +606,14 @@
  }
  
  func formatYumPackage(pkg *packages.PkgInfo) *agentendpointpb.Inventory_SoftwarePackage_YumPackage {
@@ -79,11 +72,9 @@ index b4af6b0..9620638 100644
  			Version:      pkg.Version,
  		},
  	}
-diff --git a/agentendpoint/inventory_test.go b/agentendpoint/inventory_test.go
-index 57b1ad0..c0b3a21 100644
 --- a/agentendpoint/inventory_test.go
 +++ b/agentendpoint/inventory_test.go
-@@ -26,10 +26,13 @@ import (
+@@ -26,10 +26,13 @@
  	"net/http"
  	"net/http/httptest"
  	"reflect"
@@ -97,7 +88,7 @@ index 57b1ad0..c0b3a21 100644
  	"github.com/GoogleCloudPlatform/osconfig/packages"
  	utilmocks "github.com/GoogleCloudPlatform/osconfig/util/mocks"
  	"github.com/GoogleCloudPlatform/osconfig/util/utiltest"
-@@ -38,6 +41,7 @@ import (
+@@ -38,6 +41,7 @@
  	"github.com/googleapis/gax-go/v2"
  	"google.golang.org/grpc/codes"
  	"google.golang.org/grpc/status"
@@ -105,7 +96,7 @@ index 57b1ad0..c0b3a21 100644
  	"google.golang.org/protobuf/testing/protocmp"
  	"google.golang.org/protobuf/types/known/structpb"
  	"google.golang.org/protobuf/types/known/timestamppb"
-@@ -620,6 +624,98 @@ func TestReport(t *testing.T) {
+@@ -620,6 +624,98 @@
  	}
  }
  
@@ -204,7 +195,7 @@ index 57b1ad0..c0b3a21 100644
  func TestReportVmInventory(t *testing.T) {
  	ctx := context.Background()
  	ctrl := gomock.NewController(t)
-@@ -917,3 +1013,10 @@ func Test_reportVmInventory_parseQFEDate(t *testing.T) {
+@@ -917,3 +1013,10 @@
  		})
  	}
  }
@@ -215,11 +206,9 @@ index 57b1ad0..c0b3a21 100644
 +		t.Errorf("formatYumPackage() architecture = %q, want noarch", got.YumPackage.GetArchitecture())
 +	}
 +}
-diff --git a/packages/packages_linux.go b/packages/packages_linux.go
-index bf8d7a1..4a2a5e1 100644
 --- a/packages/packages_linux.go
 +++ b/packages/packages_linux.go
-@@ -228,8 +228,12 @@ func enrichDebPkgInfoWithPurl(pkgs []*PkgInfo, shortname string, version string)
+@@ -228,8 +228,12 @@
  
  func enrichRpmPkgInfoWithPurl(pkgs []*PkgInfo, shortname string, version string) []*PkgInfo {
  	for i, pkg := range pkgs {
@@ -233,11 +222,9 @@ index bf8d7a1..4a2a5e1 100644
  			"distro": version, // For RPM, accepted distro format is version (eg. distro=9.1)
  		}
  		pkgs[i].Purl = packageurl.NewPackageURL(pkg.Type, shortname, pkg.Name, pkg.Version, packageurl.QualifiersFromMap(qualifiersMap), "").ToString()
-diff --git a/packages/yum.go b/packages/yum.go
-index ee87694..63ff930 100644
 --- a/packages/yum.go
 +++ b/packages/yum.go
-@@ -131,11 +131,12 @@ func parseYumUpdates(data []byte) []*PkgInfo {
+@@ -131,11 +131,12 @@
  		} else if !upgrading {
  			continue
  		}
@@ -254,11 +241,9 @@ index ee87694..63ff930 100644
  			break
  		}
  
-diff --git a/packages/yum_test.go b/packages/yum_test.go
-index 300b27d..3eab3a0 100644
 --- a/packages/yum_test.go
 +++ b/packages/yum_test.go
-@@ -93,6 +93,8 @@ func TestYumUpdates(t *testing.T) {
+@@ -93,6 +93,8 @@
      kernel                                    x86_64                         2.6.32-754.24.3.el6                                  updates                                   32 M
  	    replacing kernel.x86_64 1.0.0-4
  	Upgrading:

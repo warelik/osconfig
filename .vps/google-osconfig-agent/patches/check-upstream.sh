@@ -11,7 +11,7 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/google-osconfig-agent-upstream.XXXXXX") || {
 cleanup() { rm -rf -- "$work"; }
 trap cleanup EXIT
 
-for command_name in git go gofmt; do
+for command_name in git patch go gofmt; do
     command -v "$command_name" >/dev/null 2>&1 || {
         echo "Missing command: $command_name" >&2
         exit 1
@@ -30,9 +30,9 @@ else
 fi
 (
     cd -- "$source_dir"
-    git apply --check "$patch_file"
-    git apply "$patch_file"
-    gofmt -w packages/packages_linux.go packages/yum.go packages/yum_test.go agentendpoint/inventory.go agentendpoint/inventory_test.go agentendpoint/agentendpoint_test.go agentendpoint/patch_task.go
+    patch --dry-run --fuzz=0 -p1 -i "$patch_file"
+    patch --fuzz=0 -p1 -i "$patch_file"
+    gofmt -w packages/packages_linux.go packages/yum.go packages/yum_test.go agentendpoint/inventory.go agentendpoint/inventory_test.go agentendpoint/agentendpoint_test.go
     go test -count=1 -timeout=5m ./packages ./agentendpoint
 )
 printf '%s\n' 'PASS: pinned Google OS Config inventory patch and regression tests'

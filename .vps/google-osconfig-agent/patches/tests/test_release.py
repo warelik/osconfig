@@ -3,7 +3,6 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-import shlex
 import subprocess
 import sys
 import tempfile
@@ -207,40 +206,49 @@ class SigningWorkflowTrustTests(unittest.TestCase):
     def test_candidate_workflow_uses_trusted_checkout_signer_and_regression(self):
         release.validate_signing_workflow(self.workflow_path())
 
-    def test_publish_and_adopt_verify_downloaded_repository_layout(self):
+    def test_publish_and_adopt_verify_the_real_signed_artifact_layout(self):
         document = release.yaml_module().safe_load(self.workflow_path().read_text(encoding="utf-8"))
-        for job_name, release_command in (("publish", "verify"), ("adopt", "adopt")):
-            steps = document["jobs"][job_name]["steps"]
-            pages_download = next(
-                step for step in steps
-                if step.get("with", {}).get("name") == "google-osconfig-agent-pages"
-            )
-            self.assertEqual(
-                pages_download["with"]["path"], "${{ runner.temp }}/osconfig-pages/rpm"
-            )
-            verifier = next(step for step in steps if "verify-repo.sh" in step.get("run", ""))
-            command = verifier["run"]
-            self.assertIn("sudo apt-get install -y gnupg rpm", command)
-            self.assertIn("verify-repo.sh \\\n", command)
-            self.assertIn(f"release.py {release_command} \\\n", command)
-            lines = [line.strip() for line in command.splitlines()]
-            self.assertIn(
-                '"$RUNNER_TEMP/osconfig-candidate" "$RUNNER_TEMP/osconfig-pages"', lines
-            )
-            self.assertIn(
-                '"$RUNNER_TEMP/osconfig-candidate" "$RUNNER_TEMP/osconfig-pages/rpm"', lines
-            )
-            self.assertEqual(
-                verifier["env"],
-                {
-                    "GH_TOKEN": "${{ github.token }}",
-                    "OSCONFIG_RPM_SIGNING_FINGERPRINT":
-                        "${{ vars.OSCONFIG_RPM_SIGNING_FINGERPRINT }}",
-                    "EXPECTED_CANDIDATE_SHA": "${{ needs.prepare.outputs.sha }}",
-                    "EXPECTED_UPSTREAM_SHA": "${{ needs.prepare.outputs.upstream }}",
-                    "EXPECTED_PATCH_SHA": "${{ needs.prepare.outputs.patch }}",
-                },
-            )
+        for job_name, operation in (("publish", "verify"), ("adopt", "adopt")):
+            with self.subTest(job=job_name):
+                steps = document["jobs"][job_name]["steps"]
+                downloads = {
+                    (step.get("with", {}).get("name"), step.get("with", {}).get("path"))
+                    for step in steps if str(step.get("uses", "")).startswith("actions/download-artifact@")
+                }
+                self.assertIn(
+                    ("google-osconfig-agent-pages", "${{ runner.temp }}/osconfig-pages/rpm"),
+                    downloads,
+                )
+                self.assertIn(
+                    ("google-osconfig-agent-built-rpm", "${{ runner.temp }}/osconfig-built"),
+                    downloads,
+                )
+                verifier = next(
+                    step for step in steps if f"release.py {operation}" in step.get("run", "")
+                )
+                self.assertEqual(
+                    {
+                        key: verifier["env"][key]
+                        for key in ("EXPECTED_CANDIDATE_SHA", "EXPECTED_UPSTREAM_SHA", "EXPECTED_PATCH_SHA")
+                    },
+                    {
+                        "EXPECTED_CANDIDATE_SHA": "${{ needs.prepare.outputs.sha }}",
+                        "EXPECTED_UPSTREAM_SHA": "${{ needs.prepare.outputs.upstream }}",
+                        "EXPECTED_PATCH_SHA": "${{ needs.prepare.outputs.patch }}",
+                    },
+                )
+                command = verifier["run"]
+                self.assertIn("sudo apt-get install -y gnupg jq rpm", command)
+                self.assertIn(
+                    "bash .vps/google-osconfig-agent/patches/verify-repo.sh \\\n"
+                    '  "$RUNNER_TEMP/osconfig-built" "$RUNNER_TEMP/osconfig-pages"',
+                    command,
+                )
+                self.assertIn(f"release.py {operation} \\\n", command)
+                self.assertIn(
+                    '  "$RUNNER_TEMP/osconfig-candidate" "$RUNNER_TEMP/osconfig-pages/rpm"',
+                    command,
+                )
 
     def test_signing_job_can_update_runner_image_and_build_tool_packages(self):
         with tempfile.TemporaryDirectory() as temporary:

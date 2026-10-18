@@ -1929,7 +1929,8 @@ def adopt(candidate_dir, pages_dir):
             source = candidate_dir / Path(relative).name
             target = work / PREFIX / relative
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, target)
+            shutil.copyfile(source, target)
+            target.chmod(0o755 if relative.endswith(".sh") else 0o644)
         (work / REPOSITORY_CONF).write_bytes(expected_conf_bytes)
         paths = [PATCH_REL, REPOSITORY_CONF]
         paths.extend(PREFIX + relative for relative in PACKAGE_FILES)

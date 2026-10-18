@@ -727,14 +727,14 @@ class PublisherPolicyDiffTests(unittest.TestCase):
             with self.assertRaises(subprocess.CalledProcessError):
                 release.check_cached_whitespace(work)
 
-    def test_adopt_uses_cached_whitespace_check_for_nested_patch(self):
+    def test_adopt_uses_cached_whitespace_check_and_declared_package_modes(self):
         package_evr = next(
             line.partition("=")[2]
             for line in (release.ROOT / release.REPOSITORY_CONF).read_text(encoding="utf-8").splitlines()
             if line.startswith("minimum_evr=")
         )
 
-        def run_adoption(root, *, bad_ordinary_file):
+        def run_adoption(root, *, bad_ordinary_file, base_script_mode):
             remote, seed = root / "origin.git", root / "seed"
             self.git("init", "--bare", "--initial-branch=master", str(remote), cwd=root)
             self.git("init", "--initial-branch=master", str(seed), cwd=root)
@@ -743,6 +743,10 @@ class PublisherPolicyDiffTests(unittest.TestCase):
             repository_conf = seed / release.REPOSITORY_CONF
             repository_conf.parent.mkdir(parents=True)
             repository_conf.write_bytes((release.ROOT / release.REPOSITORY_CONF).read_bytes())
+            base_script = seed / release.PREFIX / "check-upstream.sh"
+            base_script.parent.mkdir(parents=True, exist_ok=True)
+            base_script.write_bytes(b"#!/usr/bin/env bash\n")
+            base_script.chmod(base_script_mode)
             self.git("add", "--all", cwd=seed)
             self.git("commit", "-m", "trusted base", cwd=seed)
             config_sha = self.git("rev-parse", "HEAD", cwd=seed)
@@ -755,7 +759,10 @@ class PublisherPolicyDiffTests(unittest.TestCase):
                 payload = source.read_bytes()
                 if bad_ordinary_file and relative == "build-rpm.sh":
                     payload += b"# ordinary trailing whitespace \n"
-                (candidate / Path(relative).name).write_bytes(payload)
+                candidate_file = candidate / Path(relative).name
+                candidate_file.write_bytes(payload)
+                candidate_file.chmod(0o644)
+            self.assertEqual((candidate / "check-upstream.sh").stat().st_mode & 0o777, 0o644)
 
             manifest = {"configSha": config_sha, "candidatePr": 42}
             settings = {"minimum_evr": package_evr}
@@ -786,19 +793,34 @@ class PublisherPolicyDiffTests(unittest.TestCase):
                 else:
                     release.adopt(candidate, root / "pages")
             self.assertEqual(whitespace_check.call_count, 1)
-            return config_sha, self.git("--git-dir", str(remote), "rev-parse", "refs/heads/master",
-                                        cwd=root)
+            adopted_sha = self.git("--git-dir", str(remote), "rev-parse", "refs/heads/master",
+                                   cwd=root)
+            if bad_ordinary_file:
+                return config_sha, adopted_sha, None, None
 
-        with tempfile.TemporaryDirectory(prefix="osconfig-adopt-whitespace-positive-") as temporary:
-            root = Path(temporary)
-            base_sha, adopted_sha = run_adoption(root, bad_ordinary_file=False)
-            self.assertNotEqual(adopted_sha, base_sha)
-            self.assertEqual(self.git("--git-dir", str(root / "origin.git"), "show", "-s",
-                                      "--format=%P", adopted_sha, cwd=root), base_sha)
+            def tree_mode(relative):
+                entry = self.git("--git-dir", str(remote), "ls-tree", "-r", adopted_sha,
+                                 "--", release.PREFIX + relative, cwd=root)
+                return entry.split(maxsplit=1)[0]
+
+            return config_sha, adopted_sha, tree_mode("check-upstream.sh"), tree_mode("source.lock")
+
+        for base_script_mode in (0o755, 0o644):
+            with self.subTest(base_script_mode=oct(base_script_mode)), \
+                 tempfile.TemporaryDirectory(prefix="osconfig-adopt-whitespace-positive-") as temporary:
+                root = Path(temporary)
+                base_sha, adopted_sha, script_mode, data_mode = run_adoption(
+                    root, bad_ordinary_file=False, base_script_mode=base_script_mode)
+                self.assertNotEqual(adopted_sha, base_sha)
+                self.assertEqual(self.git("--git-dir", str(root / "origin.git"), "show", "-s",
+                                          "--format=%P", adopted_sha, cwd=root), base_sha)
+                self.assertEqual(script_mode, "100755")
+                self.assertEqual(data_mode, "100644")
 
         with tempfile.TemporaryDirectory(prefix="osconfig-adopt-whitespace-negative-") as temporary:
             root = Path(temporary)
-            base_sha, adopted_sha = run_adoption(root, bad_ordinary_file=True)
+            base_sha, adopted_sha, _, _ = run_adoption(
+                root, bad_ordinary_file=True, base_script_mode=0o755)
             self.assertEqual(adopted_sha, base_sha)
 
     def test_exact_git_diff_accepts_only_regular_policy_files(self):

@@ -826,7 +826,7 @@ class PolicyGateIsolationTests(unittest.TestCase):
             self.assertEqual(len(container_host_environments), 3)
             for host_environment in container_host_environments:
                 self.assertEqual(host_environment.get("HOME"), os.environ.get("HOME"))
-                self.assertNotIn("osconfig-policy-tests-", host_environment.get("XDG_DATA_HOME", ""))
+                self.assertEqual(host_environment.get("XDG_DATA_HOME"), os.environ.get("XDG_DATA_HOME"))
             self.assertNotIn(str(candidate), " ".join(docker_commands[0]))
             download = next(command for command in docker_commands if "download" in command)
             self.assertIn("https://pypi.org/simple", download)

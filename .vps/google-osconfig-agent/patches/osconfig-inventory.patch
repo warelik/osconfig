@@ -1,0 +1,269 @@
+diff --git a/agentendpoint/agentendpoint_test.go b/agentendpoint/agentendpoint_test.go
+--- a/agentendpoint/agentendpoint_test.go
++++ b/agentendpoint/agentendpoint_test.go
+@@ -35,4 +35,6 @@ import (
+ 	agentendpoint "cloud.google.com/go/osconfig/agentendpoint/apiv1"
+ 	"github.com/GoogleCloudPlatform/guest-logging-go/logger"
++	"github.com/GoogleCloudPlatform/osconfig/packages"
+ 	utilmocks "github.com/GoogleCloudPlatform/osconfig/util/mocks"
++	"github.com/golang/mock/gomock"
+ 	"golang.org/x/oauth2/jws"
+@@ -196,7 +198,18 @@ func (s *agentEndpointServiceTestServer) StartNextTask(ctx context.Context, req
+ 	case !s.execTaskComplete:
+ 		return &agentendpointpb.StartNextTaskResponse{Task: &agentendpointpb.Task{TaskType: agentendpointpb.TaskType_EXEC_STEP_TASK, TaskId: "TaskType_EXEC_STEP_TASK"}}, nil
+ 	case !s.patchTaskComplete:
+-		return &agentendpointpb.StartNextTaskResponse{Task: &agentendpointpb.Task{TaskType: agentendpointpb.TaskType_APPLY_PATCHES, TaskId: "TaskType_APPLY_PATCHES"}}, nil
++		return &agentendpointpb.StartNextTaskResponse{Task: &agentendpointpb.Task{
++			TaskType: agentendpointpb.TaskType_APPLY_PATCHES,
++			TaskId:   "TaskType_APPLY_PATCHES",
++			TaskDetails: &agentendpointpb.Task_ApplyPatchesTask{
++				ApplyPatchesTask: &agentendpointpb.ApplyPatchesTask{
++					DryRun: true,
++					PatchConfig: &agentendpointpb.PatchConfig{
++						RebootConfig: agentendpointpb.PatchConfig_NEVER,
++					},
++				},
++			},
++		}}, nil
+ 	case !s.applyConfigTaskComplete:
+ 		return &agentendpointpb.StartNextTaskResponse{Task: &agentendpointpb.Task{TaskType: agentendpointpb.TaskType_APPLY_CONFIG_TASK, TaskId: "TaskType_APPLY_CONFIG_TASK"}}, nil
+ 	default:
+@@ -252,2 +265,19 @@ func TestWaitForTask(t *testing.T) {
+ func TestWaitForTask(t *testing.T) {
++	previousRunner := packages.GetCommandRunner()
++	previousPtyRunner := packages.GetPtyCommandRunner()
++	previousRebootProbe := systemRebootRequired
++	mockController := gomock.NewController(t)
++	runner := utilmocks.NewMockCommandRunner(mockController)
++	ptyRunner := utilmocks.NewMockCommandRunner(mockController)
++	// Keep this RPC-loop test from invoking host package-manager or reboot-probe commands.
++	runner.EXPECT().Run(gomock.Any(), gomock.Any()).Return(nil, nil, nil).AnyTimes()
++	ptyRunner.EXPECT().Run(gomock.Any(), gomock.Any()).Return(nil, nil, nil).AnyTimes()
++	packages.SetCommandRunner(runner)
++	packages.SetPtyCommandRunner(ptyRunner)
++	systemRebootRequired = func(context.Context) (bool, error) { return false, nil }
++	t.Cleanup(func() {
++		packages.SetCommandRunner(previousRunner)
++		packages.SetPtyCommandRunner(previousPtyRunner)
++		systemRebootRequired = previousRebootProbe
++	})
+ 	ctx := context.Background()
+diff --git a/agentendpoint/patch_task.go b/agentendpoint/patch_task.go
+--- a/agentendpoint/patch_task.go
++++ b/agentendpoint/patch_task.go
+@@ -30,5 +30,3 @@
+-func systemRebootRequired(ctx context.Context) (bool, error) {
+-	return ospatch.SystemRebootRequired(ctx)
+-}
+-
++var systemRebootRequired = ospatch.SystemRebootRequired
++
+ type patchStep string
+diff --git a/agentendpoint/inventory.go b/agentendpoint/inventory.go
+index b4af6b0..9620638 100644
+--- a/agentendpoint/inventory.go
++++ b/agentendpoint/inventory.go
+@@ -606,10 +606,14 @@ func formatGooGetPackage(pkg *packages.PkgInfo) *agentendpointpb.Inventory_Softw
+ }
+ 
+ func formatYumPackage(pkg *packages.PkgInfo) *agentendpointpb.Inventory_SoftwarePackage_YumPackage {
++	architecture := pkg.Arch
++	if architecture == "all" {
++		architecture = "noarch"
++	}
+ 	fPkg := &agentendpointpb.Inventory_SoftwarePackage_YumPackage{
+ 		YumPackage: &agentendpointpb.Inventory_VersionedPackage{
+ 			PackageName:  pkg.Name,
+-			Architecture: pkg.Arch,
++			Architecture: architecture,
+ 			Version:      pkg.Version,
+ 		},
+ 	}
+diff --git a/agentendpoint/inventory_test.go b/agentendpoint/inventory_test.go
+index 57b1ad0..c0b3a21 100644
+--- a/agentendpoint/inventory_test.go
++++ b/agentendpoint/inventory_test.go
+@@ -26,10 +26,13 @@ import (
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"reflect"
++	"runtime"
++	"strings"
+ 	"testing"
+ 	"time"
+ 
+ 	"github.com/GoogleCloudPlatform/osconfig/inventory"
++	"github.com/GoogleCloudPlatform/osconfig/osinfo"
+ 	"github.com/GoogleCloudPlatform/osconfig/packages"
+ 	utilmocks "github.com/GoogleCloudPlatform/osconfig/util/mocks"
+ 	"github.com/GoogleCloudPlatform/osconfig/util/utiltest"
+@@ -38,6 +41,7 @@ import (
+ 	"github.com/googleapis/gax-go/v2"
+ 	"google.golang.org/grpc/codes"
+ 	"google.golang.org/grpc/status"
++	"google.golang.org/protobuf/proto"
+ 	"google.golang.org/protobuf/testing/protocmp"
+ 	"google.golang.org/protobuf/types/known/structpb"
+ 	"google.golang.org/protobuf/types/known/timestamppb"
+@@ -620,6 +624,98 @@ func TestReport(t *testing.T) {
+ 	}
+ }
+ 
++type modernInventoryOSInfoProvider struct{}
++
++func (modernInventoryOSInfoProvider) GetOSInfo(context.Context) (osinfo.OSInfo, error) {
++	return osinfo.OSInfo{ShortName: "fedora", Version: "44"}, nil
++}
++
++func TestModernRPMInventoryPreservesNoarchPurl(t *testing.T) {
++	if runtime.GOOS != "linux" {
++		t.Skip("RPM package inventory is Linux-specific")
++	}
++
++	previousRunner := packages.GetCommandRunner()
++	previousRPMQueryExists := packages.RPMQueryExists
++	previousZypperExists := packages.ZypperExists
++	previousDpkgQueryExists := packages.DpkgQueryExists
++	previousCOSPkgInfoExists := packages.COSPkgInfoExists
++	previousGemExists := packages.GemExists
++	previousPipExists := packages.PipExists
++	t.Cleanup(func() {
++		packages.SetCommandRunner(previousRunner)
++		packages.RPMQueryExists = previousRPMQueryExists
++		packages.ZypperExists = previousZypperExists
++		packages.DpkgQueryExists = previousDpkgQueryExists
++		packages.COSPkgInfoExists = previousCOSPkgInfoExists
++		packages.GemExists = previousGemExists
++		packages.PipExists = previousPipExists
++	})
++	packages.RPMQueryExists = true
++	packages.ZypperExists = false
++	packages.DpkgQueryExists = false
++	packages.COSPkgInfoExists = false
++	packages.GemExists = false
++	packages.PipExists = false
++
++	runner := utilmocks.NewMockCommandRunner(gomock.NewController(t))
++	runner.EXPECT().Run(gomock.Any(), gomock.Any()).Return([]byte(
++		`{"architecture":"noarch","package":"golang-src","source_name":"golang-1.22.3-1.fc44.src.rpm","version":"0:1.22.3-1.fc44"}`+"\n"+
++			`{"architecture":"x86_64","package":"kernel-tools","source_name":"kernel-6.11.0-1.fc44.src.rpm","version":"0:6.11.0-1.fc44"}`+"\n"), nil, nil).Times(1)
++	packages.SetCommandRunner(runner)
++
++	ctx := context.Background()
++	installed, err := packages.NewInstalledPackagesProvider(modernInventoryOSInfoProvider{}).GetInstalledPackages(ctx)
++	if err != nil {
++		t.Fatalf("GetInstalledPackages() error = %v", err)
++	}
++	if len(installed.Rpm) != 2 {
++		t.Fatalf("GetInstalledPackages() returned %d RPMs, want 2", len(installed.Rpm))
++	}
++	internalArchitecture := make(map[string]string, len(installed.Rpm))
++	for _, pkg := range installed.Rpm {
++		internalArchitecture[pkg.Name] = pkg.Arch
++	}
++	if internalArchitecture["golang-src"] != "all" {
++		t.Errorf("normalized noarch RPM Arch = %q, want internal value all", internalArchitecture["golang-src"])
++	}
++	if internalArchitecture["kernel-tools"] != "x86_64" {
++		t.Errorf("x86_64 RPM Arch = %q, want x86_64", internalArchitecture["kernel-tools"])
++	}
++
++	vmInventory := formatVMInventory(ctx, &inventory.InstanceInventory{
++		ShortName:         "fedora",
++		Version:           "44",
++		InstalledPackages: &installed,
++	})
++	wire, err := proto.Marshal(vmInventory)
++	if err != nil {
++		t.Fatalf("proto.Marshal(VmInventory) error = %v", err)
++	}
++	serialized := &agentendpointpb.VmInventory{}
++	if err := proto.Unmarshal(wire, serialized); err != nil {
++		t.Fatalf("proto.Unmarshal(VmInventory) error = %v", err)
++	}
++
++	wantArchitecture := map[string]string{
++		"golang-src":   "noarch",
++		"kernel-tools": "x86_64",
++	}
++	for _, item := range serialized.GetInstalledPackages() {
++		want, ok := wantArchitecture[item.GetName()]
++		if !ok {
++			continue
++		}
++		if !strings.Contains(item.GetPurl(), "?arch="+want+"&distro=44") {
++			t.Errorf("modern inventory PURL for %s = %q, want arch=%s", item.GetName(), item.GetPurl(), want)
++		}
++		delete(wantArchitecture, item.GetName())
++	}
++	if len(wantArchitecture) != 0 {
++		t.Errorf("modern inventory omitted RPMs: %v", wantArchitecture)
++	}
++}
++
+ func TestReportVmInventory(t *testing.T) {
+ 	ctx := context.Background()
+ 	ctrl := gomock.NewController(t)
+@@ -917,3 +1013,10 @@ func Test_reportVmInventory_parseQFEDate(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestFormatYumPackagePreservesNoarch(t *testing.T) {
++	got := formatYumPackage(&packages.PkgInfo{Name: "golang-src", Arch: "all", Type: "rpm"})
++	if got.YumPackage.GetArchitecture() != "noarch" {
++		t.Errorf("formatYumPackage() architecture = %q, want noarch", got.YumPackage.GetArchitecture())
++	}
++}
+diff --git a/packages/packages_linux.go b/packages/packages_linux.go
+index bf8d7a1..4a2a5e1 100644
+--- a/packages/packages_linux.go
++++ b/packages/packages_linux.go
+@@ -228,8 +228,12 @@ func enrichDebPkgInfoWithPurl(pkgs []*PkgInfo, shortname string, version string)
+ 
+ func enrichRpmPkgInfoWithPurl(pkgs []*PkgInfo, shortname string, version string) []*PkgInfo {
+ 	for i, pkg := range pkgs {
++		purlArch := pkg.Arch
++		if purlArch == noarch {
++			purlArch = "noarch"
++		}
+ 		qualifiersMap := map[string]string{
+-			"arch":   pkg.Arch,
++			"arch":   purlArch,
+ 			"distro": version, // For RPM, accepted distro format is version (eg. distro=9.1)
+ 		}
+ 		pkgs[i].Purl = packageurl.NewPackageURL(pkg.Type, shortname, pkg.Name, pkg.Version, packageurl.QualifiersFromMap(qualifiersMap), "").ToString()
+diff --git a/packages/yum.go b/packages/yum.go
+index ee87694..63ff930 100644
+--- a/packages/yum.go
++++ b/packages/yum.go
+@@ -131,11 +131,12 @@ func parseYumUpdates(data []byte) []*PkgInfo {
+ 		} else if !upgrading {
+ 			continue
+ 		}
+-		// A package line should have 6 fields, break unless this is a 'replacing' entry.
++		// DNF5 can render replacement rows with the same number of columns as a package update.
++		if string(pkg[0]) == "replacing" {
++			continue
++		}
++		// A package line should have 6 fields; shorter rows end the update list.
+ 		if len(pkg) < 6 {
+-			if string(pkg[0]) == "replacing" {
+-				continue
+-			}
+ 			break
+ 		}
+ 
+diff --git a/packages/yum_test.go b/packages/yum_test.go
+index 300b27d..3eab3a0 100644
+--- a/packages/yum_test.go
++++ b/packages/yum_test.go
+@@ -93,6 +93,8 @@ func TestYumUpdates(t *testing.T) {
+     kernel                                    x86_64                         2.6.32-754.24.3.el6                                  updates                                   32 M
+ 	    replacing kernel.x86_64 1.0.0-4
+ 	Upgrading:
++	  replacing                               x86_64                         x86_64                                              updates                                   1 M
++	  replacing                               x86_64                         noarch                                              updates                                   1 M
+ 	  foo                                       noarch                         2.0.0-1                                              BaseOS                                   361 k
+ 	  bar                                       x86_64                         2.0.0-1                                              repo                                      10 M
+ 	Obsoleting:

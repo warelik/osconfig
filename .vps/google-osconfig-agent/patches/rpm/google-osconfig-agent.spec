@@ -1,10 +1,14 @@
 # Downstream package containing only the OS Config inventory repair.
+# Keep RPM %prep aligned with strict GNU patch --fuzz=0 checks.
+%global _default_patch_fuzz 0
 %global goipath         github.com/GoogleCloudPlatform/osconfig
 Version:                %{upstream_version}
 %global tag             %{upstream_version}
 %gometa -L -f
 
 Name:           google-osconfig-agent
+# Fedora 44 follows the official Epoch 0 package baseline.
+Epoch:          0
 Release:        %{vps_release}%{?dist}
 Summary:        Google OS Config Agent with inventory corrections
 
@@ -35,6 +39,7 @@ rm -rf examples e2e_tests
 
 %build
 %global gomodulesmode GO111MODULE=on
+LDFLAGS="${LDFLAGS:+${LDFLAGS} }-X main.version=%{version}-%{release}"
 %gobuild -o %{gobuilddir}/bin/google_osconfig_agent %{goipath}
 
 %install

@@ -9,7 +9,7 @@ output=${2:-}
     echo 'Usage: build-rpm.sh /absolute/candidate-directory /absolute/output-directory' >&2
     exit 2
 }
-for command_name in go rpmbuild sha256sum tar mkdir mktemp rm cp rpm git gofmt jq; do
+for command_name in go rpmbuild sha256sum tar mkdir mktemp rm cp rpm patch gofmt jq; do
     command -v "$command_name" >/dev/null 2>&1 || {
         echo "Missing RPM build command: $command_name" >&2
         exit 1
@@ -64,8 +64,8 @@ mkdir "$source_dir"
 tar -xzf "$archive" --strip-components=1 -C "$source_dir"
 patched_dir=$work/osconfig-$tag-patched
 cp -a -- "$source_dir" "$patched_dir"
-git -C "$patched_dir" apply --check "$patch_file"
-git -C "$patched_dir" apply "$patch_file"
+patch --dry-run --fuzz=0 -p1 -d "$patched_dir" -i "$patch_file"
+patch --fuzz=0 -p1 -d "$patched_dir" -i "$patch_file"
 gofmt -w "$patched_dir/packages/yum.go" "$patched_dir/packages/yum_test.go" \
     "$patched_dir/agentendpoint/inventory.go" "$patched_dir/agentendpoint/inventory_test.go" \
     "$patched_dir/agentendpoint/agentendpoint_test.go"

@@ -489,14 +489,21 @@ jobs:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: google-osconfig-agent-pages
-          path: ${{ runner.temp }}/osconfig-pages
+          path: ${{ runner.temp }}/osconfig-pages/rpm
       - name: Recheck exact review and signed repository before publication
         env:
           GH_TOKEN: ${{ github.token }}
           OSCONFIG_RPM_SIGNING_FINGERPRINT: ${{ vars.OSCONFIG_RPM_SIGNING_FINGERPRINT }}
+          EXPECTED_CANDIDATE_SHA: ${{ needs.prepare.outputs.sha }}
+          EXPECTED_UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream }}
+          EXPECTED_PATCH_SHA: ${{ needs.prepare.outputs.patch }}
         run: |
-          python3 -B .vps/google-osconfig-agent/patches/release.py verify \
+          sudo apt-get update
+          sudo apt-get install -y gnupg rpm
+          bash .vps/google-osconfig-agent/patches/verify-repo.sh \
             "$RUNNER_TEMP/osconfig-candidate" "$RUNNER_TEMP/osconfig-pages"
+          python3 -B .vps/google-osconfig-agent/patches/release.py verify \
+            "$RUNNER_TEMP/osconfig-candidate" "$RUNNER_TEMP/osconfig-pages/rpm"
       - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5.0.0
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -530,13 +537,18 @@ jobs:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: google-osconfig-agent-pages
-          path: ${{ runner.temp }}/osconfig-pages
+          path: ${{ runner.temp }}/osconfig-pages/rpm
       - name: Verify publication and persist the exact source, patch and required EVR
         env:
           GH_TOKEN: ${{ github.token }}
           OSCONFIG_RPM_SIGNING_FINGERPRINT: ${{ vars.OSCONFIG_RPM_SIGNING_FINGERPRINT }}
+          EXPECTED_CANDIDATE_SHA: ${{ needs.prepare.outputs.sha }}
+          EXPECTED_UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream }}
+          EXPECTED_PATCH_SHA: ${{ needs.prepare.outputs.patch }}
         run: |
           sudo apt-get update
-          sudo apt-get install -y gnupg
-          python3 -B .vps/google-osconfig-agent/patches/release.py adopt \
+          sudo apt-get install -y gnupg rpm
+          bash .vps/google-osconfig-agent/patches/verify-repo.sh \
             "$RUNNER_TEMP/osconfig-candidate" "$RUNNER_TEMP/osconfig-pages"
+          python3 -B .vps/google-osconfig-agent/patches/release.py adopt \
+            "$RUNNER_TEMP/osconfig-candidate" "$RUNNER_TEMP/osconfig-pages/rpm"

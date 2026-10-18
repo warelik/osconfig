@@ -56,7 +56,54 @@
  	tc, err := newTestClient(ctx, srv)
 --- a/agentendpoint/inventory.go
 +++ b/agentendpoint/inventory.go
-@@ -606,10 +606,14 @@
+@@ -75,15 +75,22 @@
+ 	clog.Debugf(ctx, "Reporting instance inventory to agent endpoint.")
+ 	inventory := formatInventory(ctx, state)
+ 	vmInventory := formatVMInventory(ctx, state)
++	legacyComplete := len(inventory.GetInstalledPackages()) == len(vmInventory.GetInstalledPackages()) &&
++		len(inventory.GetAvailablePackages()) == len(vmInventory.GetAvailablePackages())
++	useLegacyAPI := legacyComplete && hasYumInventory(inventory)
+ 
+ 	reportFull := false
+ 	var reportInventoryRes *agentendpointpb.ReportInventoryResponse
+ 	var reportVMInventoryRes *agentendpointpb.ReportVmInventoryResponse
+ 	var err error
+ 	f := func() error {
+-		reportVMInventoryRes, err = c.reportVMInventory(ctx, vmInventory, reportFull)
+-		if shouldFallbackToLegacyAPI(err) {
++		if useLegacyAPI {
+ 			reportInventoryRes, err = c.reportInventory(ctx, inventory, reportFull)
++		} else {
++			reportVMInventoryRes, err = c.reportVMInventory(ctx, vmInventory, reportFull)
++			if legacyComplete && shouldFallbackToLegacyAPI(err) {
++				reportInventoryRes, err = c.reportInventory(ctx, inventory, reportFull)
++			}
+ 		}
+ 
+ 		if err != nil {
+@@ -104,6 +111,21 @@
+ 			return
+ 		}
+ 	}
++}
++
++// hasYumInventory identifies native RPM inventory whose explicit package
++// architectures are preserved by the legacy API.
++func hasYumInventory(legacy *agentendpointpb.Inventory) bool {
++	for _, pkgs := range [][]*agentendpointpb.Inventory_SoftwarePackage{
++		legacy.GetInstalledPackages(), legacy.GetAvailablePackages(),
++	} {
++		for _, pkg := range pkgs {
++			if pkg.GetYumPackage() != nil {
++				return true
++			}
++		}
++	}
++	return false
+ }
+ 
+ func shouldFallbackToLegacyAPI(err error) bool {
+@@ -606,10 +628,14 @@
  }
  
  func formatYumPackage(pkg *packages.PkgInfo) *agentendpointpb.Inventory_SoftwarePackage_YumPackage {
@@ -96,10 +143,22 @@
  	"google.golang.org/protobuf/testing/protocmp"
  	"google.golang.org/protobuf/types/known/structpb"
  	"google.golang.org/protobuf/types/known/timestamppb"
-@@ -620,6 +624,98 @@
- 	}
- }
+@@ -611,12 +615,107 @@
+ 				t.Fatal(err)
+ 			}
  
++			// Legacy inventory has no Snap representation; use a complete legacy fixture.
++			tt.inventoryState.InstalledPackages.Snap = nil
++			tt.inventoryState.PackageUpdates.Snap = nil
+ 			tc.client.report(ctx, tt.inventoryState)
+ 
+ 			if diff := cmp.Diff(tt.wantInventory, actualInventory, protocmp.Transform()); diff != "" {
+ 				t.Fatalf("ReportInventoryRequest.Inventory mismatch (-want +got):\n%s", diff)
+ 			}
+ 		})
++	}
++}
++
 +type modernInventoryOSInfoProvider struct{}
 +
 +func (modernInventoryOSInfoProvider) GetOSInfo(context.Context) (osinfo.OSInfo, error) {
@@ -189,13 +248,195 @@
 +	}
 +	if len(wantArchitecture) != 0 {
 +		t.Errorf("modern inventory omitted RPMs: %v", wantArchitecture)
+ 	}
+ }
+ 
+@@ -672,6 +771,184 @@
+ 
+ }
+ 
++func TestReportUsesLegacyAPIForRepresentableNativeRPMInventory(t *testing.T) {
++	ctx := context.Background()
++	ctrl := gomock.NewController(t)
++	defer ctrl.Finish()
++
++	previousZypperExists := packages.ZypperExists
++	packages.ZypperExists = false
++	t.Cleanup(func() { packages.ZypperExists = previousZypperExists })
++
++	state := &inventory.InstanceInventory{
++		ShortName: "fedora",
++		Version:   "44",
++		InstalledPackages: &packages.Packages{Rpm: []*packages.PkgInfo{
++			{Name: "golang-src", Arch: "all", Version: "1.22.3-1.fc44", Type: "rpm"},
++			{Name: "kernel-tools", Arch: "x86_64", Version: "6.11.0-1.fc44", Type: "rpm"},
++			{Name: "kernel-tools-libs", Arch: "aarch64", Version: "6.11.0-1.fc44", Type: "rpm"},
++		}},
++		PackageUpdates: &packages.Packages{Yum: []*packages.PkgInfo{{Name: "noarch-update", Arch: "all", Version: "1-1.fc44", Type: "rpm"}}},
++	}
++
++	var requests []*agentendpointpb.ReportInventoryRequest
++	mockClient := utilmocks.NewMockAgentEndpointClient(ctrl)
++	mockClient.EXPECT().ReportVmInventory(gomock.Any(), gomock.Any()).Times(0)
++	mockClient.EXPECT().ReportInventory(gomock.Any(), gomock.Any()).Times(2).DoAndReturn(
++		func(_ context.Context, req *agentendpointpb.ReportInventoryRequest, _ ...gax.CallOption) (*agentendpointpb.ReportInventoryResponse, error) {
++			requests = append(requests, req)
++			if len(requests) == 1 {
++				return &agentendpointpb.ReportInventoryResponse{ReportFullInventory: true}, nil
++			}
++			return &agentendpointpb.ReportInventoryResponse{}, nil
++		})
++
++	tc, err := newMockTestClient(ctx, mockClient)
++	if err != nil {
++		t.Fatal(err)
++	}
++	tc.client.report(ctx, state)
++
++	if len(requests) != 2 {
++		t.Fatalf("ReportInventory called %d times, want checksum and full-inventory requests", len(requests))
++	}
++	if requests[0].GetInventoryChecksum() == "" || requests[0].GetInventory() != nil {
++		t.Fatalf("first legacy request = %v, want checksum only", requests[0])
++	}
++	if requests[1].GetInventory() == nil {
++		t.Fatal("second legacy request has no full inventory")
++	}
++
++	wantArchitecture := map[string]string{
++		"golang-src":        "noarch",
++		"kernel-tools":      "x86_64",
++		"kernel-tools-libs": "aarch64",
++		"noarch-update":     "noarch",
++	}
++	for _, list := range [][]*agentendpointpb.Inventory_SoftwarePackage{
++		requests[1].GetInventory().GetInstalledPackages(),
++		requests[1].GetInventory().GetAvailablePackages(),
++	} {
++		for _, item := range list {
++			pkg := item.GetYumPackage()
++			if pkg == nil {
++				continue
++			}
++			want, ok := wantArchitecture[pkg.GetPackageName()]
++			if !ok {
++				continue
++			}
++			if pkg.GetArchitecture() != want {
++				t.Errorf("legacy inventory architecture for %s = %q, want %q", pkg.GetPackageName(), pkg.GetArchitecture(), want)
++			}
++			delete(wantArchitecture, pkg.GetPackageName())
++		}
++	}
++	if len(wantArchitecture) != 0 {
++		t.Errorf("legacy inventory omitted RPMs: %v", wantArchitecture)
 +	}
 +}
 +
- func TestReportVmInventory(t *testing.T) {
++func TestReportKeepsModernAPIWhenLegacyWouldOmitSnap(t *testing.T) {
++	ctx := context.Background()
++	ctrl := gomock.NewController(t)
++	defer ctrl.Finish()
++
++	previousZypperExists := packages.ZypperExists
++	packages.ZypperExists = false
++	t.Cleanup(func() { packages.ZypperExists = previousZypperExists })
++
++	state := &inventory.InstanceInventory{
++		ShortName: "fedora",
++		Version:   "44",
++		InstalledPackages: &packages.Packages{
++			Rpm:  []*packages.PkgInfo{{Name: "golang-src", Arch: "all", Version: "1.22.3-1.fc44", Type: "rpm"}},
++			Snap: []*packages.PkgInfo{{Name: "snap-app", Arch: "x86_64", Version: "1", Type: "snap"}},
++		},
++	}
++
++	var request *agentendpointpb.ReportVmInventoryRequest
++	mockClient := utilmocks.NewMockAgentEndpointClient(ctrl)
++	mockClient.EXPECT().ReportVmInventory(gomock.Any(), gomock.Any()).Times(1).Do(
++		func(_ context.Context, req *agentendpointpb.ReportVmInventoryRequest, _ ...gax.CallOption) {
++			request = req
++		},
++	).Return(&agentendpointpb.ReportVmInventoryResponse{}, nil)
++	mockClient.EXPECT().ReportInventory(gomock.Any(), gomock.Any()).Times(0)
++
++	tc, err := newMockTestClient(ctx, mockClient)
++	if err != nil {
++		t.Fatal(err)
++	}
++	tc.client.report(ctx, state)
++
++	if request == nil || request.GetInventoryChecksum() == "" {
++		t.Fatal("modern API was not given its checksum request")
++	}
++}
++
++func TestReportFallsBackToLegacyWhenModernAPIIsUnsupported(t *testing.T) {
++	ctx := context.Background()
++	ctrl := gomock.NewController(t)
++	defer ctrl.Finish()
++
++	previousZypperExists := packages.ZypperExists
++	packages.ZypperExists = false
++	t.Cleanup(func() { packages.ZypperExists = previousZypperExists })
++
++	state := &inventory.InstanceInventory{
++		ShortName: "fedora",
++		Version:   "44",
++		InstalledPackages: &packages.Packages{
++			Deb: []*packages.PkgInfo{{Name: "test-deb", Arch: "x86_64", Version: "1-1", Type: "deb"}},
++		},
++	}
++
++	var legacyRequest *agentendpointpb.ReportInventoryRequest
++	mockClient := utilmocks.NewMockAgentEndpointClient(ctrl)
++	mockClient.EXPECT().ReportVmInventory(gomock.Any(), gomock.Any()).Times(1).Return(
++		nil, status.Error(codes.FailedPrecondition, "legacy API required"))
++	mockClient.EXPECT().ReportInventory(gomock.Any(), gomock.Any()).Times(1).Do(
++		func(_ context.Context, req *agentendpointpb.ReportInventoryRequest, _ ...gax.CallOption) {
++			legacyRequest = req
++		},
++	).Return(&agentendpointpb.ReportInventoryResponse{}, nil)
++
++	tc, err := newMockTestClient(ctx, mockClient)
++	if err != nil {
++		t.Fatal(err)
++	}
++	tc.client.report(ctx, state)
++
++	if legacyRequest == nil || legacyRequest.GetInventoryChecksum() == "" || legacyRequest.GetInventory() != nil {
++		t.Fatalf("legacy fallback request = %v, want checksum only", legacyRequest)
++	}
++}
++
++func TestReportRejectsLegacyFallbackWhenItWouldOmitSnap(t *testing.T) {
++	ctx := context.Background()
++	ctrl := gomock.NewController(t)
++	defer ctrl.Finish()
++
++	state := &inventory.InstanceInventory{
++		ShortName: "fedora",
++		Version:   "44",
++		InstalledPackages: &packages.Packages{
++			Rpm:  []*packages.PkgInfo{{Name: "golang-src", Arch: "all", Version: "1-1.fc44", Type: "rpm"}},
++			Snap: []*packages.PkgInfo{{Name: "snap-app", Arch: "x86_64", Version: "1", Type: "snap"}},
++		},
++	}
++	mockClient := utilmocks.NewMockAgentEndpointClient(ctrl)
++	mockClient.EXPECT().ReportVmInventory(gomock.Any(), gomock.Any()).Times(1).Return(
++		nil, status.Error(codes.FailedPrecondition, "legacy API required"))
++	mockClient.EXPECT().ReportInventory(gomock.Any(), gomock.Any()).Times(0)
++	tc, err := newMockTestClient(ctx, mockClient)
++	if err != nil {
++		t.Fatal(err)
++	}
++	tc.client.report(ctx, state)
++}
++
+ func Test_computeFingerprint_gotExpectedFingerprintFormat(t *testing.T) {
  	ctx := context.Background()
- 	ctrl := gomock.NewController(t)
-@@ -917,3 +1013,10 @@
+ 	fingerprint, err := computeFingerprint(ctx, generateInventory())
+@@ -917,3 +1194,10 @@
  		})
  	}
  }

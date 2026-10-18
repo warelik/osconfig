@@ -1980,6 +1980,13 @@ def close_candidate():
             api(f"repos/{repo}/pulls/{number}", method="PATCH", data={"state": "closed"})
 
 
+def cli_path(value):
+    """Resolve a path, tolerating the legacy workflow's escaped YAML fold."""
+    if value.startswith(" /"):
+        value = value[1:]
+    return Path(value).resolve()
+
+
 def main():
     if len(sys.argv) < 3:
         raise ValueError("Usage: release.py prepare|review|repair|verify|adopt|close PATH [EVIDENCE|PAGES]")
@@ -1990,7 +1997,7 @@ def main():
         target = Path(sys.argv[3]).resolve()
         target.write_text(failed_job_evidence(os.environ["GITHUB_REPOSITORY"], sys.argv[2]), encoding="utf-8")
         return
-    path = Path(sys.argv[2]).resolve()
+    path = cli_path(sys.argv[2])
     if command == "prepare":
         prepare(path)
     elif command == "review":

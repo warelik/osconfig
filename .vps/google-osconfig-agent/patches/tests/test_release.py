@@ -13,6 +13,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import release
 
 
+class CommandLinePathTests(unittest.TestCase):
+    def test_verify_tolerates_legacy_workflow_escaped_fold(self):
+        candidate = Path("/tmp/osconfig-candidate")
+        pages = Path("/tmp/osconfig-pages")
+        with patch.object(sys, "argv", ["release.py", "verify", f" {candidate}", str(pages)]), \
+                patch.object(release, "verify") as verify:
+            release.main()
+        verify.assert_called_once_with(candidate, pages)
+
+    def test_cli_path_does_not_trim_general_whitespace(self):
+        self.assertEqual(release.cli_path(" relative"), Path.cwd() / " relative")
+
+
 class ExactShaReviewTests(unittest.TestCase):
     sha = "a" * 40
     requested = "2026-10-17T12:00:00Z"

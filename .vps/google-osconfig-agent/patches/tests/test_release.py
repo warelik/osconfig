@@ -705,6 +705,34 @@ class PublisherPolicyDiffTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "allowlisted"):
                 release.policy_changes(work, seed, mixed_head)
 
+    def test_policy_diff_removes_shallow_boundary_before_ancestry_check(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            remote, source, shallow = root / "remote.git", root / "source", root / "shallow"
+            self.git("init", "--bare", str(remote), cwd=root)
+            self.git("init", str(source), cwd=root)
+            self.git("config", "user.name", "test", cwd=source)
+            self.git("config", "user.email", "test@example.invalid", cwd=source)
+            self.git("remote", "add", "origin", str(remote), cwd=source)
+            policy = source / (release.PREFIX + "release.py")
+            policy.parent.mkdir(parents=True)
+            policy.write_text("trusted\n", encoding="utf-8")
+            policy.chmod(0o755)
+            self.git("add", "--all", cwd=source)
+            self.git("commit", "-m", "trusted", cwd=source)
+            config = self.git("rev-parse", "HEAD", cwd=source)
+            policy.write_text("proposed\n", encoding="utf-8")
+            self.git("commit", "-am", "proposal", cwd=source)
+            head = self.git("rev-parse", "HEAD", cwd=source)
+            self.git("push", "origin", "HEAD:refs/heads/proposal", cwd=source)
+
+            self.git("clone", "--depth=1", "--branch", "proposal",
+                     "file://" + str(remote), str(shallow), cwd=root)
+            self.assertEqual(self.git("rev-parse", "--is-shallow-repository", cwd=shallow), "true")
+            self.assertEqual(release.policy_changes(shallow, config, head),
+                             [release.PREFIX + "release.py"])
+            self.assertEqual(self.git("rev-parse", "--is-shallow-repository", cwd=shallow), "false")
+
     def test_policy_change_cannot_replace_a_regular_file_with_a_symlink(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

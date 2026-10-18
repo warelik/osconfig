@@ -296,6 +296,9 @@ mode = os.environ["OSCONFIG_FAKE_GIT_MODE"]
 with open(os.environ["OSCONFIG_FAKE_GIT_CALLS"], "a", encoding="utf-8") as stream:
     stream.write(json.dumps(args) + "\n")
 if mode == "scope":
+    if args == ["rev-parse", "--is-shallow-repository"]:
+        print("false")
+        raise SystemExit(0)
     if args and args[0] in {"fetch", "merge-base"}:
         raise SystemExit(0)
     if args and args[0] == "diff" and "--name-only" in args:

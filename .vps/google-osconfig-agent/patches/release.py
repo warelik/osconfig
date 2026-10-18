@@ -1201,6 +1201,12 @@ def policy_changes(repo_dir, config, head_sha, *, allow_empty=False):
     repo_dir = Path(repo_dir).resolve()
     if not SHA.fullmatch(config) or not SHA.fullmatch(head_sha):
         raise ValueError("Publisher repair requires exact configuration and head SHAs")
+    # Fetching an exact object does not deepen an actions/checkout repository:
+    # Git continues to treat the checked-out head as a shallow root even after
+    # its parent object has been downloaded.  Remove that boundary before the
+    # ancestry gate; the exact config/head fetches below still pin both ends.
+    if run("git", "rev-parse", "--is-shallow-repository", cwd=repo_dir) == "true":
+        run("git", "fetch", "--no-tags", "--unshallow", "origin", cwd=repo_dir)
     run("git", "fetch", "--no-tags", "origin", config, cwd=repo_dir)
     run("git", "fetch", "--no-tags", "origin", head_sha, cwd=repo_dir)
     run("git", "merge-base", "--is-ancestor", config, head_sha, cwd=repo_dir)

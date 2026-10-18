@@ -32,7 +32,7 @@ fi
     cd -- "$source_dir"
     git apply --check "$patch_file"
     git apply "$patch_file"
-    gofmt -w packages/yum.go packages/yum_test.go agentendpoint/inventory.go agentendpoint/inventory_test.go agentendpoint/agentendpoint_test.go
+    gofmt -w packages/packages_linux.go packages/yum.go packages/yum_test.go agentendpoint/inventory.go agentendpoint/inventory_test.go agentendpoint/agentendpoint_test.go agentendpoint/patch_task.go
     go test -count=1 -timeout=5m ./packages ./agentendpoint
 )
 printf '%s\n' 'PASS: pinned Google OS Config inventory patch and regression tests'

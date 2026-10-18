@@ -1332,7 +1332,7 @@ def check_policy(candidate):
                    OSCONFIG_POLICY_CANDIDATE_WORKFLOW=str(candidate_workflow))
 
         def isolated_run(extra_env, arguments, *, workdir=writable, network=False,
-                         context="Isolated publisher command"):
+                         context="Isolated publisher command", parser_readonly=False):
             command = [*container_engine, "run", "--rm", "--read-only",
                        "--cap-drop=ALL", "--security-opt=no-new-privileges",
                        *( ["--userns=keep-id"] if engine_kind == "podman" else [] ),
@@ -1342,6 +1342,8 @@ def check_policy(candidate):
             relabel = ",relabel=shared" if engine_kind == "podman" else ""
             command += ["--mount", f"type=bind,source={root},target={root},readonly{relabel}"]
             command += ["--mount", f"type=bind,source={writable},target={writable}{relabel}"]
+            if parser_readonly:
+                command += ["--mount", f"type=bind,source={parser_install},target={parser_install},readonly{relabel}"]
             for name, value in (env | extra_env).items():
                 command += ["--env", f"{name}={value}"]
             command += [POLICY_IMAGE, *arguments]
@@ -1375,6 +1377,7 @@ def check_policy(candidate):
             ["python3", "-B", "-c", unit_launcher,
              str(trusted_root / PREFIX), str(trusted_patch / "tests")],
             context="Isolated trusted publisher tests",
+            parser_readonly=True,
         )
 
     with tempfile.TemporaryDirectory(prefix="osconfig-policy-lint-") as temporary:

@@ -33,6 +33,13 @@ The workflow uses public candidate branches and keeps build/review/publisher
 policy repairs machine-maintained. It publishes only the package repository
 artifacts, not server configuration, VM inventory, or credentials.
 
+Policy adoption checks run the proposed CLI against trusted regressions in a
+container without network access or credentials. The parser dependency is
+installed before this check and mounted read-only with the trusted test inputs,
+so the candidate cannot alter the parser used to judge its output. A native
+regression checks that existing parser files and adjacent new files cannot be
+written.
+
 ## Local checks
 
 Run the pinned-source regressions with:

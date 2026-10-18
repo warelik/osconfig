@@ -630,6 +630,21 @@ raise SystemExit(2)
 
 
 class PolicyGateIsolationTests(unittest.TestCase):
+    def test_candidate_cannot_modify_or_replace_the_oracle_parser(self):
+        if not os.environ.get("OSCONFIG_POLICY_CANDIDATE_RELEASE"):
+            self.skipTest("requires the actual isolated policy-check container")
+        import errno
+        parser = Path(os.environ["PYTHONPATH"]) / "yaml" / "__init__.py"
+        self.assertTrue(parser.is_file())
+        for target in (parser, parser.parent / ".oracle-write-probe"):
+            try:
+                with target.open("ab") as stream:
+                    stream.write(b"\n# unexpected writable oracle dependency\n")
+            except OSError as error:
+                self.assertIn(error.errno, (errno.EROFS, errno.EACCES, errno.EPERM))
+            else:
+                self.fail("candidate can modify or replace its oracle parser dependency")
+
     def actionlint_archive(self):
         import io
         import tarfile
@@ -710,6 +725,13 @@ class PolicyGateIsolationTests(unittest.TestCase):
             test_run = next(command for command in docker_commands if "-c" in command)
             self.assertIn("--network=none", test_run)
             self.assertTrue(any(value.startswith("PYTHONPATH=") for value in test_run))
+            parser_path = next(value.split("=", 1)[1] for value in test_run
+                               if value.startswith("PYTHONPATH="))
+            protected_parser = f"type=bind,source={parser_path},target={parser_path},readonly"
+            writable_parent = str(Path(parser_path).parent)
+            writable_mount = f"type=bind,source={writable_parent},target={writable_parent}"
+            self.assertIn(protected_parser, test_run)
+            self.assertGreater(test_run.index(protected_parser), test_run.index(writable_mount))
 
     def test_pre_adoption_gate_rejects_unavailable_parser_wheel_before_trusted_tests(self):
         with tempfile.TemporaryDirectory(prefix="osconfig-policy-parser-missing-") as temporary:

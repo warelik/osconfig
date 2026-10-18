@@ -3,6 +3,7 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -205,6 +206,22 @@ class SigningWorkflowTrustTests(unittest.TestCase):
 
     def test_candidate_workflow_uses_trusted_checkout_signer_and_regression(self):
         release.validate_signing_workflow(self.workflow_path())
+
+    def test_publish_verifier_preserves_shell_line_continuation(self):
+        document = release.yaml_module().safe_load(self.workflow_path().read_text(encoding="utf-8"))
+        verifier = next(
+            step for step in document["jobs"]["publish"]["steps"]
+            if "release.py verify" in step.get("run", "")
+        )
+        command = verifier["run"]
+        self.assertIn("verify \\\n", command)
+        self.assertEqual(
+            shlex.split(command.replace("\\\n", " ")),
+            [
+                "python3", "-B", ".vps/google-osconfig-agent/patches/release.py", "verify",
+                "$RUNNER_TEMP/osconfig-candidate", "$RUNNER_TEMP/osconfig-pages",
+            ],
+        )
 
     def test_signing_job_can_update_runner_image_and_build_tool_packages(self):
         with tempfile.TemporaryDirectory() as temporary:

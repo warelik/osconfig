@@ -1,8 +1,14 @@
 diff --git a/agentendpoint/agentendpoint_test.go b/agentendpoint/agentendpoint_test.go
-index a5aa99c..8b8ef1e 100644
 --- a/agentendpoint/agentendpoint_test.go
 +++ b/agentendpoint/agentendpoint_test.go
-@@ -196,7 +196,18 @@ func (s *agentEndpointServiceTestServer) StartNextTask(ctx context.Context, req
+@@ -35,4 +35,6 @@ import (
+ 	agentendpoint "cloud.google.com/go/osconfig/agentendpoint/apiv1"
+ 	"github.com/GoogleCloudPlatform/guest-logging-go/logger"
++	"github.com/GoogleCloudPlatform/osconfig/packages"
+ 	utilmocks "github.com/GoogleCloudPlatform/osconfig/util/mocks"
++	"github.com/golang/mock/gomock"
+ 	"golang.org/x/oauth2/jws"
+@@ -196,7 +198,18 @@ func (s *agentEndpointServiceTestServer) StartNextTask(ctx context.Context, req
  	case !s.execTaskComplete:
  		return &agentendpointpb.StartNextTaskResponse{Task: &agentendpointpb.Task{TaskType: agentendpointpb.TaskType_EXEC_STEP_TASK, TaskId: "TaskType_EXEC_STEP_TASK"}}, nil
  	case !s.patchTaskComplete:
@@ -22,6 +28,23 @@ index a5aa99c..8b8ef1e 100644
  	case !s.applyConfigTaskComplete:
  		return &agentendpointpb.StartNextTaskResponse{Task: &agentendpointpb.Task{TaskType: agentendpointpb.TaskType_APPLY_CONFIG_TASK, TaskId: "TaskType_APPLY_CONFIG_TASK"}}, nil
  	default:
+@@ -252,2 +265,16 @@ func TestWaitForTask(t *testing.T) {
+ func TestWaitForTask(t *testing.T) {
++	previousRunner := packages.GetCommandRunner()
++	previousPtyRunner := packages.GetPtyCommandRunner()
++	mockController := gomock.NewController(t)
++	runner := utilmocks.NewMockCommandRunner(mockController)
++	ptyRunner := utilmocks.NewMockCommandRunner(mockController)
++	// Keep this RPC-loop test from invoking host package-manager commands.
++	runner.EXPECT().Run(gomock.Any(), gomock.Any()).Return(nil, nil, nil).AnyTimes()
++	ptyRunner.EXPECT().Run(gomock.Any(), gomock.Any()).Return(nil, nil, nil).AnyTimes()
++	packages.SetCommandRunner(runner)
++	packages.SetPtyCommandRunner(ptyRunner)
++	t.Cleanup(func() {
++		packages.SetCommandRunner(previousRunner)
++		packages.SetPtyCommandRunner(previousPtyRunner)
++	})
+ 	ctx := context.Background()
 diff --git a/agentendpoint/inventory.go b/agentendpoint/inventory.go
 index b4af6b0..9620638 100644
 --- a/agentendpoint/inventory.go

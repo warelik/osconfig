@@ -1601,6 +1601,18 @@ def check_policy(candidate):
         trusted_patch.mkdir(parents=True)
         (trusted_patch / "tests").mkdir()
         shutil.copy2(trusted_release, trusted_patch / "release.py")
+        # Trusted regressions may exercise package adoption.  Keep their inputs
+        # in the isolated tree with the trusted policy instead of making those
+        # tests depend on files outside the read-only trusted mount.
+        for relative in PACKAGE_FILES:
+            if relative == "release.py":
+                continue
+            source = ROOT / PREFIX / relative
+            if not source.is_file() or source.is_symlink():
+                continue
+            target = trusted_patch / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
         for test in sorted(trusted_tests.glob("test_*.py")):
             if test.is_file() and not test.is_symlink():
                 shutil.copy2(test, trusted_patch / "tests" / test.name)
@@ -1929,7 +1941,8 @@ def adopt(candidate_dir, pages_dir):
             source = candidate_dir / Path(relative).name
             target = work / PREFIX / relative
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, target)
+            shutil.copyfile(source, target)
+            target.chmod(0o755 if relative.endswith(".sh") else 0o644)
         (work / REPOSITORY_CONF).write_bytes(expected_conf_bytes)
         paths = [PATCH_REL, REPOSITORY_CONF]
         paths.extend(PREFIX + relative for relative in PACKAGE_FILES)

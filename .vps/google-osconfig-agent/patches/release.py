@@ -1639,7 +1639,13 @@ def check_policy(candidate):
             for name, value in (env | extra_env).items():
                 command += ["--env", f"{name}={value}"]
             command += [POLICY_IMAGE, *arguments]
-            result = subprocess.run(command, cwd=writable, env=env | extra_env, check=False,
+            # Keep the runtime's own storage/configuration rooted in the runner.  In
+            # particular, rootless Podman interprets XDG_DATA_HOME before starting
+            # the container; pointing it at our disposable bind mount makes its
+            # overlay storage part of the policy fixture and can leave root-owned
+            # files that TemporaryDirectory cannot remove.  Only the explicit
+            # --env arguments above enter the isolated container.
+            result = subprocess.run(command, cwd=writable, env=os.environ.copy(), check=False,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                     timeout=300)
             if result.returncode != 0:

@@ -795,11 +795,13 @@ class PolicyGateIsolationTests(unittest.TestCase):
 
             archive = self.actionlint_archive()
             commands = []
+            container_host_environments = []
             requested_requirements = []
 
             def completed(command, **kwargs):
                 commands.append(command)
                 if command and command[0].endswith("/docker") and command[1] == "run":
+                    container_host_environments.append(kwargs["env"])
                     if "download" in command:
                         requirements_path = Path(command[command.index("-r") + 1])
                         requested_requirements.append(requirements_path.read_text(encoding="utf-8"))
@@ -821,6 +823,10 @@ class PolicyGateIsolationTests(unittest.TestCase):
             docker_commands = [command for command in commands
                                if command[0].endswith("/docker") and command[1] == "run"]
             self.assertEqual(len(docker_commands), 3)
+            self.assertEqual(len(container_host_environments), 3)
+            for host_environment in container_host_environments:
+                self.assertEqual(host_environment.get("HOME"), os.environ.get("HOME"))
+                self.assertNotIn("osconfig-policy-tests-", host_environment.get("XDG_DATA_HOME", ""))
             self.assertNotIn(str(candidate), " ".join(docker_commands[0]))
             download = next(command for command in docker_commands if "download" in command)
             self.assertIn("https://pypi.org/simple", download)

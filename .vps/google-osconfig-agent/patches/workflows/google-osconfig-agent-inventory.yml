@@ -1,0 +1,537 @@
+name: Google OS Config inventory package
+
+on:
+  schedule:
+    - cron: '23 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      policy_pr:
+        description: Resume an exact publisher-policy proposal
+        required: false
+        type: string
+  push:
+    branches: [master]
+    paths: ['.vps/google-osconfig-agent/patches/**', '.vps/google-osconfig-agent/repository.conf']
+  issue_comment:
+    types: [created, edited]
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: google-osconfig-agent-package
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: >-
+      github.event_name != 'pull_request_target' &&
+      (github.event_name != 'issue_comment' ||
+       (github.event.issue.pull_request &&
+        github.event.comment.user.login == 'chatgpt-codex-connector[bot]' &&
+        github.event.comment.user.type == 'Bot'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    outputs:
+      exists: ${{ steps.candidate.outputs.candidate_exists }}
+      sha: ${{ steps.candidate.outputs.candidate_sha }}
+      pr: ${{ steps.candidate.outputs.candidate_pr }}
+      branch: ${{ steps.candidate.outputs.candidate_branch }}
+      upstream: ${{ steps.candidate.outputs.upstream_commit }}
+      patch: ${{ steps.candidate.outputs.patch_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: master
+          persist-credentials: false
+      - name: Install declared workflow parser dependency
+        run: |
+          python3 -m pip install --isolated --disable-pip-version-check --no-input --no-cache-dir \
+            --only-binary=:all: --no-deps --index-url https://pypi.org/simple \
+            --target "$RUNNER_TEMP/osconfig-policy-deps" \
+            -r .vps/google-osconfig-agent/patches/requirements-policy.txt
+      - name: Test trusted release gate
+        env:
+          PYTHONPATH: ${{ runner.temp }}/osconfig-policy-deps
+        run: python3 -B -m unittest discover -s .vps/google-osconfig-agent/patches/tests -p 'test_*.py' -v
+      - name: Resolve latest upstream release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bash .vps/google-osconfig-agent/patches/prepare-source.sh --latest "$RUNNER_TEMP/osconfig-source"
+      - name: Prepare exact-source native Codex review PR
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+          OSCONFIG_RPM_SIGNING_FINGERPRINT: ${{ vars.OSCONFIG_RPM_SIGNING_FINGERPRINT }}
+          OSCONFIG_SOURCE_DIR: ${{ runner.temp }}/osconfig-source
+        run: |
+          python3 -B .vps/google-osconfig-agent/patches/release.py prepare \
+            "$RUNNER_TEMP/osconfig-candidate"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.candidate.outputs.candidate_exists == 'true'
+        with:
+          name: google-osconfig-agent-candidate
+          path: ${{ runner.temp }}/osconfig-candidate/inputs
+          if-no-files-found: error
+          retention-days: 3
+
+  policy-resume:
+    if: github.event_name != 'pull_request_target'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+      actions: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: master
+          persist-credentials: false
+      - name: Continue any bounded publisher repair or review window
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+          POLICY_PR_NUMBER: ${{ inputs.policy_pr }}
+        run: python3 -B .vps/google-osconfig-agent/patches/release.py policy-resume .
+
+  policy-check:
+    if: >-
+      (github.event_name == 'pull_request_target' &&
+       github.event.pull_request.base.ref == 'master' &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       startsWith(github.event.pull_request.head.ref, 'repair/osconfig-policy-')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.policy_pr != '')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      changed: ${{ steps.check.outputs.policy_candidate_changed }}
+      pr: ${{ steps.identity.outputs.pr }}
+      head: ${{ steps.identity.outputs.head }}
+      config: ${{ steps.identity.outputs.config }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: master
+          path: trusted
+          persist-credentials: false
+      - name: Resolve and validate the exact proposal identity
+        id: identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          POLICY_PR_NUMBER: ${{ github.event.pull_request.number || inputs.policy_pr }}
+        run: |
+          test "$POLICY_PR_NUMBER" -gt 0
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$POLICY_PR_NUMBER" > "$RUNNER_TEMP/policy-pr.json"
+          python3 -B - "$RUNNER_TEMP/policy-pr.json" "$POLICY_PR_NUMBER" >> "$GITHUB_OUTPUT" <<'PY'
+          import json, re, sys
+          pull=json.load(open(sys.argv[1], encoding="utf-8"))
+          assert pull["number"] == int(sys.argv[2])
+          assert pull["state"] == "open"
+          assert pull["base"]["ref"] == "master"
+          assert pull["head"]["repo"]["full_name"] == __import__("os").environ["GITHUB_REPOSITORY"]
+          assert pull["head"]["ref"].startswith("repair/osconfig-policy-")
+          for key,value in (("pr",str(pull["number"])),("head",pull["head"]["sha"]),
+                            ("config",pull["base"]["sha"])):
+              assert re.fullmatch(r"[0-9]+" if key == "pr" else r"[0-9a-f]{40}",value)
+              print(f"{key}={value}")
+          PY
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.identity.outputs.head }}
+          path: candidate
+          persist-credentials: false
+      - name: Install independent policy bootstrap parser
+        run: |
+          python3 -m pip install --isolated --disable-pip-version-check --no-input --no-cache-dir \
+            --only-binary=:all: --no-deps --index-url https://pypi.org/simple \
+            --target "$RUNNER_TEMP/osconfig-policy-bootstrap" 'PyYAML>=6,<7'
+      - name: Run trusted policy baseline; parse proposed Python and lint the proposed workflow
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          POLICY_PR_NUMBER: ${{ steps.identity.outputs.pr }}
+          POLICY_HEAD_SHA: ${{ steps.identity.outputs.head }}
+          PYTHONPATH: ${{ runner.temp }}/osconfig-policy-bootstrap
+        run: python3 -B trusted/.vps/google-osconfig-agent/patches/release.py policy-check candidate
+
+  policy-review:
+    needs: policy-check
+    if: needs.policy-check.result == 'success' && needs.policy-check.outputs.changed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+    outputs:
+      ready: ${{ steps.review.outputs.policy_review_ready }}
+      reason: ${{ steps.review.outputs.policy_review_reason }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: master
+          persist-credentials: false
+      - name: Request and require exact-SHA native Codex review
+        id: review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+          POLICY_PR_NUMBER: ${{ needs.policy-check.outputs.pr }}
+          POLICY_HEAD_SHA: ${{ needs.policy-check.outputs.head }}
+        run: python3 -B .vps/google-osconfig-agent/patches/release.py policy-review .
+
+  adopt-policy:
+    needs: [policy-check, policy-review]
+    if: >-
+      needs.policy-check.result == 'success' && needs.policy-check.outputs.changed == 'true' &&
+      needs.policy-review.result == 'success' && needs.policy-review.outputs.ready == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: master
+          path: trusted
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.policy-check.outputs.head }}
+          path: candidate
+          persist-credentials: false
+      - name: Recheck exact review and selectively adopt only allowlisted policy files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          POLICY_PR_NUMBER: ${{ needs.policy-check.outputs.pr }}
+          POLICY_HEAD_SHA: ${{ needs.policy-check.outputs.head }}
+        run: python3 -B trusted/.vps/google-osconfig-agent/patches/release.py adopt-policy candidate
+
+  repair-policy-proposal:
+    needs: [policy-check, policy-review, adopt-policy]
+    if: >-
+      always() &&
+      ((needs.policy-check.result == 'failure') ||
+       (needs.policy-review.result == 'failure') ||
+       (needs.policy-review.result == 'success' && needs.policy-review.outputs.ready == 'false' &&
+        needs.policy-review.outputs.reason != 'Waiting for Codex; no completed exact-SHA review') ||
+       (needs.adopt-policy.result == 'failure'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: master
+          persist-credentials: false
+      - name: Request a separate machine repair for the publisher proposal
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+          POLICY_PR_NUMBER: ${{ needs.policy-check.outputs.pr }}
+          POLICY_HEAD_SHA: ${{ needs.policy-check.outputs.head }}
+        run: |
+          python3 -B .vps/google-osconfig-agent/patches/release.py failed-job-evidence \
+            "$GITHUB_RUN_ID" "$RUNNER_TEMP/policy-failure.log"
+          python3 -B .vps/google-osconfig-agent/patches/release.py repair-policy-pr \
+            "$POLICY_PR_NUMBER" "$POLICY_HEAD_SHA" "$RUNNER_TEMP/policy-failure.log"
+
+  build-rpm:
+    needs: prepare
+    if: needs.prepare.outputs.exists == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    container: fedora:44
+    permissions:
+      contents: read
+    outputs:
+      failure_class: ${{ steps.classify.outputs.failure_class }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: master
+          persist-credentials: false
+      - name: Install Fedora build tools
+        id: tools
+        run: dnf -y install golang rpm-build go-rpm-macros go-vendor-tools systemd systemd-rpm-macros git jq tar bzip2 gzip
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: google-osconfig-agent-candidate
+          path: ${{ runner.temp }}/osconfig-candidate
+      - name: Prepare the exact upstream source tree
+        id: source_setup
+        run: |
+          mkdir "$RUNNER_TEMP/osconfig-upstream"
+          tar -xzf "$RUNNER_TEMP/osconfig-candidate/source.tar.gz" \
+            --strip-components=1 -C "$RUNNER_TEMP/osconfig-upstream"
+      - name: Apply and test the application patch
+        id: source_test
+        env:
+          UPSTREAM_SOURCE_DIR: ${{ runner.temp }}/osconfig-upstream
+          UPSTREAM_PATCH_FILE: ${{ runner.temp }}/osconfig-candidate/osconfig-inventory.patch
+        run: bash .vps/google-osconfig-agent/patches/check-upstream.sh
+      - name: Build the Fedora RPM
+        id: package_build
+        env:
+          VPS_RPM_RELEASE: 1.vps${{ github.run_number }}
+        run: |
+          bash "$RUNNER_TEMP/osconfig-candidate/build-rpm.sh" \
+            "$RUNNER_TEMP/osconfig-candidate" "$RUNNER_TEMP/osconfig-built"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        id: artifact
+        with:
+          name: google-osconfig-agent-built-rpm
+          path: ${{ runner.temp }}/osconfig-built
+          if-no-files-found: error
+          retention-days: 3
+      - name: Classify the failed stage for separate application or publisher repair
+        id: classify
+        if: always()
+        env:
+          TOOLS_OUTCOME: ${{ steps.tools.outcome }}
+          SETUP_OUTCOME: ${{ steps.source_setup.outcome }}
+          TEST_OUTCOME: ${{ steps.source_test.outcome }}
+          BUILD_OUTCOME: ${{ steps.package_build.outcome }}
+          ARTIFACT_OUTCOME: ${{ steps.artifact.outcome }}
+        run: |
+          if [[ "$TOOLS_OUTCOME" == failure || "$SETUP_OUTCOME" == failure || "$ARTIFACT_OUTCOME" == failure ]]; then
+            echo 'failure_class=publisher' >> "$GITHUB_OUTPUT"
+          elif [[ "$TEST_OUTCOME" == failure || "$BUILD_OUTCOME" == failure ]]; then
+            echo 'failure_class=application' >> "$GITHUB_OUTPUT"
+          else
+            echo 'failure_class=none' >> "$GITHUB_OUTPUT"
+          fi
+
+  review:
+    needs: [prepare, build-rpm]
+    if: needs.prepare.outputs.exists == 'true' && needs.build-rpm.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      ready: ${{ steps.gate.outputs.review_ready }}
+      reason: ${{ steps.gate.outputs.review_reason }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: master
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: google-osconfig-agent-candidate
+          path: ${{ runner.temp }}/osconfig-candidate
+      - name: Require native Codex review of this tested SHA
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 -B .vps/google-osconfig-agent/patches/release.py review \
+            "$RUNNER_TEMP/osconfig-candidate"
+
+  repair:
+    needs: [prepare, build-rpm, review]
+    if: >-
+      always() && needs.prepare.outputs.exists == 'true' &&
+      (needs.build-rpm.outputs.failure_class == 'application' ||
+       (needs.review.result == 'success' && needs.review.outputs.ready == 'false' &&
+        needs.review.outputs.reason != 'Waiting for Codex; no completed exact-SHA review'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: master
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: google-osconfig-agent-candidate
+          path: ${{ runner.temp }}/osconfig-candidate
+      - name: Request a native Codex fix with the failure evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+          REVIEW_REASON: ${{ needs.review.outputs.reason }}
+        run: |
+          python3 -B .vps/google-osconfig-agent/patches/release.py failed-job-evidence \
+            "$GITHUB_RUN_ID" "$RUNNER_TEMP/failing-jobs.log"
+          { printf 'Review state: %s\n\n' "$REVIEW_REASON"; cat "$RUNNER_TEMP/failing-jobs.log"; } \
+            > "$RUNNER_TEMP/osconfig-failure-evidence.txt"
+          python3 -B .vps/google-osconfig-agent/patches/release.py repair \
+            "$RUNNER_TEMP/osconfig-candidate" "$RUNNER_TEMP/osconfig-failure-evidence.txt"
+
+  repair-publisher:
+    needs: [prepare, build-rpm, review, sign, publish, adopt, policy-resume]
+    if: >-
+      always() &&
+      (needs.prepare.result == 'failure' ||
+       needs.build-rpm.outputs.failure_class == 'publisher' ||
+       needs.sign.result == 'failure' || needs.publish.result == 'failure' ||
+       needs.adopt.result == 'failure' || needs.policy-resume.result == 'failure')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: master
+          persist-credentials: false
+      - name: Request a separate machine repair for publisher and workflow failures
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+          POLICY_CONFIG_SHA: ${{ github.sha }}
+        run: |
+          python3 -B .vps/google-osconfig-agent/patches/release.py failed-job-evidence \
+            "$GITHUB_RUN_ID" "$RUNNER_TEMP/publisher-failure.log"
+          python3 -B .vps/google-osconfig-agent/patches/release.py repair-policy \
+            "$RUNNER_TEMP/publisher-failure.log"
+
+  sign:
+    needs: [prepare, build-rpm, review]
+    if: >-
+      needs.prepare.outputs.exists == 'true' && needs.build-rpm.result == 'success' &&
+      needs.review.result == 'success' && needs.review.outputs.ready == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    container: fedora:44
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: master
+          persist-credentials: false
+      - name: Install RPM signing tools
+        run: dnf -y install rpm-sign createrepo_c gnupg2 rpm jq coreutils findutils
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: google-osconfig-agent-candidate
+          path: ${{ runner.temp }}/osconfig-candidate
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: google-osconfig-agent-built-rpm
+          path: ${{ runner.temp }}/osconfig-built
+      - name: Check signing and verifier rejection with disposable keys
+        run: bash .vps/google-osconfig-agent/patches/tests/signing.sh "$RUNNER_TEMP/osconfig-built"
+      - name: Sign and verify RPM and RPM-MD metadata
+        env:
+          OSCONFIG_RPM_SIGNING_PRIVATE_KEY: ${{ secrets.OSCONFIG_RPM_SIGNING_PRIVATE_KEY }}
+          OSCONFIG_RPM_SIGNING_FINGERPRINT: ${{ vars.OSCONFIG_RPM_SIGNING_FINGERPRINT }}
+          EXPECTED_CANDIDATE_SHA: ${{ needs.prepare.outputs.sha }}
+          EXPECTED_UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream }}
+          EXPECTED_PATCH_SHA: ${{ needs.prepare.outputs.patch }}
+        run: |
+          bash "$RUNNER_TEMP/osconfig-candidate/sign-repo.sh" \
+            "$RUNNER_TEMP/osconfig-built" "$RUNNER_TEMP/osconfig-pages"
+          bash .vps/google-osconfig-agent/patches/verify-repo.sh \
+            "$RUNNER_TEMP/osconfig-built" "$RUNNER_TEMP/osconfig-pages"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: google-osconfig-agent-pages
+          path: ${{ runner.temp }}/osconfig-pages/rpm
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    needs: [prepare, review, sign]
+    if: >-
+      needs.prepare.outputs.exists == 'true' && needs.review.result == 'success' &&
+      needs.review.outputs.ready == 'true' && needs.sign.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: master
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: google-osconfig-agent-candidate
+          path: ${{ runner.temp }}/osconfig-candidate
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: google-osconfig-agent-pages
+          path: ${{ runner.temp }}/osconfig-pages
+      - name: Recheck exact review and signed repository before publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OSCONFIG_RPM_SIGNING_FINGERPRINT: ${{ vars.OSCONFIG_RPM_SIGNING_FINGERPRINT }}
+        run: python3 -B .vps/google-osconfig-agent/patches/release.py verify \
+          "$RUNNER_TEMP/osconfig-candidate" "$RUNNER_TEMP/osconfig-pages"
+      - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5.0.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: google-osconfig-agent-pages
+          path: ${{ runner.temp }}/pages/rpm
+      - uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4.0.0
+        with:
+          path: ${{ runner.temp }}/pages
+      - name: Publish the signed RPM-MD repository
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5
+  adopt:
+    needs: [prepare, review, publish]
+    if: >-
+      needs.prepare.outputs.exists == 'true' && needs.review.result == 'success' &&
+      needs.review.outputs.ready == 'true' && needs.publish.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: master
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: google-osconfig-agent-candidate
+          path: ${{ runner.temp }}/osconfig-candidate
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: google-osconfig-agent-pages
+          path: ${{ runner.temp }}/osconfig-pages
+      - name: Verify publication and persist the exact source, patch and required EVR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OSCONFIG_RPM_SIGNING_FINGERPRINT: ${{ vars.OSCONFIG_RPM_SIGNING_FINGERPRINT }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gnupg
+          python3 -B .vps/google-osconfig-agent/patches/release.py adopt \
+            "$RUNNER_TEMP/osconfig-candidate" "$RUNNER_TEMP/osconfig-pages"

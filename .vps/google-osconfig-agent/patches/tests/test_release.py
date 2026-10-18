@@ -190,12 +190,108 @@ class WorkflowActionPinTests(unittest.TestCase):
                 release.verify_workflow_action_pins([workflow])
 
 
+class SigningWorkflowTrustTests(unittest.TestCase):
+    def workflow_path(self):
+        return Path(os.environ.get("OSCONFIG_POLICY_CANDIDATE_WORKFLOW") or
+                    (release.PATCH_DIR / "workflows/google-osconfig-agent-inventory.yml"))
+
+    def load_document(self, directory):
+        yaml = release.yaml_module()
+        original = self.workflow_path()
+        document = yaml.safe_load(original.read_text(encoding="utf-8"))
+        path = Path(directory) / "workflow.yml"
+        path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+        return yaml, document, path
+
+    def test_candidate_workflow_uses_trusted_checkout_signer_and_regression(self):
+        release.validate_signing_workflow(self.workflow_path())
+
+    def test_signing_job_can_update_runner_image_and_build_tool_packages(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, document, path = self.load_document(temporary)
+            job = document["jobs"]["sign"]
+            job["runs-on"] = "ubuntu-26.04"
+            job["timeout-minutes"] = 35
+            job["container"] = "fedora:45"
+            install = next(step for step in job["steps"]
+                           if str(step.get("run", "")).startswith("dnf "))
+            install["run"] += " package-tools-v2"
+            path.write_text(release.yaml_module().safe_dump(document, sort_keys=False), encoding="utf-8")
+            release.validate_signing_workflow(path)
+
+    def test_candidate_signer_script_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, document, path = self.load_document(temporary)
+            signer = next(step for step in document["jobs"]["sign"]["steps"]
+                          if "OSCONFIG_RPM_SIGNING_PRIVATE_KEY" in (step.get("env") or {}))
+            signer["run"] = signer["run"].replace(
+                f"{release.PREFIX}sign-repo.sh", "$RUNNER_TEMP/osconfig-candidate/sign-repo.sh",
+            )
+            path.write_text(release.yaml_module().safe_dump(document, sort_keys=False), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "trusted tools"):
+                release.validate_signing_workflow(path)
+
+    def test_signing_checkout_must_pin_the_exact_workflow_commit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, document, path = self.load_document(temporary)
+            checkout = next(step for step in document["jobs"]["sign"]["steps"]
+                            if str(step.get("uses", "")).startswith("actions/checkout@"))
+            checkout["with"]["ref"] = "master"
+            path.write_text(release.yaml_module().safe_dump(document, sort_keys=False), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "exact trusted workflow commit"):
+                release.validate_signing_workflow(path)
+
+    def test_production_key_cannot_move_to_another_step(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, document, path = self.load_document(temporary)
+            steps = document["jobs"]["sign"]["steps"]
+            signer = next(step for step in steps
+                          if "OSCONFIG_RPM_SIGNING_PRIVATE_KEY" in (step.get("env") or {}))
+            secret = signer["env"].pop("OSCONFIG_RPM_SIGNING_PRIVATE_KEY")
+            steps[0].setdefault("env", {})["OSCONFIG_RPM_SIGNING_PRIVATE_KEY"] = secret
+            path.write_text(release.yaml_module().safe_dump(document, sort_keys=False), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Only the trusted signer step"):
+                release.validate_signing_workflow(path)
+
+    def test_signing_workflow_rejects_job_wide_environment(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, document, path = self.load_document(temporary)
+            document["jobs"]["sign"]["env"] = {"PATH": "$RUNNER_TEMP/candidate-bin"}
+            path.write_text(release.yaml_module().safe_dump(document, sort_keys=False), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "cannot supply job-wide secrets"):
+                release.validate_signing_workflow(path)
+
+    def test_signing_regression_must_precede_key_exposure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, document, path = self.load_document(temporary)
+            steps = document["jobs"]["sign"]["steps"]
+            test_index = next(index for index, step in enumerate(steps)
+                              if "tests/signing.sh" in step.get("run", ""))
+            signer_index = next(index for index, step in enumerate(steps)
+                                if "OSCONFIG_RPM_SIGNING_PRIVATE_KEY" in (step.get("env") or {}))
+            steps[test_index], steps[signer_index] = steps[signer_index], steps[test_index]
+            path.write_text(release.yaml_module().safe_dump(document, sort_keys=False), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "before the production key"):
+                release.validate_signing_workflow(path)
+
+    def test_review_command_failure_routes_to_publisher_repair(self):
+        document = release.yaml_module().safe_load(self.workflow_path().read_text(encoding="utf-8"))
+        repair = document["jobs"]["repair-publisher"]
+        self.assertIn("review", repair["needs"])
+        self.assertIn("sign", repair["needs"])
+        self.assertIn("needs.review.result == 'failure'", repair["if"])
+        self.assertIn("needs.sign.result == 'failure'", repair["if"])
+        self.assertIn("release.py repair-policy", repair["steps"][-1].get("run", ""))
+
+
 class ParserRequirementTests(unittest.TestCase):
     def test_parser_requirement_accepts_an_exact_future_pyyaml_version(self):
         for version in ("6.0.3", "999999.0.0", "7.0rc1+policy.2"):
             with self.subTest(version=version):
                 self.assertEqual(
-                    release.parser_requirement_version(f"# trusted comment\nPyYAML=={version}\n"),
+                    release.parser_requirement_version(
+                        f"# trusted comment\nPyYAML=={version} --hash=sha256:{'a' * 64}\n"
+                    ),
                     version,
                 )
 
@@ -208,6 +304,8 @@ class ParserRequirementTests(unittest.TestCase):
             "PyYAML==6.0.3; python_version>='3.12'\n",
             "PyYAML==6.0.3\nOtherDependency==1\n",
             "PyYAML==6.*\n",
+            f"PyYAML==6.0.3 --hash=sha256:{'a' * 63}\n",
+            f"PyYAML==6.0.3 --hash=sha256:{'a' * 64} --hash=sha256:{'b' * 64}\n",
         )
         for content in invalid:
             with self.subTest(content=content), self.assertRaisesRegex(
@@ -221,16 +319,25 @@ class PolicyBootstrapWorkflowTests(unittest.TestCase):
         workflow = Path(os.environ.get("OSCONFIG_POLICY_CANDIDATE_WORKFLOW") or
                         (release.PATCH_DIR / "workflows/google-osconfig-agent-inventory.yml"))
         document = release.yaml_module().safe_load(workflow.read_text(encoding="utf-8"))
+        prepare_steps = document["jobs"]["prepare"]["steps"]
+        declared_install = [step for step in prepare_steps
+                            if step.get("name") == "Install declared workflow parser dependency"]
+        self.assertEqual(len(declared_install), 1)
+        self.assertIn("--require-hashes", declared_install[0]["run"])
+        self.assertIn("-r .vps/google-osconfig-agent/patches/requirements-policy.txt",
+                      declared_install[0]["run"])
         steps = document["jobs"]["policy-check"]["steps"]
         bootstrap = [step for step in steps
                      if step.get("name") == "Install independent policy bootstrap parser"]
         self.assertEqual(len(bootstrap), 1)
         install = bootstrap[0]["run"]
         self.assertIn("pip install", install)
-        self.assertIn("PyYAML", install)
         self.assertIn("--only-binary=:all:", install)
+        self.assertIn("--require-hashes", install)
         self.assertIn("osconfig-policy-bootstrap", install)
-        self.assertNotIn("requirements-policy.txt", install)
+        self.assertIn("-r trusted/.vps/google-osconfig-agent/patches/requirements-policy-bootstrap.txt", install)
+        self.assertNotIn("trusted/.vps/google-osconfig-agent/patches/requirements-policy.txt", install)
+        self.assertNotIn(">=6,<7", install)
         check = [step for step in steps if "release.py policy-check candidate" in step.get("run", "")]
         self.assertEqual(len(check), 1)
         self.assertIn("osconfig-policy-bootstrap", check[0].get("env", {}).get("PYTHONPATH", ""))
@@ -431,8 +538,12 @@ class PublisherPolicyScopeTests(unittest.TestCase):
             ".vps/google-osconfig-agent/patches/release.py",
             ".vps/google-osconfig-agent/patches/tests/test_release.py",
             ".vps/google-osconfig-agent/patches/tests/test_policy_isolation.py",
+            ".vps/google-osconfig-agent/patches/tests/signing.sh",
+            ".vps/google-osconfig-agent/patches/sign-repo.sh",
+            ".vps/google-osconfig-agent/patches/verify-repo.sh",
             ".vps/google-osconfig-agent/patches/workflows/google-osconfig-agent-inventory.yml",
             ".vps/google-osconfig-agent/patches/requirements-policy.txt",
+            ".vps/google-osconfig-agent/patches/requirements-policy-bootstrap.txt",
             ".github/workflows/google-osconfig-agent-inventory.yml",
         }
         self.assertEqual(release.POLICY_FILES, expected)
@@ -445,6 +556,14 @@ class PublisherPolicyScopeTests(unittest.TestCase):
             ])
         with self.assertRaisesRegex(ValueError, "allowlisted"):
             release.validate_policy_paths([])
+
+    def test_signing_code_is_trusted_policy_not_application_candidate_input(self):
+        for relative in ("sign-repo.sh", "verify-repo.sh"):
+            with self.subTest(relative=relative):
+                self.assertNotIn(relative, release.PACKAGE_FILES)
+                self.assertNotIn(release.PREFIX + relative, release.EDITABLE_CANDIDATE_FILES)
+                self.assertIn(release.PREFIX + relative, release.POLICY_FILES)
+        self.assertIn(release.PREFIX + "tests/signing.sh", release.POLICY_FILES)
 
     def test_human_setup_notice_requires_a_concrete_permission_error(self):
         self.assertEqual(release.permission_blocker("repair window expired; try a new approach"), ("", ""))
@@ -462,6 +581,27 @@ class PublisherPolicyDiffTests(unittest.TestCase):
     def git(self, *args, cwd):
         return subprocess.run(["git", *args], cwd=cwd, check=True, text=True,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.strip()
+
+    def test_cached_whitespace_check_excludes_only_the_nested_source_patch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            work = root / "work"
+            self.git("init", str(work), cwd=root)
+            self.git("config", "user.name", "test", cwd=work)
+            self.git("config", "user.email", "test@example.invalid", cwd=work)
+            nested_patch = work / release.PATCH_REL
+            nested_patch.parent.mkdir(parents=True)
+            nested_patch.write_text("+ fixture with nested whitespace \n", encoding="utf-8")
+            clean_file = work / "clean.txt"
+            clean_file.write_text("clean\n", encoding="utf-8")
+            self.git("add", "--all", cwd=work)
+            release.check_cached_whitespace(work)
+
+            bad_file = work / "bad.txt"
+            bad_file.write_text("ordinary whitespace error \n", encoding="utf-8")
+            self.git("add", "--", "bad.txt", cwd=work)
+            with self.assertRaises(subprocess.CalledProcessError):
+                release.check_cached_whitespace(work)
 
     def test_exact_git_diff_accepts_only_regular_policy_files(self):
         with tempfile.TemporaryDirectory() as temporary:

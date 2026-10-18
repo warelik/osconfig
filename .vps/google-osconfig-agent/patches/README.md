@@ -40,6 +40,20 @@ so the candidate cannot alter the parser used to judge its output. A native
 regression checks that existing parser files and adjacent new files cannot be
 written.
 
+The signing job checks out the exact trusted workflow commit and executes its
+signer, verifier, and disposable-key regression. Application repair artifacts
+contain package inputs and built RPM data; they cannot replace those signing
+scripts. The production key is supplied only to the signing step. Signing and
+review-command failures enter the separate publisher repair flow.
+
+The initial YAML parser comes from the trusted bootstrap requirements file.
+Both parser requirement files pin the same exact PyYAML version and official
+wheel SHA-256; proposed changes are checked before adoption. Candidate dependency
+resolution uses `pip --require-hashes`, followed by offline installation and the
+trusted regressions in a separate container without network access. The nested
+upstream patch is excluded from the outer patch whitespace check, while other
+package inputs retain that check.
+
 ## Local checks
 
 Run the pinned-source regressions with:
@@ -57,3 +71,9 @@ python3 -B -m unittest discover \
 
 A successful local check does not establish a public Actions run, signed
 publication, or delivery to a VM.
+
+2026-10-18: the complete publisher suite passed 74 tests. Its native isolated
+policy check also passed, including the parser write-denial regression, exact
+Action commit resolution, hashed wheel download, offline installation, and
+checksum-verified actionlint. The earlier exact-commit review findings were
+corrected; this changed commit still requires fresh native Codex review.

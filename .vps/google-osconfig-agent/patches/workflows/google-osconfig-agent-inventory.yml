@@ -53,7 +53,7 @@ jobs:
       - name: Install declared workflow parser dependency
         run: |
           python3 -m pip install --isolated --disable-pip-version-check --no-input --no-cache-dir \
-            --only-binary=:all: --no-deps --index-url https://pypi.org/simple \
+            --only-binary=:all: --no-deps --require-hashes --index-url https://pypi.org/simple \
             --target "$RUNNER_TEMP/osconfig-policy-deps" \
             -r .vps/google-osconfig-agent/patches/requirements-policy.txt
       - name: Test trusted release gate
@@ -155,8 +155,9 @@ jobs:
       - name: Install independent policy bootstrap parser
         run: |
           python3 -m pip install --isolated --disable-pip-version-check --no-input --no-cache-dir \
-            --only-binary=:all: --no-deps --index-url https://pypi.org/simple \
-            --target "$RUNNER_TEMP/osconfig-policy-bootstrap" 'PyYAML>=6,<7'
+            --only-binary=:all: --no-deps --require-hashes --index-url https://pypi.org/simple \
+            --target "$RUNNER_TEMP/osconfig-policy-bootstrap" \
+            -r trusted/.vps/google-osconfig-agent/patches/requirements-policy-bootstrap.txt
       - name: Run trusted policy baseline; parse proposed Python and lint the proposed workflow
         id: check
         env:
@@ -389,6 +390,7 @@ jobs:
       always() &&
       (needs.prepare.result == 'failure' ||
        needs.build-rpm.outputs.failure_class == 'publisher' ||
+       needs.review.result == 'failure' ||
        needs.sign.result == 'failure' || needs.publish.result == 'failure' ||
        needs.adopt.result == 'failure' || needs.policy-resume.result == 'failure')
     runs-on: ubuntu-24.04
@@ -427,14 +429,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: master
+          ref: ${{ github.sha }}
           persist-credentials: false
       - name: Install RPM signing tools
         run: dnf -y install rpm-sign createrepo_c gnupg2 rpm jq coreutils findutils
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: google-osconfig-agent-candidate
-          path: ${{ runner.temp }}/osconfig-candidate
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: google-osconfig-agent-built-rpm
@@ -449,7 +447,7 @@ jobs:
           EXPECTED_UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream }}
           EXPECTED_PATCH_SHA: ${{ needs.prepare.outputs.patch }}
         run: |
-          bash "$RUNNER_TEMP/osconfig-candidate/sign-repo.sh" \
+          bash .vps/google-osconfig-agent/patches/sign-repo.sh \
             "$RUNNER_TEMP/osconfig-built" "$RUNNER_TEMP/osconfig-pages"
           bash .vps/google-osconfig-agent/patches/verify-repo.sh \
             "$RUNNER_TEMP/osconfig-built" "$RUNNER_TEMP/osconfig-pages"

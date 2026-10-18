@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import shlex
 import subprocess
 import sys
 import tarfile
@@ -43,8 +44,12 @@ POLICY_FILES = {
     PREFIX + "release.py",
     PREFIX + "tests/test_release.py",
     PREFIX + "tests/test_policy_isolation.py",
+    PREFIX + "tests/signing.sh",
+    PREFIX + "sign-repo.sh",
+    PREFIX + "verify-repo.sh",
     PREFIX + "workflows/google-osconfig-agent-inventory.yml",
     PREFIX + "requirements-policy.txt",
+    PREFIX + "requirements-policy-bootstrap.txt",
     ".github/workflows/google-osconfig-agent-inventory.yml",
 }
 POLICY_IMAGE = "docker.io/library/python@sha256:5560e9ab8709f459489e5b8aa696eda8a07ef821e14bb122be62d91234bfa98b"
@@ -54,7 +59,7 @@ JOB_LOG_LIMIT = 64 * 1024
 JOB_LOG_FETCH_LIMIT = 8 * 1024 * 1024
 PACKAGE_FILES = (
     "build-rpm.sh", "check-upstream.sh", "prepare-source.sh", "release.py",
-    "sign-repo.sh", "verify-repo.sh", "source.lock", "osconfig-inventory.patch",
+    "source.lock", "osconfig-inventory.patch",
     "rpm/google-osconfig-agent.spec", "rpm/go-vendor-tools.toml",
 )
 ROOT = Path(__file__).resolve().parents[3]
@@ -590,7 +595,8 @@ def request_review(repo, pull, sha, upstream, patch_sha, config, token):
         f"Review exact candidate commit {sha}. Upstream source: GoogleCloudPlatform/osconfig@{upstream}.\n"
         f"Trusted configuration commit: {config}; patch SHA-256: {patch_sha}.\n\n"
         "Read the Go source at the exact PR base, the patch regression cases, and the "
-        "RPM spec/build/signing inputs in this candidate. Confirm that DNF5 six-column "
+        "RPM spec/build inputs in this candidate. The signer, verifier, and signing regression "
+        "come from the trusted default branch, not the application candidate. Confirm that DNF5 six-column "
         "rows named replacing are excluded from update inventory and RPM noarch is "
         "serialized as noarch. Reject unrelated changes, weakened tests, "
         "Patch/guest-policy behavior, unsigned delivery and server configuration. "
@@ -664,6 +670,12 @@ def add_package_tree(work, source_dir):
     metadata["configSha"] = os.environ["GITHUB_SHA"]
     metadata["seedPatchSha256"] = digest(PATCH_DIR / "osconfig-inventory.patch")
     (work / PREFIX / "candidate.json").write_text(json.dumps(metadata, sort_keys=True) + "\n")
+
+
+def check_cached_whitespace(repo_work):
+    """Check staged package inputs; the inventory patch is itself a unified diff."""
+    run("git", "diff", "--cached", "--check", "--", ".",
+        f":(exclude){PATCH_REL}", cwd=repo_work)
 
 
 def prepare(candidate):
@@ -740,7 +752,7 @@ def prepare(candidate):
     else:
         add_package_tree(repo_work, source_dir)
         run("git", "add", "--", PREFIX, cwd=repo_work)
-        run("git", "diff", "--cached", "--check", cwd=repo_work)
+        check_cached_whitespace(repo_work)
         run("git", "commit", "-m", f"Prepare OS Config inventory candidate {lock['tag']}", cwd=repo_work)
         seed = run("git", "rev-parse", "HEAD", cwd=repo_work)
         head = seed
@@ -993,10 +1005,19 @@ def request_policy_task(repo, state, evidence, token):
         "Change only `.vps/google-osconfig-agent/patches/release.py`, "
         "`.vps/google-osconfig-agent/patches/tests/test_release.py`, "
         "`.vps/google-osconfig-agent/patches/tests/test_policy_isolation.py`, "
+        "`.vps/google-osconfig-agent/patches/requirements-policy.txt`, "
+        "`.vps/google-osconfig-agent/patches/requirements-policy-bootstrap.txt`, "
+        "`.vps/google-osconfig-agent/patches/sign-repo.sh`, "
+        "`.vps/google-osconfig-agent/patches/verify-repo.sh`, "
+        "`.vps/google-osconfig-agent/patches/tests/signing.sh`, "
         "the workflow template, and `.github/workflows/google-osconfig-agent-inventory.yml`. "
         "Do not change the upstream source lock, inventory patch, RPM spec, repository trust settings, "
         "signing key/fingerprint, server recipe, permissions, review gates, or any live VM state. "
+        "Keep `requirements-policy.txt` and `requirements-policy-bootstrap.txt` byte-identical; "
+        "a parser version/hash update must repair both and pass the trusted wheel-resolution checks. "
         "Preserve exact-SHA review, isolated trusted/proposed checks, signature requirements, and selective adoption. "
+        "The production signing job must use these signer/verifier files from trusted master and run the "
+        "disposable-key signing regression before the production secret step; do not execute candidate artifacts there. "
         "Do not mix application fixes into this PR.\n\n"
         f"Trusted base: `{state['config']}`. Current repair SHA: `{state['head']}`. "
         f"Repair cycle began: {started_at}. Attempt {attempt}; history:\n{history}\n\n"
@@ -1094,8 +1115,11 @@ def request_policy_review(repo, state, token):
         "without importing or executing candidate tests. PyYAML's safe loader extracts semantic job, step, "
         "and reusable-workflow `uses` values; the trusted pre-adoption check resolves every remote full-SHA "
         "reference through the read-only GitHub API outside the no-network test container. The proposed "
-        "requirements file must be a single exact PyYAML pin; the isolated gate downloads its official wheel "
-        "without build hooks, then installs it and runs trusted tests offline. The workflow is also checked "
+        "policy and bootstrap requirements must contain the same exact PyYAML pin and SHA-256 wheel hash; "
+        "the isolated gate downloads that official wheel without build hooks, then installs it and runs trusted tests offline. "
+        "The signer, verifier, and signing regression are trusted policy files; the signing job runs only those "
+        "trusted checkout scripts, and executes the disposable-key regression before exposing the production key. "
+        "The workflow is also checked "
         "with pinned actionlint. "
         "Verify only the documented policy files changed, exact-SHA review remains mandatory, "
         "publisher/application repair paths remain separate, and adoption is selective. "
@@ -1178,9 +1202,15 @@ def parser_requirement_version(requirements):
                if line.strip() and not line.lstrip().startswith("#")]
     if len(entries) != 1:
         raise ValueError("Publisher parser requirements must contain one exact PyYAML pin")
-    match = re.fullmatch(r"([A-Za-z0-9_.-]+)==([A-Za-z0-9][A-Za-z0-9.!+_-]*)", entries[0])
+    match = re.fullmatch(
+        r"([A-Za-z0-9_.-]+)==([A-Za-z0-9][A-Za-z0-9.!+_-]*)\s+"
+        r"--hash=sha256:([A-Fa-f0-9]{64})",
+        entries[0],
+    )
     if not match or match.group(1).lower() != "pyyaml":
-        raise ValueError("Publisher parser requirements must be exactly PyYAML==<version>")
+        raise ValueError(
+            "Publisher parser requirements must be exactly PyYAML==<version> with one SHA-256 wheel hash"
+        )
     return match.group(2)
 
 
@@ -1236,6 +1266,195 @@ def verify_workflow_action_pins(workflows):
     return references
 
 
+def validate_signing_workflow(workflow):
+    """Require the production-key job to use only trusted signer code and inputs."""
+    workflow = Path(workflow)
+    yaml = yaml_module()
+    if not workflow.is_file() or workflow.is_symlink():
+        raise ValueError(f"Signing workflow is not a regular file: {workflow}")
+    try:
+        document = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+    except (yaml.YAMLError, UnicodeError) as error:
+        raise ValueError(f"Signing workflow contains invalid or unsafe YAML: {workflow.name}") from error
+    if isinstance(document, dict) and ("env" in document or "defaults" in document):
+        raise ValueError("Signing workflow cannot supply job-wide environment or shell defaults")
+    jobs = document.get("jobs") if isinstance(document, dict) else None
+    sign_job = jobs.get("sign") if isinstance(jobs, dict) else None
+    if not isinstance(sign_job, dict):
+        raise ValueError("Signing workflow has no signing job")
+    if any(key in sign_job for key in ("env", "defaults", "uses", "services")):
+        raise ValueError("Signing job cannot supply job-wide secrets, shell defaults, or candidate services")
+    needs = sign_job.get("needs", [])
+    needs = {needs} if isinstance(needs, str) else set(needs) if isinstance(needs, list) else set()
+    condition = " ".join(str(sign_job.get("if", "")).split())
+    required_conditions = (
+        ("needs.prepare.outputs.exists", "true"),
+        ("needs.build-rpm.result", "success"),
+        ("needs.review.result", "success"),
+        ("needs.review.outputs.ready", "true"),
+    )
+    condition_valid = all(
+        re.search(rf"(?<![A-Za-z0-9_.!]){re.escape(path)}\s*==\s*['\"]?{value}['\"]?",
+                  condition, re.I)
+        and not re.search(rf"!\s*{re.escape(path)}", condition, re.I)
+        for path, value in required_conditions
+    )
+    runner = sign_job.get("runs-on")
+    runner_labels = ([runner] if isinstance(runner, str) else runner
+                     if isinstance(runner, list) and all(isinstance(label, str) for label in runner)
+                     else [])
+    if (not any(re.fullmatch(r"ubuntu-(?:[0-9]{2}\.[0-9]{2}|latest)", label, re.I)
+                for label in runner_labels)
+            or any("self-hosted" in label.lower() for label in runner_labels)):
+        raise ValueError("Signing job must use a GitHub-hosted Ubuntu runner")
+    container = sign_job.get("container")
+    if isinstance(container, dict):
+        if set(container) != {"image"}:
+            raise ValueError("Signing job container cannot supply environment or mount overrides")
+        container = container.get("image")
+    trusted_images = (
+        r"fedora",
+        r"docker\.io/library/fedora",
+        r"quay\.io/fedora/fedora",
+        r"registry\.fedoraproject\.org/fedora",
+    )
+    image_pattern = r"(?:" + "|".join(trusted_images) + r"):[A-Za-z0-9_.-]+(?:@sha256:[A-Fa-f0-9]{64})?"
+    if not isinstance(container, str) or not re.fullmatch(image_pattern, container):
+        raise ValueError("Signing job container must come from an official Fedora image repository")
+    if (not {"prepare", "build-rpm", "review"}.issubset(needs)
+            or sign_job.get("permissions") != {"contents": "read"}
+            or not condition_valid):
+        raise ValueError("Signing job must wait for the exact reviewed application candidate")
+    if "uses" in sign_job:
+        raise ValueError("Signing workflow cannot delegate the signing job to a candidate reusable workflow")
+    steps = sign_job.get("steps")
+    if not isinstance(steps, list) or not steps:
+        raise ValueError("Signing workflow has no trusted steps")
+
+    key = "OSCONFIG_RPM_SIGNING_PRIVATE_KEY"
+    key_occurrences = []
+
+    def find_key(node, path=()):
+        if isinstance(node, dict):
+            for name, value in node.items():
+                next_path = path + (name,)
+                if name == key:
+                    key_occurrences.append((next_path, value))
+                find_key(value, next_path)
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                find_key(value, path + (index,))
+
+    find_key(document)
+    keyed_steps = [index for index, step in enumerate(steps)
+                   if isinstance(step, dict) and key in (step.get("env") or {})]
+    if len(keyed_steps) != 1 or len(key_occurrences) != 1:
+        raise ValueError("Production signing key must be scoped to one trusted signer step")
+    signer_index = keyed_steps[0]
+    secret_path, secret_value = key_occurrences[0]
+    if (secret_path != ("jobs", "sign", "steps", signer_index, "env", key)
+            or secret_value != "${{ secrets.OSCONFIG_RPM_SIGNING_PRIVATE_KEY }}"):
+        raise ValueError("Production signing key must be available only to the trusted signer step")
+
+    checkout_steps = []
+    download_steps = []
+    upload_steps = []
+    run_steps = []
+    for index, step in enumerate(steps):
+        if not isinstance(step, dict):
+            raise ValueError("Signing workflow contains a malformed step")
+        if set(step) - {"uses", "name", "run", "env", "with", "id", "shell",
+                        "working-directory", "timeout-minutes"}:
+            raise ValueError("Signing workflow step has unexpected execution settings")
+        if ("uses" in step) == ("run" in step):
+            raise ValueError("Signing workflow step must use exactly one trusted action or command")
+        if index != signer_index and "env" in step:
+            raise ValueError("Only the trusted signer step may receive environment values")
+        uses = step.get("uses")
+        if uses is not None:
+            if not isinstance(uses, str) or "@" not in uses:
+                raise ValueError("Signing workflow action is not pinned")
+            repository = "/".join(uses.split("@", 1)[0].split("/")[:2])
+            if repository == "actions/checkout":
+                checkout_steps.append((index, step))
+            elif repository == "actions/download-artifact":
+                download_steps.append((index, step))
+            elif repository == "actions/upload-artifact":
+                upload_steps.append((index, step))
+            else:
+                raise ValueError("Signing workflow may use only the trusted checkout and artifact actions")
+        if "run" in step:
+            try:
+                run_text = step["run"].replace("\\\r\n", " ").replace("\\\n", " ")
+                tokens = shlex.split(run_text)
+            except (TypeError, ValueError) as error:
+                raise ValueError("Signing workflow contains an invalid shell command") from error
+            run_steps.append((index, tokens))
+
+    if len(checkout_steps) != 1:
+        raise ValueError("Signing job must have one checkout of the trusted default branch")
+    checkout_index, checkout = checkout_steps[0]
+    checkout_inputs = checkout.get("with") or {}
+    if (not isinstance(checkout_inputs, dict)
+            or checkout_inputs.get("ref") != "${{ github.sha }}"
+            or checkout_inputs.get("persist-credentials") is not False
+            or {"path", "repository", "token"} & set(checkout_inputs)):
+        raise ValueError("Signing job must check out the exact trusted workflow commit into the workspace")
+    if len(download_steps) != 1:
+        raise ValueError("Signing job must download only the built RPM artifact")
+    download_inputs = download_steps[0][1].get("with") or {}
+    if (not isinstance(download_inputs, dict)
+            or download_inputs.get("name") != "google-osconfig-agent-built-rpm"
+            or download_inputs.get("path") != "${{ runner.temp }}/osconfig-built"
+            or {"pattern", "repository", "run-id", "github-token"} & set(download_inputs)):
+        raise ValueError("Signing job cannot download a candidate script artifact")
+    if len(upload_steps) != 1:
+        raise ValueError("Signing job must upload only the signed repository artifact")
+    upload_inputs = upload_steps[0][1].get("with") or {}
+    if (not isinstance(upload_inputs, dict)
+            or upload_inputs.get("name") != "google-osconfig-agent-pages"
+            or upload_inputs.get("path") != "${{ runner.temp }}/osconfig-pages/rpm"):
+        raise ValueError("Signing job has an unexpected artifact output")
+
+    expected_signer_env = {
+        "OSCONFIG_RPM_SIGNING_PRIVATE_KEY": "${{ secrets.OSCONFIG_RPM_SIGNING_PRIVATE_KEY }}",
+        "OSCONFIG_RPM_SIGNING_FINGERPRINT": "${{ vars.OSCONFIG_RPM_SIGNING_FINGERPRINT }}",
+        "EXPECTED_CANDIDATE_SHA": "${{ needs.prepare.outputs.sha }}",
+        "EXPECTED_UPSTREAM_SHA": "${{ needs.prepare.outputs.upstream }}",
+        "EXPECTED_PATCH_SHA": "${{ needs.prepare.outputs.patch }}",
+    }
+    if steps[signer_index].get("env") != expected_signer_env:
+        raise ValueError("Signer step must receive only the exact reviewed package identity and signing key")
+
+    trusted_commands = [
+        shlex.split(f"bash {PREFIX}tests/signing.sh \"$RUNNER_TEMP/osconfig-built\""),
+        shlex.split(
+            f"bash {PREFIX}sign-repo.sh \"$RUNNER_TEMP/osconfig-built\" \"$RUNNER_TEMP/osconfig-pages\" "
+            f"bash {PREFIX}verify-repo.sh \"$RUNNER_TEMP/osconfig-built\" \"$RUNNER_TEMP/osconfig-pages\""
+        ),
+    ]
+    install_steps = []
+    for index, tokens in run_steps:
+        if (tokens and tokens[0] == "dnf" and "install" in tokens
+                and not re.search(r"[;&|<>`$()]", " ".join(tokens))):
+            install_steps.append((index, tokens))
+    if (len(run_steps) != 3 or len(install_steps) != 1
+            or any(tokens not in trusted_commands for _, tokens in run_steps if tokens != install_steps[0][1])):
+        raise ValueError("Signing job must run only trusted tools and the trusted signing regression")
+    test_tokens, signer_tokens = trusted_commands
+    test_indices = [index for index, tokens in run_steps if tokens == test_tokens]
+    signer_indices = [index for index, tokens in run_steps if tokens == signer_tokens]
+    install_indices = [index for index, _ in install_steps]
+    upload_index = upload_steps[0][0]
+    if (len(test_indices) != 1 or len(signer_indices) != 1
+            or len(install_indices) != 1 or signer_indices[0] != signer_index):
+        raise ValueError("Trusted signing regression must pass before the production key is exposed")
+    step_order = (checkout_index, install_indices[0], download_steps[0][0],
+                  test_indices[0], signer_index, upload_index)
+    if step_order != tuple(sorted(step_order)):
+        raise ValueError("Trusted signing regression must pass before the production key is exposed")
+
+
 def collect_workflow_action_reference(value, workflow, location, references):
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"Workflow uses reference is not a string: {workflow.name}:{location}")
@@ -1257,13 +1476,19 @@ def check_policy(candidate):
     candidate_release = candidate / (PREFIX + "release.py")
     candidate_tests = candidate / (PREFIX + "tests")
     candidate_requirements = candidate / (PREFIX + "requirements-policy.txt")
+    candidate_bootstrap_requirements = candidate / (PREFIX + "requirements-policy-bootstrap.txt")
     if (not candidate_release.is_file() or candidate_release.is_symlink()
             or not candidate_tests.is_dir() or candidate_tests.is_symlink()
             or not (candidate_tests / "test_release.py").is_file()
             or (candidate_tests / "test_release.py").is_symlink()
-            or not candidate_requirements.is_file() or candidate_requirements.is_symlink()):
+            or not candidate_requirements.is_file() or candidate_requirements.is_symlink()
+            or not candidate_bootstrap_requirements.is_file()
+            or candidate_bootstrap_requirements.is_symlink()):
         raise ValueError("Publisher repair candidate is missing release policy, tests, or parser requirements")
-    parser_version = parser_requirement_version(candidate_requirements)
+    parser_requirement_version(candidate_requirements)
+    parser_requirement_version(candidate_bootstrap_requirements)
+    if candidate_requirements.read_bytes() != candidate_bootstrap_requirements.read_bytes():
+        raise ValueError("Policy and trusted bootstrap parser requirements must have the same exact pin and hash")
     trusted_tests = ROOT / PREFIX / "tests"
     trusted_release = ROOT / PREFIX / "release.py"
     if not trusted_release.is_file() or not (trusted_tests / "test_release.py").is_file():
@@ -1280,6 +1505,8 @@ def check_policy(candidate):
                  if workflow.is_file()]
     if not workflows:
         raise ValueError("Publisher repair has no workflow to validate")
+    for workflow in workflows:
+        validate_signing_workflow(workflow)
     verify_workflow_action_pins(workflows)
     unit_launcher = (
         "import sys,unittest;sys.path.insert(0,sys.argv[1]);import release;"
@@ -1357,8 +1584,9 @@ def check_policy(candidate):
         isolated_run(
             {}, ["python3", "-B", "-m", "pip", "download", "--isolated",
                  "--disable-pip-version-check", "--no-input", "--no-cache-dir",
-                 "--only-binary=:all:", "--no-deps", "--index-url", "https://pypi.org/simple",
-                 "--dest", str(parser_wheels), f"PyYAML=={parser_version}"],
+                 "--only-binary=:all:", "--no-deps", "--require-hashes",
+                 "--index-url", "https://pypi.org/simple", "--dest", str(parser_wheels),
+                 "-r", str(candidate_root / "requirements-policy.txt")],
             network=True, context="Official PyYAML wheel resolution",
         )
         wheels = [path for path in parser_wheels.iterdir()

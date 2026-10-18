@@ -13,6 +13,53 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import release
 
 
+def policy_signing_workflow_fixture():
+    sha = "a" * 40
+    return (
+        "name: fixture\n"
+        "jobs:\n"
+        "  sign:\n"
+        "    needs: [prepare, build-rpm, review]\n"
+        "    if: >-\n"
+        "      needs.prepare.outputs.exists == 'true' && needs.build-rpm.result == 'success' &&\n"
+        "      needs.review.result == 'success' && needs.review.outputs.ready == 'true'\n"
+        "    runs-on: ubuntu-24.04\n"
+        "    timeout-minutes: 20\n"
+        "    permissions:\n"
+        "      contents: read\n"
+        "    container: fedora:44\n"
+        "    steps:\n"
+        f"      - uses: actions/checkout@{sha}\n"
+        "        with:\n"
+            "          ref: ${{ github.sha }}\n"
+        "          persist-credentials: false\n"
+        "      - run: dnf -y install rpm-sign createrepo_c gnupg2 rpm jq coreutils findutils\n"
+        f"      - uses: actions/download-artifact@{sha}\n"
+        "        with:\n"
+        "          name: google-osconfig-agent-built-rpm\n"
+        "          path: ${{ runner.temp }}/osconfig-built\n"
+        f"      - run: bash {release.PREFIX}tests/signing.sh \"$RUNNER_TEMP/osconfig-built\"\n"
+        "      - name: Sign repository\n"
+        "        env:\n"
+        "          OSCONFIG_RPM_SIGNING_PRIVATE_KEY: '${{ secrets.OSCONFIG_RPM_SIGNING_PRIVATE_KEY }}'\n"
+        "          OSCONFIG_RPM_SIGNING_FINGERPRINT: '${{ vars.OSCONFIG_RPM_SIGNING_FINGERPRINT }}'\n"
+        "          EXPECTED_CANDIDATE_SHA: '${{ needs.prepare.outputs.sha }}'\n"
+        "          EXPECTED_UPSTREAM_SHA: '${{ needs.prepare.outputs.upstream }}'\n"
+        "          EXPECTED_PATCH_SHA: '${{ needs.prepare.outputs.patch }}'\n"
+        "        run: |\n"
+        f"          bash {release.PREFIX}sign-repo.sh \\\n"
+        "            \"$RUNNER_TEMP/osconfig-built\" \"$RUNNER_TEMP/osconfig-pages\"\n"
+        f"          bash {release.PREFIX}verify-repo.sh \\\n"
+        "            \"$RUNNER_TEMP/osconfig-built\" \"$RUNNER_TEMP/osconfig-pages\"\n"
+        f"      - uses: actions/upload-artifact@{sha}\n"
+        "        with:\n"
+        "          name: google-osconfig-agent-pages\n"
+        "          path: ${{ runner.temp }}/osconfig-pages/rpm\n"
+        "          if-no-files-found: error\n"
+        "          retention-days: 3\n"
+    )
+
+
 class CandidatePolicyCliTests(unittest.TestCase):
     repo = "warelik/osconfig"
     config_sha = "a" * 40
@@ -65,11 +112,11 @@ class CandidatePolicyCliTests(unittest.TestCase):
         shutil.copy2(self.candidate_release(), patch_dir / "release.py")
         (patch_dir / "tests/test_release.py").write_text("# candidate test fixture\n", encoding="utf-8")
         (patch_dir / "requirements-policy.txt").write_text(requirements, encoding="utf-8")
+        (patch_dir / "requirements-policy-bootstrap.txt").write_text(requirements, encoding="utf-8")
         (candidate / release.REPOSITORY_CONF).parent.mkdir(parents=True, exist_ok=True)
         (candidate / release.REPOSITORY_CONF).write_text("# candidate config fixture\n", encoding="utf-8")
         (patch_dir / "workflows/google-osconfig-agent-inventory.yml").write_text(
-            "name: fixture\njobs:\n  check:\n    steps:\n"
-            f"      - uses: actions/checkout@{'a' * 40}\n",
+            policy_signing_workflow_fixture(),
             encoding="utf-8",
         )
         return candidate
@@ -204,6 +251,8 @@ if found is not None:
     response = routes[found]
 elif method == "GET" and base_path.startswith("repos/warelik/osconfig/commits/"):
     response = {"sha": base_path.rsplit("/", 1)[-1]}
+elif method == "GET" and base_path.startswith("repos/actions/") and "/commits/" in base_path:
+    response = {"sha": base_path.rsplit("/", 1)[-1]}
 else:
     print("unexpected fake GitHub API request: " + method + " " + path, file=sys.stderr)
     raise SystemExit(2)
@@ -220,11 +269,16 @@ print(json.dumps(response))
             docker = binary_dir / "docker"
             docker.write_text(
                 "#!" + sys.executable + "\n" + r'''import json, os, sys
+from pathlib import Path
 args = sys.argv[1:]
 if args == ["info"]:
     raise SystemExit(0)
 if args[:1] == ["run"] and "download" in args:
-    print("ERROR: No matching distribution found for PyYAML==999999.0.0", file=sys.stderr)
+    requirement_path = Path(args[args.index("-r") + 1])
+    if "PyYAML==6.0.3" in requirement_path.read_text(encoding="utf-8"):
+        print("ERROR: Downloaded PyYAML wheel does not match the required SHA-256", file=sys.stderr)
+    else:
+        print("ERROR: No matching distribution found for PyYAML==999999.0.0", file=sys.stderr)
     raise SystemExit(1)
 print("unexpected fake container command", file=sys.stderr)
 raise SystemExit(2)
@@ -276,6 +330,8 @@ raise SystemExit(2)
             "GITHUB_OUTPUT": str(output_file),
             "CODEX_REQUEST_TOKEN": "fixture-owner-token",
             "PYTHONDONTWRITEBYTECODE": "1",
+            # Native policy checks install their trusted parser outside site-packages.
+            "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
             "LC_ALL": "C.UTF-8",
             "TZ": "UTC",
             "OSCONFIG_FAKE_GH_ROUTES": str(routes_file),
@@ -477,10 +533,35 @@ raise SystemExit(2)
         self.assertFalse(any(call["path"].startswith("repos/actions/") for call in calls))
         self.assertTrue(any(call and call[0] == "diff" for call in git_calls))
 
+    def test_policy_check_cli_rejects_mismatched_bootstrap_pin_before_candidate_tests(self):
+        with tempfile.TemporaryDirectory(prefix="osconfig-policy-requirements-mismatch-") as temporary:
+            root = Path(temporary)
+            candidate = self.write_policy_candidate(
+                root, f"PyYAML==6.0.3 --hash=sha256:{'a' * 64}\n",
+            )
+            (candidate / release.PREFIX / "requirements-policy-bootstrap.txt").write_text(
+                f"PyYAML==6.0.3 --hash=sha256:{'b' * 64}\n", encoding="utf-8",
+            )
+            changed = (release.PREFIX + "requirements-policy.txt\n"
+                       + release.PREFIX + "requirements-policy-bootstrap.txt\n")
+            result, output, calls, git_calls = self.run_candidate_cli(
+                root, candidate / release.PREFIX / "release.py", ["policy-check", candidate],
+                routes=self.policy_routes(self.policy_pull()), git_mode="scope",
+                changed_paths=changed,
+                env_extra={"POLICY_PR_NUMBER": "42", "POLICY_HEAD_SHA": self.candidate_sha},
+            )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("same exact pin and hash", result.stderr)
+        self.assertEqual(output, "")
+        self.assertFalse(any(call["method"] == "POST" for call in calls))
+        self.assertTrue(any(call and call[0] == "diff" for call in git_calls))
+
     def test_policy_check_cli_does_not_mark_unavailable_parser_wheel_changed(self):
         with tempfile.TemporaryDirectory(prefix="osconfig-policy-requirements-missing-") as temporary:
             root = Path(temporary)
-            candidate = self.write_policy_candidate(root, "PyYAML==999999.0.0\n")
+            candidate = self.write_policy_candidate(
+                root, f"PyYAML==999999.0.0 --hash=sha256:{'b' * 64}\n",
+            )
             action_sha = "a" * 40
             routes = self.policy_routes(self.policy_pull())
             routes[f"GET repos/actions/checkout/commits/{action_sha}"] = {"sha": action_sha}
@@ -498,6 +579,27 @@ raise SystemExit(2)
         self.assertEqual(result.returncode, 1)
         self.assertIn("Official PyYAML wheel resolution failed", result.stderr)
         self.assertIn("No matching distribution", result.stderr)
+        self.assertEqual(output, "")
+        self.assertFalse(any(call["method"] == "POST" for call in calls))
+        self.assertTrue(any(call and call[0] == "diff" for call in git_calls))
+
+    def test_policy_check_cli_does_not_mark_a_mismatched_parser_wheel_hash_changed(self):
+        with tempfile.TemporaryDirectory(prefix="osconfig-policy-requirements-hash-") as temporary:
+            root = Path(temporary)
+            candidate = self.write_policy_candidate(
+                root, f"PyYAML==6.0.3 --hash=sha256:{'b' * 64}\n",
+            )
+            routes = self.policy_routes(self.policy_pull())
+            result, output, calls, git_calls = self.run_candidate_cli(
+                root, candidate / release.PREFIX / "release.py", ["policy-check", candidate], routes=routes,
+                git_mode="scope",
+                changed_paths=release.PREFIX + "requirements-policy.txt\n",
+                env_extra={"POLICY_PR_NUMBER": "42", "POLICY_HEAD_SHA": self.candidate_sha},
+                container_mode="bad-parser-hash",
+            )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Official PyYAML wheel resolution failed", result.stderr)
+        self.assertIn("does not match the required SHA-256", result.stderr)
         self.assertEqual(output, "")
         self.assertFalse(any(call["method"] == "POST" for call in calls))
         self.assertTrue(any(call and call[0] == "diff" for call in git_calls))
@@ -668,7 +770,10 @@ class PolicyGateIsolationTests(unittest.TestCase):
             trusted_tests.mkdir(parents=True)
             candidate_tests.mkdir(parents=True)
             (candidate / release.PREFIX / "requirements-policy.txt").write_text(
-                "PyYAML==6.0.3\n", encoding="utf-8",
+                "PyYAML==6.0.3 --hash=sha256:" + "a" * 64 + "\n", encoding="utf-8",
+            )
+            (candidate / release.PREFIX / "requirements-policy-bootstrap.txt").write_text(
+                "PyYAML==6.0.3 --hash=sha256:" + "a" * 64 + "\n", encoding="utf-8",
             )
             (trusted / release.PREFIX / "release.py").write_text("# trusted fixture\n", encoding="utf-8")
             (trusted_tests / "test_release.py").write_text("# trusted test fixture\n", encoding="utf-8")
@@ -682,20 +787,19 @@ class PolicyGateIsolationTests(unittest.TestCase):
             installed = candidate / ".github/workflows/google-osconfig-agent-inventory.yml"
             workflow.parent.mkdir(parents=True)
             installed.parent.mkdir(parents=True)
-            workflow.write_text(
-                "name: candidate\njobs:\n  check:\n    steps:\n"
-                "      - uses: actions/checkout@" + "a" * 40 + "\n",
-                encoding="utf-8",
-            )
+            workflow.write_text(policy_signing_workflow_fixture(), encoding="utf-8")
             installed.write_bytes(workflow.read_bytes())
 
             archive = self.actionlint_archive()
             commands = []
+            requested_requirements = []
 
             def completed(command, **kwargs):
                 commands.append(command)
                 if command and command[0].endswith("/docker") and command[1] == "run":
                     if "download" in command:
+                        requirements_path = Path(command[command.index("-r") + 1])
+                        requested_requirements.append(requirements_path.read_text(encoding="utf-8"))
                         destination = Path(command[command.index("--dest") + 1])
                         destination.mkdir(parents=True, exist_ok=True)
                         (destination / "pyyaml-6.0.3-py3-none-any.whl").write_bytes(b"fixture wheel")
@@ -718,7 +822,11 @@ class PolicyGateIsolationTests(unittest.TestCase):
             download = next(command for command in docker_commands if "download" in command)
             self.assertIn("https://pypi.org/simple", download)
             self.assertIn("--only-binary=:all:", download)
-            self.assertIn("PyYAML==6.0.3", download)
+            self.assertIn("--require-hashes", download)
+            self.assertEqual(len(requested_requirements), 1)
+            proposed_requirements = requested_requirements[0]
+            self.assertIn("PyYAML==6.0.3", proposed_requirements)
+            self.assertIn("--hash=sha256:", proposed_requirements)
             install = next(command for command in docker_commands if "install" in command)
             self.assertIn("--no-index", install)
             self.assertIn("--network=none", install)
@@ -749,24 +857,25 @@ class PolicyGateIsolationTests(unittest.TestCase):
             (candidate / release.PREFIX / "release.py").write_text("# candidate fixture\n", encoding="utf-8")
             (candidate_tests / "test_release.py").write_text("# candidate fixture\n", encoding="utf-8")
             (candidate / release.PREFIX / "requirements-policy.txt").write_text(
-                "PyYAML==999999.0.0\n", encoding="utf-8",
+                "PyYAML==999999.0.0 --hash=sha256:" + "b" * 64 + "\n", encoding="utf-8",
+            )
+            (candidate / release.PREFIX / "requirements-policy-bootstrap.txt").write_text(
+                "PyYAML==999999.0.0 --hash=sha256:" + "b" * 64 + "\n", encoding="utf-8",
             )
             workflow = candidate / release.PREFIX / "workflows/google-osconfig-agent-inventory.yml"
             workflow.parent.mkdir(parents=True)
-            workflow.write_text(
-                "name: fixture\njobs:\n  check:\n    steps:\n"
-                "      - uses: actions/checkout@" + "a" * 40 + "\n",
-                encoding="utf-8",
-            )
+            workflow.write_text(policy_signing_workflow_fixture(), encoding="utf-8")
             commands = []
 
             def pip_fails(command, **kwargs):
                 commands.append(command)
                 if command and command[0].endswith("/docker") and command[1] == "run":
                     if "download" in command:
-                        self.assertIn("PyYAML==999999.0.0", command)
+                        self.assertIn("--require-hashes", command)
                         self.assertIn("--only-binary=:all:", command)
                         self.assertNotIn("--network=none", command)
+                        requirement_path = Path(command[command.index("-r") + 1])
+                        self.assertIn("PyYAML==999999.0.0", requirement_path.read_text(encoding="utf-8"))
                         return subprocess.CompletedProcess(
                             command, 1, "", "ERROR: No matching distribution found for PyYAML==999999.0.0",
                         )

@@ -1,0 +1,93 @@
+diff --git a/agentendpoint/agentendpoint_test.go b/agentendpoint/agentendpoint_test.go
+index a5aa99c..8b8ef1e 100644
+--- a/agentendpoint/agentendpoint_test.go
++++ b/agentendpoint/agentendpoint_test.go
+@@ -196,7 +196,18 @@ func (s *agentEndpointServiceTestServer) StartNextTask(ctx context.Context, req
+ 	case !s.execTaskComplete:
+ 		return &agentendpointpb.StartNextTaskResponse{Task: &agentendpointpb.Task{TaskType: agentendpointpb.TaskType_EXEC_STEP_TASK, TaskId: "TaskType_EXEC_STEP_TASK"}}, nil
+ 	case !s.patchTaskComplete:
+-		return &agentendpointpb.StartNextTaskResponse{Task: &agentendpointpb.Task{TaskType: agentendpointpb.TaskType_APPLY_PATCHES, TaskId: "TaskType_APPLY_PATCHES"}}, nil
++		return &agentendpointpb.StartNextTaskResponse{Task: &agentendpointpb.Task{
++			TaskType: agentendpointpb.TaskType_APPLY_PATCHES,
++			TaskId:   "TaskType_APPLY_PATCHES",
++			TaskDetails: &agentendpointpb.Task_ApplyPatchesTask{
++				ApplyPatchesTask: &agentendpointpb.ApplyPatchesTask{
++					DryRun: true,
++					PatchConfig: &agentendpointpb.PatchConfig{
++						RebootConfig: agentendpointpb.PatchConfig_NEVER,
++					},
++				},
++			},
++		}}, nil
+ 	case !s.applyConfigTaskComplete:
+ 		return &agentendpointpb.StartNextTaskResponse{Task: &agentendpointpb.Task{TaskType: agentendpointpb.TaskType_APPLY_CONFIG_TASK, TaskId: "TaskType_APPLY_CONFIG_TASK"}}, nil
+ 	default:
+diff --git a/agentendpoint/inventory.go b/agentendpoint/inventory.go
+index b4af6b0..9620638 100644
+--- a/agentendpoint/inventory.go
++++ b/agentendpoint/inventory.go
+@@ -606,10 +606,14 @@ func formatGooGetPackage(pkg *packages.PkgInfo) *agentendpointpb.Inventory_Softw
+ }
+ 
+ func formatYumPackage(pkg *packages.PkgInfo) *agentendpointpb.Inventory_SoftwarePackage_YumPackage {
++	architecture := pkg.Arch
++	if architecture == "all" {
++		architecture = "noarch"
++	}
+ 	fPkg := &agentendpointpb.Inventory_SoftwarePackage_YumPackage{
+ 		YumPackage: &agentendpointpb.Inventory_VersionedPackage{
+ 			PackageName:  pkg.Name,
+-			Architecture: pkg.Arch,
++			Architecture: architecture,
+ 			Version:      pkg.Version,
+ 		},
+ 	}
+diff --git a/agentendpoint/inventory_test.go b/agentendpoint/inventory_test.go
+index 57b1ad0..5fdcfb8 100644
+--- a/agentendpoint/inventory_test.go
++++ b/agentendpoint/inventory_test.go
+@@ -917,3 +917,10 @@ func Test_reportVmInventory_parseQFEDate(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestFormatYumPackagePreservesNoarch(t *testing.T) {
++	got := formatYumPackage(&packages.PkgInfo{Name: "golang-src", Arch: "all", Type: "rpm"})
++	if got.YumPackage.GetArchitecture() != "noarch" {
++		t.Errorf("formatYumPackage() architecture = %q, want noarch", got.YumPackage.GetArchitecture())
++	}
++}
+diff --git a/packages/yum.go b/packages/yum.go
+index ee87694..63ff930 100644
+--- a/packages/yum.go
++++ b/packages/yum.go
+@@ -131,11 +131,12 @@ func parseYumUpdates(data []byte) []*PkgInfo {
+ 		} else if !upgrading {
+ 			continue
+ 		}
+-		// A package line should have 6 fields, break unless this is a 'replacing' entry.
++		// DNF5 can render replacement rows with the same number of columns as a package update.
++		if string(pkg[0]) == "replacing" {
++			continue
++		}
++		// A package line should have 6 fields; shorter rows end the update list.
+ 		if len(pkg) < 6 {
+-			if string(pkg[0]) == "replacing" {
+-				continue
+-			}
+ 			break
+ 		}
+ 
+diff --git a/packages/yum_test.go b/packages/yum_test.go
+index 300b27d..3eab3a0 100644
+--- a/packages/yum_test.go
++++ b/packages/yum_test.go
+@@ -93,6 +93,8 @@ func TestYumUpdates(t *testing.T) {
+     kernel                                    x86_64                         2.6.32-754.24.3.el6                                  updates                                   32 M
+ 	    replacing kernel.x86_64 1.0.0-4
+ 	Upgrading:
++	  replacing                               x86_64                         x86_64                                              updates                                   1 M
++	  replacing                               x86_64                         noarch                                              updates                                   1 M
+ 	  foo                                       noarch                         2.0.0-1                                              BaseOS                                   361 k
+ 	  bar                                       x86_64                         2.0.0-1                                              repo                                      10 M
+ 	Obsoleting:

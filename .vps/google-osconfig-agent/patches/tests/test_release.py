@@ -687,12 +687,38 @@ class PublisherPolicyDiffTests(unittest.TestCase):
             self.git("init", str(work), cwd=root)
             self.git("config", "user.name", "test", cwd=work)
             self.git("config", "user.email", "test@example.invalid", cwd=work)
+            source_file = work / "example.go"
+            source_file.write_text("package p\nfunc f() {\n\tkeep()\n\treturn 1\n\n}\n", encoding="utf-8")
+            self.git("add", "--", "example.go", cwd=work)
+            self.git("commit", "-m", "nested patch source", cwd=work)
             nested_patch = work / release.PATCH_REL
             nested_patch.parent.mkdir(parents=True)
-            nested_patch.write_text("+ fixture with nested whitespace \n", encoding="utf-8")
+            nested_patch.write_text(
+                "diff --git a/example.go b/example.go\n"
+                "index 1111111..2222222 100644\n"
+                "--- a/example.go\n"
+                "+++ b/example.go\n"
+                "@@ -1,6 +1,6 @@\n"
+                " package p\n"
+                " func f() {\n"
+                " \tkeep()\n"
+                "-\treturn 1\n"
+                "+\treturn 2\n"
+                " \n"
+                " }\n",
+                encoding="utf-8",
+            )
             clean_file = work / "clean.txt"
             clean_file.write_text("clean\n", encoding="utf-8")
             self.git("add", "--all", cwd=work)
+            self.assertEqual(
+                subprocess.run(["git", "apply", "--check", str(nested_patch)], cwd=work,
+                               text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).returncode,
+                0,
+            )
+            with self.assertRaises(subprocess.CalledProcessError):
+                subprocess.run(["git", "diff", "--cached", "--check"], cwd=work, check=True,
+                               text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             release.check_cached_whitespace(work)
 
             bad_file = work / "bad.txt"
@@ -700,6 +726,80 @@ class PublisherPolicyDiffTests(unittest.TestCase):
             self.git("add", "--", "bad.txt", cwd=work)
             with self.assertRaises(subprocess.CalledProcessError):
                 release.check_cached_whitespace(work)
+
+    def test_adopt_uses_cached_whitespace_check_for_nested_patch(self):
+        package_evr = next(
+            line.partition("=")[2]
+            for line in (release.ROOT / release.REPOSITORY_CONF).read_text(encoding="utf-8").splitlines()
+            if line.startswith("minimum_evr=")
+        )
+
+        def run_adoption(root, *, bad_ordinary_file):
+            remote, seed = root / "origin.git", root / "seed"
+            self.git("init", "--bare", "--initial-branch=master", str(remote), cwd=root)
+            self.git("init", "--initial-branch=master", str(seed), cwd=root)
+            self.git("config", "user.name", "adoption fixture", cwd=seed)
+            self.git("config", "user.email", "adoption-fixture@example.invalid", cwd=seed)
+            repository_conf = seed / release.REPOSITORY_CONF
+            repository_conf.parent.mkdir(parents=True)
+            repository_conf.write_bytes((release.ROOT / release.REPOSITORY_CONF).read_bytes())
+            self.git("add", "--all", cwd=seed)
+            self.git("commit", "-m", "trusted base", cwd=seed)
+            config_sha = self.git("rev-parse", "HEAD", cwd=seed)
+            self.git("push", str(remote), "HEAD:master", cwd=seed)
+
+            candidate = root / "candidate"
+            candidate.mkdir()
+            for relative in release.PACKAGE_FILES:
+                source = release.PATCH_DIR / relative
+                payload = source.read_bytes()
+                if bad_ordinary_file and relative == "build-rpm.sh":
+                    payload += b"# ordinary trailing whitespace \n"
+                (candidate / Path(relative).name).write_bytes(payload)
+
+            manifest = {"configSha": config_sha, "candidatePr": 42}
+            settings = {"minimum_evr": package_evr}
+            published = {"packageEvr": package_evr}
+            verified = ("fixture/osconfig", manifest, settings, "A" * 40, published, config_sha)
+            original_run = release.run
+
+            def fixture_run(*arguments, cwd=None, env=None, input=None):
+                if arguments == ("gh", "auth", "setup-git"):
+                    return ""
+                if arguments[:3] == ("git", "clone", "--no-checkout"):
+                    arguments = (*arguments[:3], str(remote), arguments[4])
+                    output = original_run(*arguments, cwd=cwd, env=env, input=input)
+                    original_run("git", "config", "core.hooksPath", "/dev/null",
+                                 cwd=arguments[4])
+                    return output
+                return original_run(*arguments, cwd=cwd, env=env, input=input)
+
+            with patch.object(release, "verify_candidate_artifact", return_value=verified), \
+                 patch.object(release, "run", side_effect=fixture_run), \
+                 patch.object(release, "close_candidate"), \
+                 patch.object(release, "check_cached_whitespace",
+                              wraps=release.check_cached_whitespace) as whitespace_check, \
+                 patch.dict(os.environ, {}, clear=False):
+                if bad_ordinary_file:
+                    with self.assertRaises(release.CommandFailure):
+                        release.adopt(candidate, root / "pages")
+                else:
+                    release.adopt(candidate, root / "pages")
+            self.assertEqual(whitespace_check.call_count, 1)
+            return config_sha, self.git("--git-dir", str(remote), "rev-parse", "refs/heads/master",
+                                        cwd=root)
+
+        with tempfile.TemporaryDirectory(prefix="osconfig-adopt-whitespace-positive-") as temporary:
+            root = Path(temporary)
+            base_sha, adopted_sha = run_adoption(root, bad_ordinary_file=False)
+            self.assertNotEqual(adopted_sha, base_sha)
+            self.assertEqual(self.git("--git-dir", str(root / "origin.git"), "show", "-s",
+                                      "--format=%P", adopted_sha, cwd=root), base_sha)
+
+        with tempfile.TemporaryDirectory(prefix="osconfig-adopt-whitespace-negative-") as temporary:
+            root = Path(temporary)
+            base_sha, adopted_sha = run_adoption(root, bad_ordinary_file=True)
+            self.assertEqual(adopted_sha, base_sha)
 
     def test_exact_git_diff_accepts_only_regular_policy_files(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -949,6 +1049,63 @@ class PaginationAndApiDiagnosticsTests(unittest.TestCase):
 
 
 class PublisherRepairDeliveryTests(unittest.TestCase):
+    def test_application_task_requires_verified_delivery_to_manifest_candidate(self):
+        repo = "warelik/osconfig"
+        number = 42
+        candidate_sha = "b" * 40
+        upstream = "c" * 40
+        config = "d" * 40
+        branch = "review/osconfig-exact-candidate"
+        manifest = {
+            "candidatePr": number,
+            "candidateSha": candidate_sha,
+            "candidateBranch": branch,
+            "upstreamCommit": upstream,
+            "configSha": config,
+        }
+        pull = {
+            "number": number,
+            "state": "open",
+            "base": {
+                "ref": f"review-base/{upstream}",
+                "sha": upstream,
+                "repo": {"full_name": repo},
+            },
+            "head": {
+                "ref": branch,
+                "sha": candidate_sha,
+                "repo": {"full_name": repo},
+            },
+        }
+        captured = []
+
+        def fake_api(path, **kwargs):
+            captured.append((path, kwargs))
+            return pull if path == f"repos/{repo}/pulls/{number}" else None
+
+        with tempfile.TemporaryDirectory(prefix="osconfig-application-repair-task-") as temporary:
+            candidate_dir = Path(temporary)
+            (candidate_dir / "candidate-manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8")
+            with patch.object(release, "api", side_effect=fake_api), \
+                 patch.object(release, "pages", return_value=[]), \
+                 patch.object(release, "owner_token", return_value="fixture-token"), \
+                 patch.dict(os.environ, {"GITHUB_REPOSITORY": repo}):
+                release.request_fix(candidate_dir, "package build failed")
+
+        comment = next(call for call in captured
+                       if call[0] == f"repos/{repo}/issues/{number}/comments")
+        body = comment[1]["data"]["body"]
+        self.assertIn(f"`candidatePr` #{number}", body)
+        self.assertIn(f"`candidateBranch` `{branch}`", body)
+        self.assertIn("commit and push", body)
+        self.assertIn(f"read back PR #{number} with the GitHub API", body)
+        self.assertIn("`head.ref` is exactly", body)
+        self.assertIn("`head.sha` equals the pushed commit SHA", body)
+        self.assertIn("A local diff or commit is not delivery", body)
+        self.assertIn("report the exact command and error and do not claim delivery", body)
+        self.assertIn("Do not create another PR or force-push", body)
+
     def test_candidate_checkout_has_full_history_in_template_and_installed_workflow(self):
         yaml = release.yaml_module()
         proposed = os.environ.get("OSCONFIG_POLICY_CANDIDATE_WORKFLOW")

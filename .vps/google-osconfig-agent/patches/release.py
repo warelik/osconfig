@@ -912,6 +912,13 @@ def request_fix(candidate_dir, evidence):
         "upstream without the redundant product hunk, remove only that hunk, and retain the test. "
         "Do not change source.lock, release.py, the workflow, review gates, permissions, or server recipe. "
         "Do not add agent capabilities, Patch/guest-policy behavior, unsigned delivery or server changes.\n\n"
+        f"Use the validated manifest's `candidatePr` #{manifest['candidatePr']} and "
+        f"`candidateBranch` `{manifest['candidateBranch']}`: after tests pass, commit and push to that "
+        "exact existing PR branch. Do not create another PR or force-push. "
+        f"Then read back PR #{manifest['candidatePr']} with the GitHub API and verify `head.ref` "
+        f"is exactly `{manifest['candidateBranch']}` and `head.sha` equals the pushed commit SHA. "
+        "A local diff or commit is not delivery. Report delivery complete only after the remote SHA "
+        "matches; if push or readback fails, report the exact command and error and do not claim delivery.\n\n"
         "The workflow reapplies the patch to the exact source SHA and reruns upstream tests before build. "
         "This time window bounds one attempt only. A later scheduled run continues with preserved "
         "history; elapsed time or attempt count does not prove that no simple fix exists.\n\n"
@@ -1927,7 +1934,7 @@ def adopt(candidate_dir, pages_dir):
         paths = [PATCH_REL, REPOSITORY_CONF]
         paths.extend(PREFIX + relative for relative in PACKAGE_FILES)
         run("git", "add", "--", *paths, cwd=work)
-        run("git", "diff", "--cached", "--check", cwd=work)
+        check_cached_whitespace(work)
         status = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=work, check=False)
         if status.returncode == 1:
             run("git", "-c", "user.name=github-actions[bot]",

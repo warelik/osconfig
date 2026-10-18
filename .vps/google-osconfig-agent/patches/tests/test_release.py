@@ -253,15 +253,16 @@ class SigningWorkflowTrustTests(unittest.TestCase):
                 command = verifier["run"]
                 self.assertIn("sudo apt-get install -y gnupg jq rpm", command)
                 self.assertIn(
-                    "bash .vps/google-osconfig-agent/patches/verify-repo.sh \\\n"
-                    '  "$RUNNER_TEMP/osconfig-built" "$RUNNER_TEMP/osconfig-pages"',
+                    'bash .vps/google-osconfig-agent/patches/verify-repo.sh '
+                    '"$RUNNER_TEMP/osconfig-built" "$RUNNER_TEMP/osconfig-pages"',
                     command,
                 )
-                self.assertIn(f"release.py {operation} \\\n", command)
                 self.assertIn(
-                    '  "$RUNNER_TEMP/osconfig-candidate" "$RUNNER_TEMP/osconfig-pages/rpm"',
+                    f'python3 -B .vps/google-osconfig-agent/patches/release.py {operation} '
+                    '"$RUNNER_TEMP/osconfig-candidate" "$RUNNER_TEMP/osconfig-pages/rpm"',
                     command,
                 )
+                self.assertNotIn("\\\n", command)
 
     def test_signing_job_can_update_runner_image_and_build_tool_packages(self):
         with tempfile.TemporaryDirectory() as temporary:

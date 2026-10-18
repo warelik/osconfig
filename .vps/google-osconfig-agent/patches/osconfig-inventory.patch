@@ -28,23 +28,37 @@ diff --git a/agentendpoint/agentendpoint_test.go b/agentendpoint/agentendpoint_t
  	case !s.applyConfigTaskComplete:
  		return &agentendpointpb.StartNextTaskResponse{Task: &agentendpointpb.Task{TaskType: agentendpointpb.TaskType_APPLY_CONFIG_TASK, TaskId: "TaskType_APPLY_CONFIG_TASK"}}, nil
  	default:
-@@ -252,2 +265,16 @@ func TestWaitForTask(t *testing.T) {
+@@ -252,2 +265,19 @@ func TestWaitForTask(t *testing.T) {
  func TestWaitForTask(t *testing.T) {
 +	previousRunner := packages.GetCommandRunner()
 +	previousPtyRunner := packages.GetPtyCommandRunner()
++	previousRebootProbe := systemRebootRequired
 +	mockController := gomock.NewController(t)
 +	runner := utilmocks.NewMockCommandRunner(mockController)
 +	ptyRunner := utilmocks.NewMockCommandRunner(mockController)
-+	// Keep this RPC-loop test from invoking host package-manager commands.
++	// Keep this RPC-loop test from invoking host package-manager or reboot-probe commands.
 +	runner.EXPECT().Run(gomock.Any(), gomock.Any()).Return(nil, nil, nil).AnyTimes()
 +	ptyRunner.EXPECT().Run(gomock.Any(), gomock.Any()).Return(nil, nil, nil).AnyTimes()
 +	packages.SetCommandRunner(runner)
 +	packages.SetPtyCommandRunner(ptyRunner)
++	systemRebootRequired = func(context.Context) (bool, error) { return false, nil }
 +	t.Cleanup(func() {
 +		packages.SetCommandRunner(previousRunner)
 +		packages.SetPtyCommandRunner(previousPtyRunner)
++		systemRebootRequired = previousRebootProbe
 +	})
  	ctx := context.Background()
+diff --git a/agentendpoint/patch_task.go b/agentendpoint/patch_task.go
+--- a/agentendpoint/patch_task.go
++++ b/agentendpoint/patch_task.go
+@@ -30,5 +30,3 @@
+-func systemRebootRequired(ctx context.Context) (bool, error) {
+-	return ospatch.SystemRebootRequired(ctx)
+-}
+-
++var systemRebootRequired = ospatch.SystemRebootRequired
++
+ type patchStep string
 diff --git a/agentendpoint/inventory.go b/agentendpoint/inventory.go
 index b4af6b0..9620638 100644
 --- a/agentendpoint/inventory.go

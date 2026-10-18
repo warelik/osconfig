@@ -152,6 +152,7 @@ jobs:
           ref: ${{ steps.identity.outputs.head }}
           path: candidate
           persist-credentials: false
+          fetch-depth: 0
       - name: Install independent policy bootstrap parser
         run: |
           python3 -m pip install --isolated --disable-pip-version-check --no-input --no-cache-dir \

@@ -816,6 +816,102 @@ class FailedJobEvidenceTests(unittest.TestCase):
             request, None, 302, "Found", {}, "http://logs.example.invalid/plain"
         ))
 
+class PaginationAndApiDiagnosticsTests(unittest.TestCase):
+    def test_jobs_envelope_paginates_until_total_count(self):
+        first = [{"id": number, "status": "completed", "conclusion": "failure"}
+                 for number in range(100)]
+        second = [{"id": 100, "status": "completed", "conclusion": "failure"}]
+        with patch.object(release, "api", side_effect=[
+            {"total_count": 101, "jobs": first},
+            {"total_count": 101, "jobs": second},
+        ]) as github_api:
+            jobs = release.pages("repos/warelik/osconfig/actions/runs/1/jobs")
+        self.assertEqual(len(jobs), 101)
+        self.assertEqual(jobs[-1]["id"], 100)
+        self.assertEqual(github_api.call_count, 2)
+
+    def test_api_failure_keeps_bounded_sanitized_stderr(self):
+        secret = "ghp_" + "x" * 40
+        failure = subprocess.CalledProcessError(
+            1, ["gh", "api"], stderr="useful denial " + secret + "&sig=signed-secret " + "z" * 10000)
+        with patch.object(subprocess, "run", side_effect=failure), \
+             self.assertRaises(subprocess.CalledProcessError) as raised:
+            release.api("repos/warelik/osconfig/pulls", method="POST", data={"title": "x"})
+        detail = raised.exception.stderr
+        self.assertIn("earlier API error omitted", detail)
+        self.assertNotIn(secret, detail)
+        self.assertNotIn("signed-secret", detail)
+        self.assertLessEqual(len(detail), release.API_ERROR_LIMIT + 32)
+
+
+class PublisherRepairDeliveryTests(unittest.TestCase):
+    def test_candidate_checkout_has_full_history_in_template_and_installed_workflow(self):
+        yaml = release.yaml_module()
+        paths = [release.PATCH_DIR / "workflows/google-osconfig-agent-inventory.yml",
+                 release.ROOT / ".github/workflows/google-osconfig-agent-inventory.yml"]
+        for path in paths:
+            document = yaml.safe_load(path.read_text(encoding="utf-8"))
+            steps = document["jobs"]["policy-check"]["steps"]
+            checkout = next(step for step in steps
+                            if step.get("with", {}).get("path") == "candidate")
+            self.assertEqual(checkout["with"].get("fetch-depth"), 0, path)
+
+    def test_policy_task_requires_verified_delivery_to_exact_head_branch(self):
+        state = {"number": 42, "config": "a" * 40, "head": "b" * 40,
+                 "branch": "repair/osconfig-policy-exact"}
+        captured = []
+        def fake_api(path, **kwargs):
+            captured.append((path, kwargs))
+            return None
+        with patch.object(release, "pages", return_value=[]), \
+             patch.object(release, "api", side_effect=fake_api):
+            release.request_policy_task("warelik/osconfig", state, "failure", "token")
+        body = captured[-1][1]["data"]["body"]
+        self.assertIn("commit and push", body)
+        self.assertIn(state["branch"], body)
+        self.assertIn("read back PR #42", body)
+        self.assertIn("head.sha equals the pushed commit SHA", body)
+        self.assertIn("Never force-push or create another PR", body)
+
+
+class ReusableCommitIdentityTests(unittest.TestCase):
+    def git(self, *args, cwd):
+        return subprocess.run(["git", *args], cwd=cwd, check=True, text=True,
+                              stdout=subprocess.PIPE).stdout.strip()
+
+    def test_exact_tree_and_parent_are_required_for_retry_reuse(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary)
+            self.git("init", cwd=work)
+            self.git("config", "user.name", "fixture", cwd=work)
+            self.git("config", "user.email", "fixture@example.invalid", cwd=work)
+            (work / "file").write_text("base\n")
+            self.git("add", "file", cwd=work)
+            self.git("commit", "-m", "base", cwd=work)
+            base = self.git("rev-parse", "HEAD", cwd=work)
+            tree = self.git("rev-parse", "HEAD^{tree}", cwd=work)
+            self.git("commit", "--allow-empty", "-m", "first candidate", cwd=work)
+            valid = self.git("rev-parse", "HEAD", cwd=work)
+            self.assertEqual(release.verify_reusable_commit(
+                work, valid, tree, base, "candidate branch"), valid)
+
+            (work / "file").write_text("changed\n")
+            self.git("commit", "-am", "wrong tree", cwd=work)
+            wrong_tree = self.git("rev-parse", "HEAD", cwd=work)
+            with self.assertRaisesRegex(ValueError, "unexpected tree or parent"):
+                release.verify_reusable_commit(work, wrong_tree, tree, valid, "candidate branch")
+            with self.assertRaisesRegex(ValueError, "unexpected tree or parent"):
+                release.verify_reusable_commit(work, valid, tree, "f" * 40, "candidate branch")
+
+    def test_api_failure_preserves_actionable_sanitized_detail(self):
+        failure = subprocess.CalledProcessError(
+            1, ["gh", "api"], stderr="permission denied Authorization: Bearer top-secret")
+        with patch.object(subprocess, "run", side_effect=failure), \
+             self.assertRaises(subprocess.CalledProcessError) as raised:
+            release.api("repos/warelik/osconfig/pulls")
+        self.assertIn("permission denied", raised.exception.stderr)
+        self.assertNotIn("top-secret", raised.exception.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

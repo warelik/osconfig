@@ -906,8 +906,10 @@ class PaginationAndApiDiagnosticsTests(unittest.TestCase):
 class PublisherRepairDeliveryTests(unittest.TestCase):
     def test_candidate_checkout_has_full_history_in_template_and_installed_workflow(self):
         yaml = release.yaml_module()
-        paths = [release.PATCH_DIR / "workflows/google-osconfig-agent-inventory.yml",
-                 release.ROOT / ".github/workflows/google-osconfig-agent-inventory.yml"]
+        proposed = os.environ.get("OSCONFIG_POLICY_CANDIDATE_WORKFLOW")
+        paths = ([Path(proposed)] if proposed else
+                 [release.PATCH_DIR / "workflows/google-osconfig-agent-inventory.yml",
+                  release.ROOT / ".github/workflows/google-osconfig-agent-inventory.yml"])
         for path in paths:
             document = yaml.safe_load(path.read_text(encoding="utf-8"))
             steps = document["jobs"]["policy-check"]["steps"]
@@ -927,6 +929,21 @@ class PublisherRepairDeliveryTests(unittest.TestCase):
                 '"$POLICY_BASE_SHA" "$POLICY_HEAD_SHA"',
                 path,
             )
+
+    def test_checkout_history_assertion_reads_the_proposed_workflow(self):
+        yaml = release.yaml_module()
+        source = Path(os.environ.get("OSCONFIG_POLICY_CANDIDATE_WORKFLOW") or
+                      release.PATCH_DIR / "workflows/google-osconfig-agent-inventory.yml")
+        with tempfile.TemporaryDirectory() as directory:
+            document = yaml.safe_load(source.read_text(encoding="utf-8"))
+            checkout = next(step for step in document["jobs"]["policy-check"]["steps"]
+                            if step.get("with", {}).get("path") == "candidate")
+            checkout["with"]["fetch-depth"] = 1
+            candidate = Path(directory) / "proposed.yml"
+            candidate.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+            with patch.dict(os.environ, {"OSCONFIG_POLICY_CANDIDATE_WORKFLOW": str(candidate)}):
+                with self.assertRaises(AssertionError):
+                    self.test_candidate_checkout_has_full_history_in_template_and_installed_workflow()
 
     def test_policy_task_requires_verified_delivery_to_exact_head_branch(self):
         state = {"number": 42, "config": "a" * 40, "head": "b" * 40,

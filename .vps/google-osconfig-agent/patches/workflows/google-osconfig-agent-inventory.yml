@@ -153,6 +153,11 @@ jobs:
           path: candidate
           persist-credentials: false
           fetch-depth: 0
+      - name: Verify the exact proposal has complete ancestry
+        env:
+          POLICY_BASE_SHA: ${{ steps.identity.outputs.config }}
+          POLICY_HEAD_SHA: ${{ steps.identity.outputs.head }}
+        run: git -C candidate merge-base --is-ancestor "$POLICY_BASE_SHA" "$POLICY_HEAD_SHA"
       - name: Install independent policy bootstrap parser
         run: |
           python3 -m pip install --isolated --disable-pip-version-check --no-input --no-cache-dir \

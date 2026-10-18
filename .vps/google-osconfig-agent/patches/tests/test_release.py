@@ -894,6 +894,19 @@ class PublisherRepairDeliveryTests(unittest.TestCase):
             checkout = next(step for step in steps
                             if step.get("with", {}).get("path") == "candidate")
             self.assertEqual(checkout["with"].get("fetch-depth"), 0, path)
+            ancestry = next(step for step in steps
+                            if step.get("name") ==
+                            "Verify the exact proposal has complete ancestry")
+            self.assertEqual(ancestry["env"]["POLICY_BASE_SHA"],
+                             "${{ steps.identity.outputs.config }}", path)
+            self.assertEqual(ancestry["env"]["POLICY_HEAD_SHA"],
+                             "${{ steps.identity.outputs.head }}", path)
+            self.assertEqual(
+                ancestry["run"],
+                'git -C candidate merge-base --is-ancestor '
+                '"$POLICY_BASE_SHA" "$POLICY_HEAD_SHA"',
+                path,
+            )
 
     def test_policy_task_requires_verified_delivery_to_exact_head_branch(self):
         state = {"number": 42, "config": "a" * 40, "head": "b" * 40,

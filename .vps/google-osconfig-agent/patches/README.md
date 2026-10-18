@@ -77,3 +77,12 @@ policy check also passed, including the parser write-denial regression, exact
 Action commit resolution, hashed wheel download, offline installation, and
 checksum-verified actionlint. The earlier exact-commit review findings were
 corrected; this changed commit still requires fresh native Codex review.
+
+The next correction rejects custom signer shell/working-directory settings,
+untrusted package URLs or repository overrides, alternate Action subdirectories,
+and conditions that bypass the review gate. Normal package-name, runner, image
+and timeout updates remain covered. The direct suite now passes 80 tests, and
+the actual isolated policy check passes the native parser protection case too.
+Review comments use their original reviewed commit identity because GitHub can
+relocate an older inline comment to a newer head; a fresh clean review is still
+required for the changed commit.

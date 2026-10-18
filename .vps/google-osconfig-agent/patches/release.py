@@ -329,7 +329,7 @@ def review_gate(sha, requested_at, reviews, inline, comments, resolve):
         return False, "No owner-authenticated exact-SHA review request"
     exact = [review for review in reviews if actor(review) and review.get("commit_id") == sha]
     exact_inline = [comment for comment in inline
-                    if actor(comment) and comment.get("commit_id") == sha]
+                    if actor(comment) and (comment.get("original_commit_id") or comment.get("commit_id")) == sha]
     if exact_inline:
         return False, "Codex left exact-SHA inline findings that have not been cleared"
     evidence = exact[:]
@@ -1293,12 +1293,13 @@ def validate_signing_workflow(workflow):
         ("needs.review.result", "success"),
         ("needs.review.outputs.ready", "true"),
     )
-    condition_valid = all(
-        re.search(rf"(?<![A-Za-z0-9_.!]){re.escape(path)}\s*==\s*['\"]?{value}['\"]?",
-                  condition, re.I)
-        and not re.search(rf"!\s*{re.escape(path)}", condition, re.I)
-        for path, value in required_conditions
-    )
+    if condition.startswith("${{") and condition.endswith("}}"):
+        condition = condition[3:-2].strip()
+    terms = [re.fullmatch(r"\s*(needs\.[A-Za-z0-9_.-]+)\s*==\s*(['\"])([A-Za-z]+)\2\s*", term)
+             for term in condition.split("&&")]
+    condition_valid = (all(terms) and set(required_conditions).issubset(
+        {(term[1], term[3]) for term in terms if term}
+    ))
     runner = sign_job.get("runs-on")
     runner_labels = ([runner] if isinstance(runner, str) else runner
                      if isinstance(runner, list) and all(isinstance(label, str) for label in runner)
@@ -1363,8 +1364,7 @@ def validate_signing_workflow(workflow):
     for index, step in enumerate(steps):
         if not isinstance(step, dict):
             raise ValueError("Signing workflow contains a malformed step")
-        if set(step) - {"uses", "name", "run", "env", "with", "id", "shell",
-                        "working-directory", "timeout-minutes"}:
+        if set(step) - {"uses", "name", "run", "env", "with", "id", "timeout-minutes"}:
             raise ValueError("Signing workflow step has unexpected execution settings")
         if ("uses" in step) == ("run" in step):
             raise ValueError("Signing workflow step must use exactly one trusted action or command")
@@ -1374,7 +1374,7 @@ def validate_signing_workflow(workflow):
         if uses is not None:
             if not isinstance(uses, str) or "@" not in uses:
                 raise ValueError("Signing workflow action is not pinned")
-            repository = "/".join(uses.split("@", 1)[0].split("/")[:2])
+            repository = uses.split("@", 1)[0]
             if repository == "actions/checkout":
                 checkout_steps.append((index, step))
             elif repository == "actions/download-artifact":
@@ -1435,8 +1435,8 @@ def validate_signing_workflow(workflow):
     ]
     install_steps = []
     for index, tokens in run_steps:
-        if (tokens and tokens[0] == "dnf" and "install" in tokens
-                and not re.search(r"[;&|<>`$()]", " ".join(tokens))):
+        if (len(tokens) > 3 and tokens[:3] in (["dnf", "-y", "install"], ["dnf", "install", "-y"])
+                and all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9+_.-]*", package) for package in tokens[3:])):
             install_steps.append((index, tokens))
     if (len(run_steps) != 3 or len(install_steps) != 1
             or any(tokens not in trusted_commands for _, tokens in run_steps if tokens != install_steps[0][1])):

@@ -231,6 +231,46 @@ class SigningWorkflowTrustTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "trusted tools"):
                 release.validate_signing_workflow(path)
 
+    def test_signer_rejects_execution_overrides(self):
+        for key, value in (("shell", "bash -c 'echo override; bash {0}'"),
+                           ("working-directory", "${{ runner.temp }}/osconfig-built")):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as temporary:
+                yaml, document, path = self.load_document(temporary)
+                signer = next(step for step in document["jobs"]["sign"]["steps"]
+                              if "OSCONFIG_RPM_SIGNING_PRIVATE_KEY" in (step.get("env") or {}))
+                signer[key] = value
+                path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    release.validate_signing_workflow(path)
+
+    def test_signer_rejects_package_urls_and_repository_overrides(self):
+        for extra in (" https://example.invalid/untrusted.rpm", " --repofrompath=extra,https://example.invalid/"):
+            with self.subTest(extra=extra), tempfile.TemporaryDirectory() as temporary:
+                yaml, document, path = self.load_document(temporary)
+                install = next(step for step in document["jobs"]["sign"]["steps"]
+                               if str(step.get("run", "")).startswith("dnf "))
+                install["run"] += extra
+                path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    release.validate_signing_workflow(path)
+
+    def test_signer_rejects_review_gate_disjunction(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            yaml, document, path = self.load_document(temporary)
+            document["jobs"]["sign"]["if"] += " || true"
+            path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                release.validate_signing_workflow(path)
+
+    def test_signer_rejects_action_subdirectory_override(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            yaml, document, path = self.load_document(temporary)
+            checkout = document["jobs"]["sign"]["steps"][0]
+            checkout["uses"] = checkout["uses"].replace("actions/checkout@", "actions/checkout/other@")
+            path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                release.validate_signing_workflow(path)
+
     def test_signing_checkout_must_pin_the_exact_workflow_commit(self):
         with tempfile.TemporaryDirectory() as temporary:
             _, document, path = self.load_document(temporary)
@@ -416,6 +456,19 @@ class ExactShaReviewRegressionTests(unittest.TestCase):
     requested = ExactShaReviewTests.requested
     clean_native_comment = ExactShaReviewTests.clean_native_comment
     gate = ExactShaReviewTests.gate
+
+    def test_relocated_old_inline_finding_requires_fresh_review_but_does_not_poison_it(self):
+        inline = {"user": {"login": release.BOT, "type": "Bot"},
+                  "commit_id": self.sha, "original_commit_id": "b" * 40,
+                  "body": "P1 defect on an earlier commit"}
+        self.assertFalse(self.gate(inline=[inline])[0])
+        self.assertTrue(self.gate(comments=[self.clean_native_comment()], inline=[inline])[0])
+
+    def test_original_current_inline_finding_still_blocks_when_relocated(self):
+        inline = {"user": {"login": release.BOT, "type": "Bot"},
+                  "commit_id": "b" * 40, "original_commit_id": self.sha,
+                  "body": "P2 defect on the requested commit"}
+        self.assertFalse(self.gate(comments=[self.clean_native_comment()], inline=[inline])[0])
 
     def test_exact_sha_inline_finding_blocks_even_with_clean_summary(self):
         inline = {

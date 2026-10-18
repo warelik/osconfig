@@ -145,9 +145,23 @@ def review_followup_due(comments, *, sha, now):
     return followup_due(now, last.get("created_at", "1970-01-01T00:00:00Z"))
 
 
+class CommandFailure(subprocess.CalledProcessError):
+    """Keep the actionable, sanitized diagnostic visible at CLI/error boundaries."""
+
+    def __str__(self):
+        summary = sanitize_job_log(super().__str__())
+        detail = sanitize_job_log(self.stderr or "")
+        if len(detail) > API_ERROR_LIMIT:
+            detail = "[earlier command error omitted]\n" + detail[-API_ERROR_LIMIT:]
+        return summary + ("\n" + detail if detail else "")
+
+
 def run(*args, cwd=None, env=None, input=None):
-    result = subprocess.run(args, cwd=cwd, env=env, input=input, text=True,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+    try:
+        result = subprocess.run(args, cwd=cwd, env=env, input=input, text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+    except subprocess.CalledProcessError as error:
+        raise CommandFailure(error.returncode, args, output="", stderr=error.stderr) from error
     return result.stdout.strip()
 
 
@@ -166,7 +180,7 @@ def api(path, *, method="GET", data=None, token=None):
         detail = sanitize_job_log(error.stderr or "")
         if len(detail) > API_ERROR_LIMIT:
             detail = "[earlier API error omitted]\n" + detail[-API_ERROR_LIMIT:]
-        raise subprocess.CalledProcessError(
+        raise CommandFailure(
             error.returncode, command, output="", stderr=detail
         ) from error
     return json.loads(result.stdout) if result.stdout.strip() else None

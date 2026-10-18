@@ -856,6 +856,26 @@ class FailedJobEvidenceTests(unittest.TestCase):
         ))
 
 class PaginationAndApiDiagnosticsTests(unittest.TestCase):
+    def test_real_cli_reports_api_denial_without_the_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "bin"
+            binary.mkdir()
+            secret = "ghp_" + "s" * 40
+            gh = binary / "gh"
+            gh.write_text("#!/bin/sh\nprintf '%s\\n' 'permission denied Authorization: Bearer " + secret + "' >&2\nexit 1\n")
+            gh.chmod(0o700)
+            settings = release.repository_settings()
+            env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ["PATH"],
+                       GITHUB_REPOSITORY=settings["github_owner"] + "/" + settings["github_repo"],
+                       GITHUB_SHA="a" * 40, OSCONFIG_RPM_SIGNING_FINGERPRINT=settings["signing_fingerprint"])
+            result = subprocess.run([sys.executable, "-I", "-B", str(release.PATCH_DIR / "release.py"),
+                                     "prepare", str(root / "candidate")], cwd=root, env=env,
+                                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("permission denied", result.stderr)
+            self.assertNotIn(secret, result.stderr)
+
     def test_jobs_envelope_paginates_until_total_count(self):
         first = [{"id": number, "status": "completed", "conclusion": "failure"}
                  for number in range(100)]

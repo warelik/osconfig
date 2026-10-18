@@ -1601,6 +1601,15 @@ def check_policy(candidate):
         trusted_patch.mkdir(parents=True)
         (trusted_patch / "tests").mkdir()
         shutil.copy2(trusted_release, trusted_patch / "release.py")
+        for relative in PACKAGE_FILES:
+            if relative == "release.py":
+                continue
+            source = ROOT / PREFIX / relative
+            if not source.is_file():
+                continue
+            target = trusted_patch / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
         for test in sorted(trusted_tests.glob("test_*.py")):
             if test.is_file() and not test.is_symlink():
                 shutil.copy2(test, trusted_patch / "tests" / test.name)

@@ -755,7 +755,8 @@ class PublisherPolicyDiffTests(unittest.TestCase):
             candidate = root / "candidate"
             candidate.mkdir()
             for relative in release.PACKAGE_FILES:
-                payload = f"fixture for {relative}\n".encode()
+                source = release.PATCH_DIR / relative
+                payload = source.read_bytes()
                 if bad_ordinary_file and relative == "build-rpm.sh":
                     payload += b"# ordinary trailing whitespace \n"
                 candidate_file = candidate / Path(relative).name

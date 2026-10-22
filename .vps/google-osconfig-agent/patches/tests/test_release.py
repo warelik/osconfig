@@ -376,6 +376,16 @@ class WorkflowActionPinTests(unittest.TestCase):
 
 
 class SigningWorkflowTrustTests(unittest.TestCase):
+    def test_policy_validation_ref_cannot_follow_a_moving_branch(self):
+        for ref in ("master", "main", "${{ github.ref }}"):
+            with self.subTest(ref=ref), tempfile.TemporaryDirectory() as directory:
+                yaml, document, path = self.load_document(directory)
+                checkout = document["jobs"]["prepare"]["steps"][0]
+                checkout["with"]["ref"] = ref
+                path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "exact reserved workflow SHA"):
+                    release.validate_signing_workflow(path)
+
     def workflow_path(self):
         return Path(os.environ.get("OSCONFIG_POLICY_CANDIDATE_WORKFLOW") or
                     (release.PATCH_DIR / "workflows/google-osconfig-agent-inventory.yml"))
@@ -2354,6 +2364,24 @@ class ReviewFindingBatchWriterTests(unittest.TestCase):
 
 
 class FindingDispositionReceiptTests(unittest.TestCase):
+    def test_review_requests_use_context_bases_for_application_and_configuration_deltas(self):
+        candidate = {"application_sha": "a" * 40, "configuration_sha": "b" * 40}
+        pulls = {"full": {"number": 1}, "delta": {"number": 2}}
+        for application_only in (False, True):
+            with self.subTest(application_only=application_only):
+                delta_sha = candidate["application_sha"] if application_only else candidate["configuration_sha"]
+                delta_base = "e" * 40 if application_only else "f" * 40
+                manifest = {"candidate": candidate, "candidateIdentity": self.current_id,
+                            "reviewContexts": {"full": {"review_sha": "7" * 40, "base_sha": "d" * 40},
+                                               "delta": {"review_sha": delta_sha, "base_sha": delta_base}}}
+                with patch.object(release, "request_lifecycle_review") as request:
+                    release.request_manifest_reviews(self.repo, manifest, pulls, "owner-token")
+                self.assertEqual(request.call_count, 2)
+                request.assert_any_call(self.repo, pulls["delta"], candidate, self.current_id,
+                                        "delta", delta_sha, delta_base, "owner-token")
+                request.assert_any_call(self.repo, pulls["full"], candidate, self.current_id,
+                                        "full", "7" * 40, "d" * 40, "owner-token")
+
     repo = "warelik/osconfig"
     old_app = "a" * 40
     current_app = "b" * 40

@@ -1259,6 +1259,15 @@ def latest_owner_review_request(comments, marker, owner):
     return request
 
 
+def request_manifest_reviews(repo, manifest, pulls, token):
+    """Use the same source/base pair for review requests and later verification."""
+    for scope in ("full", "delta"):
+        context = manifest["reviewContexts"][scope]
+        request_lifecycle_review(repo, pulls[scope], manifest["candidate"],
+                                 manifest["candidateIdentity"], scope,
+                                 context["review_sha"], context["base_sha"], token)
+
+
 def request_lifecycle_review(repo, pull, candidate, candidate_id, scope,
                              review_sha, base_sha, token):
     marker = owner_review_marker(candidate_id, scope, review_sha, base_sha)
@@ -4204,10 +4213,7 @@ def prepare(candidate):
         json.dumps({"baseline": baseline, "acceptedBaselineProof": accepted_proof},
                    sort_keys=True, indent=2) + "\n", encoding="utf-8")
     if not bundle_reuse:
-        request_lifecycle_review(repo, pull, candidate_value, candidate_id, "full",
-                                 review_source_sha, upstream, codex_token)
-        request_lifecycle_review(repo, delta_pull, candidate_value, candidate_id, "delta",
-                                 delta_sha, baseline_config, codex_token)
+        request_manifest_reviews(repo, manifest, {"full": pull, "delta": delta_pull}, codex_token)
     full, delta, pair = review_pair_status(repo, manifest)
     if bundle_reuse:
         if pair.get("state") != "ready" or pair.get("complete") is not True:
@@ -4364,10 +4370,7 @@ def prepare_policy_candidate(candidate_dir):
             json.dumps({"baseline": baseline, "acceptedBaselineProof": accepted_proof},
                        ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
         record_policy_pair_context(repo, number, manifest, token)
-        request_lifecycle_review(repo, full_pull, candidate_value, candidate_id, "full",
-                                 full_context_sha, upstream, token)
-        request_lifecycle_review(repo, delta_pull, candidate_value, candidate_id, "delta",
-                                 delta_sha, baseline_config, token)
+        request_manifest_reviews(repo, manifest, {"full": full_pull, "delta": delta_pull}, token)
         full_review, delta_review, pair = review_pair_status(repo, manifest)
         full_review, delta_review, pair = complete_machine_finding_dispositions(
             repo, manifest, full_review, delta_review, pair, token)
@@ -5578,6 +5581,18 @@ def _validate_shared_signing_workflow(workflow):
     sign_job = jobs.get("sign") if isinstance(jobs, dict) else None
     if not isinstance(sign_job, dict):
         raise ValueError("Signing workflow has no signing job")
+    policy_job = jobs.get("prepare")
+    if isinstance(policy_job, dict):
+        root_checkouts = [step for step in policy_job.get("steps", [])
+                          if isinstance(step, dict)
+                          and str(step.get("uses", "")).split("@", 1)[0] == "actions/checkout"
+                          and step.get("with", {}).get("path") in {None, "", "."}]
+        if not root_checkouts or any(
+                step.get("with", {}).get("ref") != "${{ github.sha }}"
+                or step.get("with", {}).get("repository") not in {None, "${{ github.repository }}"}
+                or step.get("with", {}).get("persist-credentials") is not False
+                for step in root_checkouts):
+            raise ValueError("Policy validation checkout must use the exact reserved workflow SHA")
     _validate_fedora_private_checkout_transport(jobs)
     if any(key in sign_job for key in ("env", "defaults", "uses", "services")):
         raise ValueError("Signing job cannot supply job-wide secrets, shell defaults, or candidate services")

@@ -2373,6 +2373,41 @@ class FindingDispositionReceiptTests(unittest.TestCase):
                    "body": "target returns an incorrect result"}
         return candidate, old_candidate, finding
 
+    def test_application_only_delta_carries_receipts_against_the_reviewed_application(self):
+        candidate, old_candidate, finding = self.candidate_and_finding()
+        candidate["configuration_sha"] = old_candidate["configuration_sha"]
+        finding["scope"] = "delta"
+        entry = {"mode": "100644", "blob_sha": "5" * 40}
+        trees = {self.current_app: ("4" * 40, {"pkg/target.go": entry}),
+                 self.old_app: ("8" * 40, {"pkg/target.go": entry})}
+        prior = {finding["finding_id"]: {"candidate_id": self.old_id,
+                 "source_sha": self.old_app, "status": "fixed", "evidence": "Exact owner receipt."}}
+        contexts = {"full": {"review_sha": "1" * 40},
+                    "delta": {"review_sha": self.current_app}}
+        sources = {self.old_id: {"candidate": old_candidate,
+                   "review_contexts": {"delta": {"review_sha": self.old_app}}}}
+        posted, reads = [], []
+        core = Mock()
+        core.candidate_identity.return_value = self.current_id
+
+        def tree(_repo, sha):
+            reads.append(sha)
+            return trees[sha]
+
+        with (patch.object(release, "lifecycle_module", return_value=core),
+              patch.object(release, "native_review_tree", side_effect=tree),
+              patch.object(release, "_post_finding_dispositions", side_effect=lambda *args: posted.append(args))):
+            release.create_review_finding_dispositions(
+                self.repo, 91, candidate, [finding], sources, prior, "owner-token",
+                review_contexts=contexts)
+        self.assertEqual(len(posted), 1)
+        self.assertEqual(posted[0][3], self.current_app)
+        self.assertEqual(posted[0][4][0]["finding_id"], finding["finding_id"])
+        self.assertNotIn(candidate["configuration_sha"], reads)
+        for bad in (None, "not-a-source"):
+            with self.subTest(source=bad), self.assertRaises(ValueError):
+                release._review_source_shas(candidate, {"delta": {"review_sha": bad}})
+
     def test_changed_code_and_matching_test_do_not_synthesize_an_owner_receipt(self):
         candidate, old_candidate, finding = self.candidate_and_finding()
         current_tree = ("4" * 40, {
@@ -4123,7 +4158,7 @@ class PostPublicationAdoptionTests(unittest.TestCase):
 class AlreadyAdoptedProductInputTests(unittest.TestCase):
     repo = "warelik/osconfig"
 
-    def run_adopt(self, *, mismatched_path=None):
+    def run_adopt(self, *, mismatched_path=None, mismatched_mode_path=None):
         package_evr = next(
             line.partition("=")[2]
             for line in (release.ROOT / release.REPOSITORY_CONF).read_text(encoding="utf-8").splitlines()
@@ -4153,9 +4188,23 @@ class AlreadyAdoptedProductInputTests(unittest.TestCase):
             if mismatched_path is not None:
                 files[mismatched_path] = b"different package input\n"
 
-            def content(repo, path, revision):
-                self.assertEqual((repo, revision), (self.repo, release.DEFAULT_BRANCH))
-                return files[path]
+            tree_sha = "c" * 40
+
+            def native_api(route):
+                if route == f"repos/{self.repo}/commits/{latest}":
+                    return {"sha": latest, "commit": {"tree": {"sha": tree_sha}}}
+                if route == f"repos/{self.repo}/git/trees/{tree_sha}?recursive=1":
+                    entries = []
+                    for path, data in files.items():
+                        mode = "100755" if path.endswith(".sh") else "100644"
+                        if path == mismatched_mode_path:
+                            mode = "100644" if mode == "100755" else "100755"
+                        entries.append({"path": path, "type": "blob", "mode": mode,
+                                        "sha": hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()})
+                    return {"sha": tree_sha, "tree": entries, "truncated": False}
+                if route == f"repos/{self.repo}/commits/{release.DEFAULT_BRANCH}":
+                    return {"sha": latest}
+                self.fail(f"Unexpected adoption API read: {route}")
 
             advanced = Mock()
             closed = Mock()
@@ -4163,12 +4212,12 @@ class AlreadyAdoptedProductInputTests(unittest.TestCase):
                     patch.object(release, "verify_candidate_artifact",
                                  return_value=(self.repo, manifest, settings, "A" * 40,
                                                published, latest)), \
-                    patch.object(release, "api", return_value={"sha": latest}), \
-                    patch.object(release, "content", side_effect=content), \
+                    patch.object(release, "api", side_effect=native_api), \
+                    patch.object(release, "content", side_effect=AssertionError("Read immutable Git blobs and modes")), \
                     patch.object(release, "owner_token", return_value="fixture-token"), \
                     patch.object(release, "advance_accepted_baseline", advanced), \
                     patch.object(release, "close_candidate", closed):
-                if mismatched_path is None:
+                if mismatched_path is None and mismatched_mode_path is None:
                     release.adopt(candidate_dir, root / "pages")
                 else:
                     with self.assertRaisesRegex(
@@ -4183,6 +4232,14 @@ class AlreadyAdoptedProductInputTests(unittest.TestCase):
         for relative in (*release.PRODUCT_BUILD_INPUTS, "source.lock"):
             with self.subTest(path=relative):
                 advanced, closed = self.run_adopt(mismatched_path=release.PREFIX + relative)
+                advanced.assert_not_called()
+                closed.assert_not_called()
+
+    def test_already_adopted_acceptance_rejects_mode_only_changes(self):
+        for path in (*[release.PREFIX + value for value in release.PRODUCT_RECIPE_INPUTS],
+                     release.REPOSITORY_CONF):
+            with self.subTest(path=path):
+                advanced, closed = self.run_adopt(mismatched_mode_path=path)
                 advanced.assert_not_called()
                 closed.assert_not_called()
 

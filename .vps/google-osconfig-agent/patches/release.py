@@ -1633,7 +1633,7 @@ def _finding_record_is_valid(item):
             and isinstance(item.get("body"), str))
 
 
-def native_review_tree(repo, revision):
+def native_review_tree(repo, revision, *, paths=None):
     """Resolve a native Git commit to its exact regular-file tree map."""
     commit = api(f"repos/{repo}/commits/{revision}")
     if not isinstance(commit, dict) or commit.get("sha") != revision:
@@ -1644,11 +1644,15 @@ def native_review_tree(repo, revision):
     tree = api(f"repos/{repo}/git/trees/{tree_sha}?recursive=1")
     if not isinstance(tree, dict) or tree.get("truncated") is True or not isinstance(tree.get("tree"), list):
         raise ValueError("Finding source tree is incomplete or malformed")
+    if paths is not None and tree.get("sha") != tree_sha:
+        raise ValueError("Adoption source tree differs from its exact commit")
     entries = {}
     for item in tree["tree"]:
         if not isinstance(item, dict) or item.get("type") != "blob":
             continue
         path, mode, blob = item.get("path"), item.get("mode"), item.get("sha")
+        if paths is not None and path not in paths:
+            continue
         if (not isinstance(path, str) or path.startswith("/") or "\\" in path
                 or any(part in {"", ".", ".."} for part in path.split("/"))
                 or mode not in {"100644", "100755"}
@@ -2395,9 +2399,8 @@ def complete_machine_finding_dispositions(repo, manifest, full, delta, pair, tok
             for finding_id in closed_ids:
                 proposal_item = items[finding_id][0]
                 observed_item = observed_by_id[finding_id]
-                source_sha = (candidate["application_sha"] if observed_item.get("scope") == "full"
-                              else candidate["configuration_sha"]
-                              if observed_item.get("scope") == "delta" else None)
+                source_sha = _review_source_shas(
+                    candidate, manifest.get("reviewContexts")).get(observed_item.get("scope"))
                 disposition = dispositions_by_id.get(finding_id)
                 native_comment = (disposition.get("native_comment") if disposition else None)
                 native_user = (native_comment.get("user") if isinstance(native_comment, dict) else None)
@@ -2476,8 +2479,7 @@ def complete_machine_finding_dispositions(repo, manifest, full, delta, pair, tok
             or checked_ids != unresolved_ids or checked_observed_ids != observed_ids):
         raise ValueError("Exact reviews, repair request, or source-bound proposal changed before disposition")
     statuses = {item["finding_id"]: item for item in proposals[0][1]}
-    for scope, source in (("full", candidate["application_sha"]),
-                          ("delta", candidate["configuration_sha"])):
+    for scope, source in _review_source_shas(candidate, manifest.get("reviewContexts")).items():
         batch = [statuses[item["finding_id"]] for item in checked_findings
                  if item["scope"] == scope]
         if batch:
@@ -2489,16 +2491,29 @@ def complete_machine_finding_dispositions(repo, manifest, full, delta, pair, tok
     return result
 
 
+def _review_source_shas(candidate, contexts=None):
+    # Legacy callers carry configuration deltas; current producers supply both
+    # exact contexts, including application-only deltas at an unchanged config.
+    result = {"full": candidate["application_sha"], "delta": candidate["configuration_sha"]}
+    if contexts is not None:
+        if not isinstance(contexts, dict) or not isinstance(contexts.get("delta", {}), dict):
+            raise ValueError("Finding dispositions have malformed delta source context")
+        result["delta"] = contexts.get("delta", {}).get("review_sha", result["delta"])
+    if any(not isinstance(sha, str) or not SHA.fullmatch(sha) for sha in result.values()):
+        raise ValueError("Finding dispositions require both exact review source SHAs")
+    return result
+
+
 def create_review_finding_dispositions(repo, pull_number, candidate,
-                                       findings, sources, prior_dispositions, token):
+                                       findings, sources, prior_dispositions, token, *, review_contexts=None):
     """Carry existing owner dispositions only while their exact source evidence remains valid."""
     if not findings or not prior_dispositions:
         return
     current_id = lifecycle_module().candidate_identity(candidate)
     current_trees = {}
-    generated = {candidate["application_sha"]: {}, candidate["configuration_sha"]: {}}
-    for scope, source_sha in (("full", candidate["application_sha"]),
-                              ("delta", candidate["configuration_sha"])):
+    review_sources = _review_source_shas(candidate, review_contexts)
+    generated = {sha: {} for sha in review_sources.values()}
+    for scope, source_sha in review_sources.items():
         current_trees[scope] = native_review_tree(repo, source_sha)
     prior_tree_cache = {}
     for finding in findings:
@@ -2509,9 +2524,10 @@ def create_review_finding_dispositions(repo, pull_number, candidate,
             continue
         old_candidate = source_record["candidate"]
         scope = finding["scope"]
-        old_sha = (old_candidate["application_sha"] if scope == "full"
-                   else old_candidate["configuration_sha"])
-        current_sha = candidate["application_sha"] if scope == "full" else candidate["configuration_sha"]
+        old_sha = (old_candidate["application_sha"] if scope == "full" else
+                   finding.get("source_sha") or
+                   _review_source_shas(old_candidate, source_record.get("review_contexts"))[scope])
+        current_sha = review_sources[scope]
         if old_sha == current_sha:
             continue
         new_tree_sha, new_tree = current_trees[scope]
@@ -4141,7 +4157,9 @@ def prepare(candidate):
         repo, pull["number"], published_at=baseline["published_at"])
     create_review_finding_dispositions(
         repo, pull["number"], candidate_value, finding_history,
-        finding_sources, prior_dispositions, codex_token)
+        finding_sources, prior_dispositions, codex_token,
+        review_contexts={"full": {"review_sha": review_source_sha},
+                         "delta": {"review_sha": delta_sha}})
     _, finding_history, _, all_dispositions = load_review_finding_history(
         repo, pull["number"], published_at=baseline["published_at"])
     candidate_dispositions = [item for item in all_dispositions.values()
@@ -4314,7 +4332,8 @@ def prepare_policy_candidate(candidate_dir):
             repo, number, published_at=baseline["published_at"])
         create_review_finding_dispositions(
             repo, number, candidate_value, finding_history, finding_sources,
-            prior_dispositions, token)
+            prior_dispositions, token,
+            review_contexts={"full": full_context, "delta": delta_context})
         _, finding_history, _, all_dispositions = load_review_finding_history(
             repo, number, published_at=baseline["published_at"])
         candidate_dispositions = [item for item in all_dispositions.values()
@@ -6643,13 +6662,19 @@ def adopt(candidate_dir, pages_dir):
     config_lines[minimum_lines[0]] = f"minimum_evr={package_evr}"
     expected_conf_bytes = ("\n".join(config_lines) + "\n").encode()
     if latest != config:
-        already_adopted = (
-            all(content(repo, path, DEFAULT_BRANCH) == expected
-                for path, expected in expected_product_inputs.items())
-            and content(repo, REPOSITORY_CONF, DEFAULT_BRANCH) == expected_conf_bytes
-        )
+        expected_files = {**expected_product_inputs, REPOSITORY_CONF: expected_conf_bytes}
+        _, actual_tree = native_review_tree(repo, latest, paths=set(expected_files))
+        already_adopted = all(
+            actual_tree.get(path) == {
+                "mode": "100755" if path.endswith(".sh") else "100644",
+                "blob_sha": hashlib.sha1(b"blob " + str(len(expected)).encode()
+                                         + b"\0" + expected).hexdigest(),
+            }
+            for path, expected in expected_files.items())
         if not already_adopted:
             raise ValueError("Default branch advanced with different package state; refusing stale adoption")
+        if api(f"repos/{repo}/commits/{DEFAULT_BRANCH}").get("sha") != latest:
+            raise ValueError("Default branch changed during adopted package verification")
         advance_accepted_baseline(repo, manifest, published, owner_token(repo))
         os.environ["CANDIDATE_PR"] = str(manifest["candidatePr"])
         os.environ["DELTA_PR"] = str(manifest.get("deltaPr", ""))

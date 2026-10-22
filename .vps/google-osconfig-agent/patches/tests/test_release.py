@@ -1018,7 +1018,9 @@ rm -rf -- "$private_root"
             step for step in jobs["sign"]["steps"]
             if step.get("name") == "Record the exact native signature artifact identity")
         self.assertIn("FORK_MAINTENANCE_ROOT", signature_proof.get("env", {}))
-        self.assertIn("release.py write-signature-proof", signature_proof.get("run", ""))
+        signature_command = " ".join(
+            signature_proof.get("run", "").replace("\\\n", " ").split())
+        self.assertIn("release.py write-signature-proof", signature_command)
 
     def test_final_history_ignores_only_timestamped_native_skipped_placeholders(self):
         self.assertFalse(release.native_heavy_job_started({
@@ -2038,9 +2040,9 @@ class PublisherPolicyDiffTests(unittest.TestCase):
                     advance_baseline.assert_not_called()
                 else:
                     release.adopt(candidate, root / "pages")
-                    owner_token.assert_called_once_with("warelik/osconfig")
+                    owner_token.assert_called_once_with(verified[0])
                     advance_baseline.assert_called_once_with(
-                        "warelik/osconfig", manifest, published, "fixture-owner-token")
+                        verified[0], manifest, published, "fixture-owner-token")
             self.assertEqual(whitespace_check.call_count, 1)
             adopted_sha = self.git("--git-dir", str(remote), "rev-parse", "refs/heads/master",
                                    cwd=root)
@@ -3244,7 +3246,9 @@ class PublisherRepairDeliveryTests(unittest.TestCase):
         self.assertIn("Do not change the local-only `check-upstream.sh` diagnostic", body)
         self.assertIn("fork-review-disposition:v1", body)
         self.assertIn(f"exact current `candidate_id` `{candidate_id}`", body)
-        self.assertIn("`finding_id`, `status`, and `evidence`", body)
+        self.assertIn('"finding_id":"actual native finding ID"', body)
+        self.assertIn('"status":"fixed or disproved"', body)
+        self.assertIn('"evidence":"..."', body)
         self.assertIn("`source_sha`", body)
         self.assertIn("`application_sha` for full scope or `configuration_sha` for delta scope", body)
         self.assertIn("specific regression test path and test name/assertion", body)
@@ -3305,7 +3309,9 @@ class PublisherRepairDeliveryTests(unittest.TestCase):
         self.assertIn(
             f"Trusted base: `{state['config']}`. Current repair SHA: `{state['head']}`.", body)
         self.assertIn("do not add candidate_id or create an owner receipt", body)
-        self.assertIn("`finding_id`, `status`, and `evidence`", body)
+        self.assertIn('"finding_id":"actual native finding ID"', body)
+        self.assertIn('"status":"fixed or disproved"', body)
+        self.assertIn('"evidence":"..."', body)
         self.assertIn("`source_sha`", body)
         self.assertIn("specific regression test path and test name/assertion", body)
         self.assertIn("Use the existing authorized native owner API; no human approval is needed", body)

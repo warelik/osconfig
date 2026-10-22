@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
@@ -485,42 +486,56 @@ raise SystemExit(2)
 
             ensure_pull = iter(({"number": 71}, {"number": 72}))
             review_result = ({}, {}, {"state": "ready", "complete": True})
-            with (patch.dict(os.environ, {
+            with ExitStack() as stack:
+                stack.enter_context(patch.dict(os.environ, {
                     "GITHUB_REPOSITORY": self.repo,
                     "GITHUB_SHA": self.config_sha,
                     "POLICY_PR_NUMBER": "42",
                     "POLICY_HEAD_SHA": self.candidate_sha,
                     "OSCONFIG_RPM_SIGNING_FINGERPRINT": settings["signing_fingerprint"],
-                }, clear=True),
-                  patch.object(release.tempfile, "TemporaryDirectory",
-                               side_effect=tracked_temporary_directory),
-                  patch.object(release, "api", side_effect=api),
-                  patch.object(release, "policy_changes", return_value=[release.PREFIX + "release.py"]),
-                  patch.object(release, "repository_settings", return_value=settings),
-                  patch.object(release, "published_manifest", return_value=published),
-                  patch.object(release, "owner_token", return_value="fixture-owner-token"),
-                  patch.object(release, "lifecycle_module", return_value=type(
-                      "LifecycleFixture", (), {"candidate_identity": staticmethod(candidate_identity)})()),
-                  patch.object(release, "verified_pages_baseline",
-                               return_value={"published_at": "2026-10-01T00:00:00Z"}),
-                  patch.object(release, "published_candidate_identity", side_effect=published_identity),
-                  patch.object(release, "accepted_baseline_proof", return_value={"fixture": True}),
-                  patch.object(release, "run", return_value=""),
-                  patch.object(release, "ensure_review_base"),
-                  patch.object(release, "create_delta_snapshot", side_effect=create_delta),
-                  patch.object(release, "create_application_review_context", return_value="7" * 40),
-                  patch.object(release, "ensure_review_branch"),
-                  patch.object(release, "ensure_review_pull",
-                               side_effect=lambda *_args, **_kwargs: next(ensure_pull)),
-                  patch.object(release, "load_review_finding_history", return_value=([], [], {}, {})),
-                  patch.object(release, "create_review_finding_dispositions"),
-                  patch.object(release, "record_policy_pair_context"),
-                  patch.object(release, "request_lifecycle_review"),
-                  patch.object(release, "review_pair_status", return_value=review_result),
-                  patch.object(release, "complete_machine_finding_dispositions",
-                               return_value=review_result),
-                  patch.object(release, "record_review_finding_batch"),
-                  patch.object(release, "output")):
+                }, clear=True))
+                stack.enter_context(patch.object(
+                    release.tempfile, "TemporaryDirectory",
+                    side_effect=tracked_temporary_directory))
+                stack.enter_context(patch.object(release, "api", side_effect=api))
+                stack.enter_context(patch.object(
+                    release, "policy_changes", return_value=[release.PREFIX + "release.py"]))
+                stack.enter_context(patch.object(release, "repository_settings", return_value=settings))
+                stack.enter_context(patch.object(release, "published_manifest", return_value=published))
+                stack.enter_context(patch.object(
+                    release, "owner_token", return_value="fixture-owner-token"))
+                stack.enter_context(patch.object(release, "lifecycle_module", return_value=type(
+                    "LifecycleFixture", (), {"candidate_identity": staticmethod(candidate_identity)})()))
+                stack.enter_context(patch.object(
+                    release, "verified_pages_baseline",
+                    return_value={"published_at": "2026-10-01T00:00:00Z"}))
+                stack.enter_context(patch.object(
+                    release, "published_candidate_identity", side_effect=published_identity))
+                stack.enter_context(patch.object(
+                    release, "accepted_baseline_proof", return_value={"fixture": True}))
+                stack.enter_context(patch.object(release, "run", return_value=""))
+                stack.enter_context(patch.object(release, "ensure_review_base"))
+                stack.enter_context(patch.object(
+                    release, "create_delta_snapshot", side_effect=create_delta))
+                stack.enter_context(patch.object(
+                    release, "create_application_review_context", return_value="7" * 40))
+                stack.enter_context(patch.object(release, "ensure_review_branch"))
+                stack.enter_context(patch.object(
+                    release, "ensure_review_pull",
+                    side_effect=lambda *_args, **_kwargs: next(ensure_pull)))
+                stack.enter_context(patch.object(
+                    release, "load_review_finding_history", return_value=([], [], {}, {})))
+                stack.enter_context(patch.object(
+                    release, "create_review_finding_dispositions"))
+                stack.enter_context(patch.object(release, "record_policy_pair_context"))
+                stack.enter_context(patch.object(release, "request_lifecycle_review"))
+                stack.enter_context(patch.object(
+                    release, "review_pair_status", return_value=review_result))
+                stack.enter_context(patch.object(
+                    release, "complete_machine_finding_dispositions",
+                    return_value=review_result))
+                stack.enter_context(patch.object(release, "record_review_finding_batch"))
+                stack.enter_context(patch.object(release, "output"))
                 if fail_at_delta:
                     with self.assertRaisesRegex(RuntimeError, "fixture delta snapshot failed"):
                         release.prepare_policy_candidate(candidate_dir)
@@ -929,7 +944,16 @@ class PolicyGateIsolationTests(unittest.TestCase):
             for host_environment in container_host_environments:
                 self.assertEqual(host_environment.get("HOME"), os.environ.get("HOME"))
                 self.assertEqual(host_environment.get("XDG_DATA_HOME"), os.environ.get("XDG_DATA_HOME"))
-            self.assertNotIn(str(candidate), " ".join(docker_commands[0]))
+            for command in docker_commands:
+                mount_specs = [command[index + 1] for index, value in enumerate(command[:-1])
+                               if value == "--mount"]
+                self.assertFalse(any(spec.startswith(f"type=bind,source={candidate},")
+                                    or f",source={candidate}/" in spec
+                                    for spec in mount_specs))
+                self.assertNotIn(str(candidate / release.PREFIX / "release.py"), [
+                    argument for argument in command
+                    if not argument.startswith("OSCONFIG_POLICY_CANDIDATE_RELEASE=")
+                ])
             download = next(command for command in docker_commands if "download" in command)
             self.assertIn("https://pypi.org/simple", download)
             self.assertIn("--only-binary=:all:", download)

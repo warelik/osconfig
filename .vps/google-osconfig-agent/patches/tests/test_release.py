@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, urlsplit
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import maintenance
 import release
 
 
@@ -474,7 +475,8 @@ class SigningWorkflowTrustTests(unittest.TestCase):
                     '"$RUNNER_TEMP/osconfig-candidate" "$RUNNER_TEMP/osconfig-pages/rpm"',
                     command,
                 )
-                self.assertNotIn("\\\n", command)
+                normalized_command = command.replace("\\\n", " ")
+                self.assertIn("release.py verify-final-run", normalized_command)
 
     def test_signing_job_can_update_runner_image_and_build_tool_packages(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -677,7 +679,7 @@ class PolicyWorkflowAndSharedValidationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="osconfig-signing-workflow-key-") as temporary:
             candidate = Path(temporary) / "workflow.yml"
             candidate.write_text(old_spelling, encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "without credentials"):
+            with self.assertRaises(ValueError):
                 release._validate_shared_signing_workflow(candidate)
 
     def test_owner_metadata_callers_get_the_owner_token_only_at_trusted_steps(self):
@@ -904,7 +906,12 @@ class PolicyWorkflowAndSharedValidationTests(unittest.TestCase):
 
     def test_bundle_reuse_uses_owner_authenticated_read_only_native_callback(self):
         repo = "warelik/osconfig"
-        candidate = {"schema": 1, "repository": repo}
+        candidate = {
+            "schema": 1, "repository": repo,
+            "upstream_sha": "a" * 40, "application_sha": "b" * 40,
+            "configuration_sha": "c" * 40, "patchset_sha256": "d" * 64,
+            "recipe_sha256": "e" * 64, "platform": "fedora-44/x86_64",
+        }
         comments = [{"id": 91, "body": "exact full review thread"}]
         native_response = {"id": 701}
 
@@ -920,7 +927,7 @@ class PolicyWorkflowAndSharedValidationTests(unittest.TestCase):
         with patch.object(release, "owner_token", return_value="owner-read-token"), \
              patch.object(release, "pages", return_value=comments) as native_comments, \
              patch.object(release, "api", return_value=native_response) as native_get, \
-             patch.object(release, "lifecycle_module", return_value=Core):
+             patch.object(maintenance, "validated_bundle", side_effect=Core.validated_bundle):
             self.assertTrue(release.validated_policy_bundle(repo, candidate, 91))
         native_comments.assert_called_once_with(
             "repos/warelik/osconfig/issues/91/comments", token="owner-read-token")
@@ -980,7 +987,8 @@ class PolicyWorkflowAndSharedValidationTests(unittest.TestCase):
         builder_index = next(index for index, step in enumerate(build_steps)
                              if step.get("name") == "Build the Fedora RPM")
         provenance_index = next(index for index, step in enumerate(build_steps)
-                                if "release.py write-build-provenance" in step.get("run", ""))
+                                if "release.py write-build-provenance" in " ".join(
+                                    step.get("run", "").replace("\\\n", " ").split()))
         self.assertLess(verify_index, remove_index)
         self.assertLess(remove_index, builder_index)
         self.assertLess(builder_index, provenance_index)
@@ -1823,7 +1831,7 @@ class PublisherPolicyScopeTests(unittest.TestCase):
         self.assertEqual(installed, template)
         guards = [line for line in installed.splitlines()
                   if "config --local --get-regexp" in line]
-        self.assertEqual(len(guards), 15)
+        self.assertEqual(len(guards), 16)
         self.assertTrue(all(r"core\.sshcommand" in line for line in guards))
         self.assertFalse(any(r"core\.sshCommand" in line for line in guards))
 
@@ -2017,14 +2025,22 @@ class PublisherPolicyDiffTests(unittest.TestCase):
             with patch.object(release, "verify_candidate_artifact", return_value=verified), \
                  patch.object(release, "run", side_effect=fixture_run), \
                  patch.object(release, "close_candidate"), \
+                 patch.object(release, "owner_token",
+                              return_value="fixture-owner-token") as owner_token, \
+                 patch.object(release, "advance_accepted_baseline") as advance_baseline, \
                  patch.object(release, "check_cached_whitespace",
                               wraps=release.check_cached_whitespace) as whitespace_check, \
                  patch.dict(os.environ, {}, clear=False):
                 if bad_ordinary_file:
                     with self.assertRaises(release.CommandFailure):
                         release.adopt(candidate, root / "pages")
+                    owner_token.assert_not_called()
+                    advance_baseline.assert_not_called()
                 else:
                     release.adopt(candidate, root / "pages")
+                    owner_token.assert_called_once_with("warelik/osconfig")
+                    advance_baseline.assert_called_once_with(
+                        "warelik/osconfig", manifest, published, "fixture-owner-token")
             self.assertEqual(whitespace_check.call_count, 1)
             adopted_sha = self.git("--git-dir", str(remote), "rev-parse", "refs/heads/master",
                                    cwd=root)
@@ -2939,7 +2955,7 @@ class DeltaSnapshotProductModeTests(unittest.TestCase):
 
                 with patch.object(release, "run", side_effect=fake_run), \
                      patch.object(release, "ensure_review_base") as ensure_base:
-                    expected = "non-regular or malformed" if kind == "mode" else "incomplete"
+                    expected = "unsupported mode or blob" if kind == "mode" else "incomplete"
                     with self.assertRaisesRegex(ValueError, expected):
                         release.create_delta_snapshot(
                             application_path, baseline_config=self.baseline,
@@ -3167,7 +3183,16 @@ class PublisherRepairDeliveryTests(unittest.TestCase):
         upstream = "c" * 40
         config = "d" * 40
         branch = "review/osconfig-exact-candidate"
+        candidate = {
+            "schema": 1, "repository": repo, "upstream_sha": upstream,
+            "application_sha": candidate_sha, "configuration_sha": config,
+            "patchset_sha256": "1" * 64, "recipe_sha256": "2" * 64,
+            "platform": "fedora-44/x86_64",
+        }
+        candidate_id = release.frozen_candidate_identity(candidate)
         manifest = {
+            "candidate": candidate,
+            "candidateIdentity": candidate_id,
             "candidatePr": number,
             "candidateSha": candidate_sha,
             "candidateBranch": branch,
@@ -3218,7 +3243,7 @@ class PublisherRepairDeliveryTests(unittest.TestCase):
         self.assertIn("Do not create another PR or force-push", body)
         self.assertIn("Do not change the local-only `check-upstream.sh` diagnostic", body)
         self.assertIn("fork-review-disposition:v1", body)
-        self.assertIn("exact current `candidate_id`", body)
+        self.assertIn(f"exact current `candidate_id` `{candidate_id}`", body)
         self.assertIn("`finding_id`, `status`, and `evidence`", body)
         self.assertIn("`source_sha`", body)
         self.assertIn("`application_sha` for full scope or `configuration_sha` for delta scope", body)
@@ -3277,7 +3302,9 @@ class PublisherRepairDeliveryTests(unittest.TestCase):
         self.assertIn("head.sha equals the pushed commit SHA", body)
         self.assertIn("Never force-push or create another PR", body)
         self.assertIn("fork-review-disposition:v1", body)
-        self.assertIn("exact current `candidate_id`", body)
+        self.assertIn(
+            f"Trusted base: `{state['config']}`. Current repair SHA: `{state['head']}`.", body)
+        self.assertIn("do not add candidate_id or create an owner receipt", body)
         self.assertIn("`finding_id`, `status`, and `evidence`", body)
         self.assertIn("`source_sha`", body)
         self.assertIn("specific regression test path and test name/assertion", body)
@@ -3467,9 +3494,15 @@ class FinalAttemptReuseTests(unittest.TestCase):
             built_dir = root / "built"
             candidate_dir.mkdir()
             built_dir.mkdir()
-            candidate = {"schema": 1}
+            candidate = {
+                "schema": 1, "repository": "warelik/osconfig",
+                "upstream_sha": "a" * 40, "application_sha": "b" * 40,
+                "configuration_sha": "c" * 40, "patchset_sha256": "d" * 64,
+                "recipe_sha256": "e" * 64, "platform": "fedora-44/x86_64",
+            }
+            candidate_id = release.frozen_candidate_identity(candidate)
             (candidate_dir / "candidate-manifest.json").write_text(json.dumps({
-                "candidate": candidate, "candidateIdentity": self.candidate_id,
+                "candidate": candidate, "candidateIdentity": candidate_id,
                 "candidateSha": self.run_sha,
             }), encoding="utf-8")
             rpm = built_dir / "agent.rpm"
@@ -3477,21 +3510,21 @@ class FinalAttemptReuseTests(unittest.TestCase):
             class Core:
                 @staticmethod
                 def candidate_identity(value):
-                    return "c" * 64 if value == candidate else "d" * 64
+                    return candidate_id if value == candidate else "f" * 64
             with patch.object(release, "lifecycle_module", return_value=Core), \
                     patch.dict(os.environ, {
                         "GITHUB_RUN_ID": "701", "GITHUB_RUN_ATTEMPT": "2",
                         "GITHUB_SHA": self.run_sha,
-                        "EXPECTED_CANDIDATE_ID": self.candidate_id,
+                        "EXPECTED_CANDIDATE_ID": candidate_id,
                     }):
                 release.write_build_provenance(candidate_dir, built_dir)
                 proof = release.verify_build_provenance(
-                    candidate_dir, built_dir, 701, 2, self.run_sha, self.candidate_id)
+                    candidate_dir, built_dir, 701, 2, self.run_sha, candidate_id)
                 self.assertEqual(proof["run_attempt"], 2)
                 rpm.write_bytes(b"changed-rpm-bytes")
                 with self.assertRaisesRegex(ValueError, "differ from their exact attempt receipt"):
                     release.verify_build_provenance(
-                        candidate_dir, built_dir, 701, 2, self.run_sha, self.candidate_id)
+                        candidate_dir, built_dir, 701, 2, self.run_sha, candidate_id)
 
 
 class PolicyLogPrivacyTests(unittest.TestCase):

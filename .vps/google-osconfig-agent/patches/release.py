@@ -1773,17 +1773,28 @@ def load_review_finding_history(repo, pull_number, *, published_at=None):
             body = ""
         if not isinstance(body, str):
             raise ValueError("Owner-authenticated finding comment body is malformed")
+        created_at, updated_at = comment.get("created_at"), comment.get("updated_at")
+        parsed_times = None
+        if isinstance(created_at, str) and isinstance(updated_at, str):
+            try:
+                parsed_times = (parse_utc(created_at), parse_utc(updated_at))
+            except (AttributeError, TypeError, ValueError):
+                pass
+        if (parsed_times is not None and parsed_times[0] < cutoff
+                and parsed_times[1] >= cutoff and parsed_times[1] != parsed_times[0]):
+            raise ValueError("Owner-authenticated comment was edited")
         if ("<!-- fork-finding-batch:v1" not in body
                 and FINDING_DISPOSITION_PREFIX not in body
                 and not body.startswith(FINDING_BATCH_PROLOGUE)):
             continue
-        created_at, updated_at = comment.get("created_at"), comment.get("updated_at")
         if not isinstance(created_at, str) or not isinstance(updated_at, str):
             raise ValueError("Owner-authenticated comment timestamps are missing")
-        try:
-            created_time, updated_time = parse_utc(created_at), parse_utc(updated_at)
-        except (AttributeError, TypeError, ValueError) as error:
-            raise ValueError("Owner-authenticated comment timestamps are malformed") from error
+        if parsed_times is None:
+            try:
+                parsed_times = (parse_utc(created_at), parse_utc(updated_at))
+            except (AttributeError, TypeError, ValueError) as error:
+                raise ValueError("Owner-authenticated comment timestamps are malformed") from error
+        created_time, updated_time = parsed_times
         if created_time < cutoff and updated_time < cutoff:
             continue
         protocol_values = _native_structured_protocol_values(body)
@@ -4367,6 +4378,9 @@ def review(candidate_dir):
 def request_fix(candidate_dir, evidence):
     repo = os.environ["GITHUB_REPOSITORY"]
     manifest = json.loads((candidate_dir / "candidate-manifest.json").read_text())
+    candidate_id = frozen_candidate_identity(manifest.get("candidate"))
+    if manifest.get("candidateIdentity") != candidate_id:
+        raise ValueError("Candidate repair request lacks its exact current candidate identity")
     pull = api(f"repos/{repo}/pulls/{manifest['candidatePr']}")
     if (not pull_identity(repo, pull, manifest["upstreamCommit"], manifest["candidateBranch"])
             or pull["head"]["sha"] != manifest["candidateSha"]):
@@ -4415,6 +4429,9 @@ def request_fix(candidate_dir, evidence):
         "upstream without the redundant product hunk, remove only that hunk, and retain the test. "
         "Do not change source.lock, release.py, the workflow, review gates, permissions, or server recipe. "
         "Do not add agent capabilities, Patch/guest-policy behavior, unsigned delivery or server changes.\n\n"
+        f"Failure evidence is for the exact current `candidate_id` `{candidate_id}` and "
+        f"source SHA `{manifest['candidateSha']}`. If the repair changes the candidate identity, "
+        "bind new evidence and reviews to the new identity.\n\n"
         + FINDING_DISPOSITION_INSTRUCTION + "\n\n"
         f"Use the validated manifest's `candidatePr` #{manifest['candidatePr']} and "
         f"`candidateBranch` `{manifest['candidateBranch']}`: after source inspection, commit and push to that "

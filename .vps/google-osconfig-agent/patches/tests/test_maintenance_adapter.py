@@ -658,7 +658,10 @@ class NativeAdapterTests(unittest.TestCase):
         self.assertIs(result, run_record)
         checked_proof = core.validate_workflow_source.call_args.args[-1]
         self.assertEqual(checked_proof, proof)
-        self.assertEqual(calls[-1][0], "graphql")
+        routes_seen = [route for route, _kwargs in calls]
+        self.assertEqual(routes_seen.count("graphql"), 2)
+        contents_prefix = f"repos/{self.repo}/contents/"
+        self.assertEqual(sum(route.startswith(contents_prefix) for route in routes_seen), 4)
 
     def test_current_workflow_guard_validates_the_exact_native_attempt(self):
         run_record = {
@@ -895,7 +898,7 @@ class NativeAdapterTests(unittest.TestCase):
                 self.repo, 91, published_at=REVIEW_HISTORY_CUTOFF)
 
         self.assertEqual(comments, [valid])
-        self.assertEqual(loaded, findings)
+        self.assertEqual(loaded, sorted(findings, key=lambda item: item["finding_id"]))
         self.assertEqual(sources, {candidate_id: {
             "candidate": candidate, "review_contexts": contexts,
         }})
@@ -1209,7 +1212,7 @@ class NativeAdapterTests(unittest.TestCase):
             "warelik", owner_comment, cutoff=release.parse_utc(REVIEW_HISTORY_CUTOFF))
         self.assertNotIn("fork-final:v1", protocol_body)
         self.assertNotIn("fork-candidate:v1", protocol_body)
-        self.assertNotIn("fork-policy-pair:v1", protocol_body)
+        self.assertEqual(protocol_body.count("<!-- fork-policy-pair:v1 "), 1)
         self.assertIn(disposition_marker, protocol_body)
         self.assertIn(policy_pair_marker, protocol_body)
         self.assertEqual(release._marker_value(

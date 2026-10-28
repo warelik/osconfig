@@ -57,15 +57,18 @@ index a5aa99c..1d064bd 100644
  	srv := newAgentEndpointServiceTestServer()
  	tc, err := newTestClient(ctx, srv)
 diff --git a/agentendpoint/inventory.go b/agentendpoint/inventory.go
-index b4af6b0..b6ff160 100644
+index f197236..361c4e6 100644
 --- a/agentendpoint/inventory.go
 +++ b/agentendpoint/inventory.go
-@@ -75,15 +75,22 @@ func (c *Client) report(ctx context.Context, state *inventory.InstanceInventory)
+@@ -75,15 +75,25 @@ func (c *Client) report(ctx context.Context, state *inventory.InstanceInventory)
  	clog.Debugf(ctx, "Reporting instance inventory to agent endpoint.")
  	inventory := formatInventory(ctx, state)
  	vmInventory := formatVMInventory(ctx, state)
-+	legacyComplete := len(inventory.GetInstalledPackages()) == len(vmInventory.GetInstalledPackages()) &&
-+		len(inventory.GetAvailablePackages()) == len(vmInventory.GetAvailablePackages())
++	// The legacy format intentionally ignores Pip and Gem packages, so a
++	// package-count comparison would reject otherwise complete legacy
++	// reports. Legacy is complete when it omits no Snap inventory, the one
++	// category it cannot represent at all.
++	legacyComplete := !hasSnapInventory(vmInventory)
 +	useLegacyAPI := legacyComplete && hasYumInventory(inventory)
  
  	reportFull := false
@@ -85,10 +88,25 @@ index b4af6b0..b6ff160 100644
  		}
  
  		if err != nil {
-@@ -106,6 +113,21 @@ func (c *Client) report(ctx context.Context, state *inventory.InstanceInventory)
+@@ -106,6 +116,36 @@ func (c *Client) report(ctx context.Context, state *inventory.InstanceInventory)
  	}
  }
  
++// hasSnapInventory reports whether the VM inventory contains Snap
++// packages, which the legacy inventory format cannot represent.
++func hasSnapInventory(vm *agentendpointpb.VmInventory) bool {
++	for _, items := range [][]*agentendpointpb.VmInventory_InventoryItem{
++		vm.GetInstalledPackages(), vm.GetAvailablePackages(),
++	} {
++		for _, item := range items {
++			if item.GetType() == "snap" {
++				return true
++			}
++		}
++	}
++	return false
++}
++
 +// hasYumInventory identifies native RPM inventory whose explicit package
 +// architectures are preserved by the legacy API.
 +func hasYumInventory(legacy *agentendpointpb.Inventory) bool {
@@ -107,7 +125,7 @@ index b4af6b0..b6ff160 100644
  func shouldFallbackToLegacyAPI(err error) bool {
  	if st, ok := status.FromError(err); ok == true {
  		return st.Code() == codes.FailedPrecondition
-@@ -606,10 +628,14 @@ func formatGooGetPackage(pkg *packages.PkgInfo) *agentendpointpb.Inventory_Softw
+@@ -633,10 +673,14 @@ func formatGooGetPackage(pkg *packages.PkgInfo) *agentendpointpb.Inventory_Softw
  }
  
  func formatYumPackage(pkg *packages.PkgInfo) *agentendpointpb.Inventory_SoftwarePackage_YumPackage {
@@ -124,7 +142,7 @@ index b4af6b0..b6ff160 100644
  		},
  	}
 diff --git a/agentendpoint/inventory_test.go b/agentendpoint/inventory_test.go
-index 57b1ad0..886070c 100644
+index 66ddb67..eda1e78 100644
 --- a/agentendpoint/inventory_test.go
 +++ b/agentendpoint/inventory_test.go
 @@ -26,10 +26,13 @@ import (
@@ -149,7 +167,7 @@ index 57b1ad0..886070c 100644
  	"google.golang.org/protobuf/testing/protocmp"
  	"google.golang.org/protobuf/types/known/structpb"
  	"google.golang.org/protobuf/types/known/timestamppb"
-@@ -611,6 +615,9 @@ func TestReport(t *testing.T) {
+@@ -619,6 +623,9 @@ func TestReport(t *testing.T) {
  				t.Fatal(err)
  			}
  
@@ -159,7 +177,7 @@ index 57b1ad0..886070c 100644
  			tc.client.report(ctx, tt.inventoryState)
  
  			if diff := cmp.Diff(tt.wantInventory, actualInventory, protocmp.Transform()); diff != "" {
-@@ -620,6 +627,98 @@ func TestReport(t *testing.T) {
+@@ -628,6 +635,98 @@ func TestReport(t *testing.T) {
  	}
  }
  
@@ -258,7 +276,7 @@ index 57b1ad0..886070c 100644
  func TestReportVmInventory(t *testing.T) {
  	ctx := context.Background()
  	ctrl := gomock.NewController(t)
-@@ -672,6 +771,184 @@ func TestReportVmInventory(t *testing.T) {
+@@ -680,6 +779,184 @@ func TestReportVmInventory(t *testing.T) {
  
  }
  
@@ -443,7 +461,7 @@ index 57b1ad0..886070c 100644
  func Test_computeFingerprint_gotExpectedFingerprintFormat(t *testing.T) {
  	ctx := context.Background()
  	fingerprint, err := computeFingerprint(ctx, generateInventory())
-@@ -917,3 +1194,10 @@ func Test_reportVmInventory_parseQFEDate(t *testing.T) {
+@@ -991,3 +1268,10 @@ func Test_pkgInfoToInventoryItem_propagatesLocation(t *testing.T) {
  		})
  	}
  }

@@ -2783,7 +2783,8 @@ def native_final_history(repo, current_candidate, baseline, current_run_id,
                     active_after.append(job)
             if not reservation_tuple:
                 if (started_after or active_after
-                        or any(native_policy_job_started(job)
+                        or any((native_policy_job_started(job)
+                                and parse_utc(job["started_at"]) >= cutoff)
                                or job.get("status") in {"queued", "in_progress"}
                                for job in policy_jobs)):
                     complete = False

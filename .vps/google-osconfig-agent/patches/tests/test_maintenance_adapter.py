@@ -1974,3 +1974,58 @@ class PolicyReuseAndOptionalLaneTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PolicyJobCutoffTests(unittest.TestCase):
+    repo = "warelik/osconfig"
+
+    def history_with_policy_job(self, policy_started_at):
+        candidate = {"repository": self.repo, "upstream_sha": "1" * 40,
+                     "application_sha": "2" * 40, "configuration_sha": "3" * 40}
+        workflow_run = {"id": 800, "run_attempt": 1,
+                        "updated_at": "2026-10-19T10:05:00Z"}
+        run_record = {
+            "id": 800, "run_attempt": 1, "path": release.WORKFLOW_PATH,
+            "head_sha": "a" * 40, "node_id": "WFR_example",
+            "event": "workflow_dispatch", "head_branch": "master",
+            "status": "completed", "conclusion": "success",
+            "created_at": "2026-10-19T09:45:00Z",
+            "updated_at": "2026-10-19T10:05:00Z",
+        }
+        jobs = [
+            {"id": 1, "name": name, "status": "completed", "conclusion": "skipped",
+             "steps": [], "started_at": None}
+            for name in release.FINAL_REQUIRED_JOBS
+        ]
+        jobs.append({"id": 2, "name": release.POLICY_VALIDATION_JOB,
+                     "status": "completed", "conclusion": "success",
+                     "steps": [{"name": "policy", "status": "completed",
+                                "conclusion": "success"}],
+                     "started_at": policy_started_at})
+
+        def pages(route):
+            if route == f"repos/{self.repo}/issues/comments":
+                return []
+            if route.endswith("/attempts/1/jobs"):
+                return jobs
+            return []
+
+        core = types.SimpleNamespace(candidate_identity=Mock(return_value="c" * 64))
+        with patch.dict("os.environ", {"CANDIDATE_PR": "91"}), \
+                patch.object(release, "lifecycle_module", return_value=core), \
+                patch.object(release, "pages", side_effect=pages), \
+                patch.object(release, "native_workflow_runs", return_value=[workflow_run]), \
+                patch.object(release, "api", return_value=run_record):
+            return release.native_final_history(
+                self.repo, candidate, {"published_at": "2026-10-19T10:00:00Z"}, 999, 1)
+
+    def test_policy_job_started_before_cutoff_keeps_history_complete(self):
+        # The run that published the baseline necessarily started its policy
+        # validation before the publication timestamp it produced; only its
+        # final updated_at crosses the cutoff. It must not poison history.
+        history = self.history_with_policy_job("2026-10-19T09:48:00Z")
+        self.assertTrue(history["complete"])
+
+    def test_policy_job_started_after_cutoff_without_reservation_is_incomplete(self):
+        history = self.history_with_policy_job("2026-10-19T10:01:00Z")
+        self.assertFalse(history["complete"])

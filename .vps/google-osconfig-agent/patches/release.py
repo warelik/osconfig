@@ -6190,6 +6190,11 @@ def check_policy(candidate, *, shared=False):
             if test.is_file() and not test.is_symlink():
                 shutil.copy2(test, trusted_patch / "tests" / test.name)
         shutil.copy2(ROOT / REPOSITORY_CONF, trusted_root / REPOSITORY_CONF)
+        trusted_workflow = ROOT / ".github/workflows/google-osconfig-agent-inventory.yml"
+        if trusted_workflow.is_file() and not trusted_workflow.is_symlink():
+            workflow_target = trusted_root / ".github/workflows" / trusted_workflow.name
+            workflow_target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(trusted_workflow, workflow_target)
         candidate_root = root / "candidate"
         candidate_root.mkdir()
         workflow_source = workflow_installed if workflow_installed.is_file() else workflow_template
@@ -6799,13 +6804,6 @@ def policy_container_engine():
         if result.returncode == 0:
             return [host_exec, "podman"], "podman"
         attempts.append("host Podman through distrobox-host-exec is unavailable")
-    podman = shutil.which("podman")
-    if podman:
-        result = subprocess.run([podman, "info"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                check=False, timeout=15)
-        if result.returncode == 0:
-            return [podman], "podman"
-        attempts.append("Podman CLI is installed but its service is unavailable")
     docker = shutil.which("docker")
     if docker:
         result = subprocess.run([docker, "info"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -6813,6 +6811,13 @@ def policy_container_engine():
         if result.returncode == 0:
             return [docker], "docker"
         attempts.append("Docker CLI is installed but its daemon is unavailable")
+    podman = shutil.which("podman")
+    if podman:
+        result = subprocess.run([podman, "info"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                check=False, timeout=15)
+        if result.returncode == 0:
+            return [podman], "podman"
+        attempts.append("Podman CLI is installed but its service is unavailable")
     detail = "; ".join(attempts) if attempts else "no Docker or Podman CLI is installed"
     raise ValueError(f"Publisher policy tests require a working Docker or Podman runtime: {detail}")
 

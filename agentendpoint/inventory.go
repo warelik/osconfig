@@ -75,15 +75,25 @@ func (c *Client) report(ctx context.Context, state *inventory.InstanceInventory)
 	clog.Debugf(ctx, "Reporting instance inventory to agent endpoint.")
 	inventory := formatInventory(ctx, state)
 	vmInventory := formatVMInventory(ctx, state)
+	// The legacy format intentionally ignores Pip and Gem packages, so a
+	// package-count comparison would reject otherwise complete legacy
+	// reports. Legacy is complete when it omits no Snap inventory, the one
+	// category it cannot represent at all.
+	legacyComplete := !hasSnapInventory(vmInventory)
+	useLegacyAPI := legacyComplete && hasYumInventory(inventory)
 
 	reportFull := false
 	var reportInventoryRes *agentendpointpb.ReportInventoryResponse
 	var reportVMInventoryRes *agentendpointpb.ReportVmInventoryResponse
 	var err error
 	f := func() error {
-		reportVMInventoryRes, err = c.reportVMInventory(ctx, vmInventory, reportFull)
-		if shouldFallbackToLegacyAPI(err) {
+		if useLegacyAPI {
 			reportInventoryRes, err = c.reportInventory(ctx, inventory, reportFull)
+		} else {
+			reportVMInventoryRes, err = c.reportVMInventory(ctx, vmInventory, reportFull)
+			if legacyComplete && shouldFallbackToLegacyAPI(err) {
+				reportInventoryRes, err = c.reportInventory(ctx, inventory, reportFull)
+			}
 		}
 
 		if err != nil {
@@ -104,6 +114,36 @@ func (c *Client) report(ctx context.Context, state *inventory.InstanceInventory)
 			return
 		}
 	}
+}
+
+// hasSnapInventory reports whether the VM inventory contains Snap
+// packages, which the legacy inventory format cannot represent.
+func hasSnapInventory(vm *agentendpointpb.VmInventory) bool {
+	for _, items := range [][]*agentendpointpb.VmInventory_InventoryItem{
+		vm.GetInstalledPackages(), vm.GetAvailablePackages(),
+	} {
+		for _, item := range items {
+			if item.GetType() == "snap" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hasYumInventory identifies native RPM inventory whose explicit package
+// architectures are preserved by the legacy API.
+func hasYumInventory(legacy *agentendpointpb.Inventory) bool {
+	for _, pkgs := range [][]*agentendpointpb.Inventory_SoftwarePackage{
+		legacy.GetInstalledPackages(), legacy.GetAvailablePackages(),
+	} {
+		for _, pkg := range pkgs {
+			if pkg.GetYumPackage() != nil {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func shouldFallbackToLegacyAPI(err error) bool {
@@ -633,10 +673,14 @@ func formatGooGetPackage(pkg *packages.PkgInfo) *agentendpointpb.Inventory_Softw
 }
 
 func formatYumPackage(pkg *packages.PkgInfo) *agentendpointpb.Inventory_SoftwarePackage_YumPackage {
+	architecture := pkg.Arch
+	if architecture == "all" {
+		architecture = "noarch"
+	}
 	fPkg := &agentendpointpb.Inventory_SoftwarePackage_YumPackage{
 		YumPackage: &agentendpointpb.Inventory_VersionedPackage{
 			PackageName:  pkg.Name,
-			Architecture: pkg.Arch,
+			Architecture: architecture,
 			Version:      pkg.Version,
 		},
 	}

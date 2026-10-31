@@ -3060,10 +3060,13 @@ def policy_validation_state(history, candidate_id):
             for step in steps:
                 name = step.get("name")
                 if name in {POLICY_VALIDATION_STEP, POLICY_PROPOSAL_VALIDATION_STEP}:
-                    started = (bool(step.get("started_at"))
-                               or step.get("status") == "in_progress"
-                               or (step.get("status") == "completed"
-                                   and step.get("conclusion") not in {None, "skipped"}))
+                    started = (
+                        step.get("conclusion") != "skipped"
+                        and (bool(step.get("started_at"))
+                             or step.get("status") == "in_progress"
+                             or (step.get("status") == "completed"
+                                 and step.get("conclusion") is not None))
+                    )
                     if started:
                         executions.append({
                             "run_id": run.get("id"),

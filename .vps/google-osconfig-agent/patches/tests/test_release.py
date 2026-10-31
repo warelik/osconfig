@@ -3777,6 +3777,73 @@ class FinalAttemptReuseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exact authorization grant"):
             release.existing_reservation_decision(comment, {"decision": "policy-only"})
 
+    def test_timestamped_skipped_sibling_policy_step_is_not_counted_as_second_execution(self):
+        real_api_attempt = {
+            "candidate_id": self.candidate_id,
+            "run": {"id": 41223189692, "run_attempt": 1},
+            "jobs": [{
+                "name": release.POLICY_VALIDATION_JOB,
+                "status": "completed",
+                "conclusion": "success",
+                "steps": [
+                    {
+                        "name": release.POLICY_VALIDATION_STEP,
+                        "status": "completed",
+                        "conclusion": "success",
+                        "started_at": "2026-10-31T17:11:37Z",
+                        "completed_at": "2026-10-31T17:12:02Z",
+                    },
+                    {
+                        "name": "Reuse exact private bundle policy validation",
+                        "status": "completed",
+                        "conclusion": "skipped",
+                        "started_at": "2026-10-31T17:12:02Z",
+                        "completed_at": "2026-10-31T17:12:02Z",
+                    },
+                    {
+                        "name": release.POLICY_PROPOSAL_VALIDATION_STEP,
+                        "status": "completed",
+                        "conclusion": "skipped",
+                        "started_at": "2026-10-31T17:12:02Z",
+                        "completed_at": "2026-10-31T17:12:02Z",
+                    },
+                ],
+            }],
+        }
+        state = release.policy_validation_state(self.history(real_api_attempt), self.candidate_id)
+        self.assertEqual(state["active"], False)
+        self.assertEqual(state["failed"], False)
+        self.assertEqual(state["validated"], True)
+
+        failed_attempt = json.loads(json.dumps(real_api_attempt))
+        failed_attempt["jobs"][0]["conclusion"] = "failure"
+        failed_attempt["jobs"][0]["steps"][0]["conclusion"] = "failure"
+        failed_state = release.policy_validation_state(
+            self.history(failed_attempt), self.candidate_id)
+        self.assertEqual(failed_state["active"], False)
+        self.assertEqual(failed_state["failed"], True)
+        self.assertEqual(failed_state["validated"], False)
+
+        active_attempt = json.loads(json.dumps(real_api_attempt))
+        active_attempt["jobs"][0]["status"] = "in_progress"
+        active_attempt["jobs"][0]["conclusion"] = None
+        active_attempt["jobs"][0]["steps"][0]["status"] = "in_progress"
+        active_attempt["jobs"][0]["steps"][0]["conclusion"] = None
+        active_attempt["jobs"][0]["steps"][0]["completed_at"] = None
+        active_state = release.policy_validation_state(
+            self.history(active_attempt), self.candidate_id)
+        self.assertEqual(active_state["active"], True)
+        self.assertEqual(active_state["failed"], False)
+        self.assertEqual(active_state["validated"], False)
+
+        both_executed = json.loads(json.dumps(real_api_attempt))
+        both_executed["jobs"][0]["steps"][2]["conclusion"] = "success"
+        duplicate_state = release.policy_validation_state(
+            self.history(both_executed), self.candidate_id)
+        self.assertEqual(duplicate_state["failed"], True)
+        self.assertEqual(duplicate_state["validated"], False)
+        self.assertIn("more than once", duplicate_state["reason"])
+
     def test_build_artifact_provenance_binds_files_to_exact_run_attempt(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

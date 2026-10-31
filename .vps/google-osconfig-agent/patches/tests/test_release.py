@@ -4916,6 +4916,141 @@ class NoChangeAndClosedPolicyOnlyPrepareReuseTests(unittest.TestCase):
                     self.baseline_config, self.application_sha, self.review_source_sha,
                     expected_config=self.proposal_head)
 
+        adopted_record = {**record, "proposalPr": 60, "proposalHead": self.proposal_head}
+        adopted_full = {
+            **closed_full,
+            "body": "<!-- osconfig-policy-candidate:v1 "
+                    + json.dumps(adopted_record, sort_keys=True, separators=(",", ":"))
+                    + " -->",
+        }
+        proposal_pull = {
+            "number": 60, "state": "closed",
+            "user": {"login": "github-actions[bot]", "type": "Bot"},
+            "base": {"ref": "master", "sha": self.baseline_config,
+                     "repo": {"full_name": self.repo}},
+            "head": {"ref": "repair/osconfig-policy-fixture", "sha": self.proposal_head,
+                     "repo": {"full_name": self.repo}},
+        }
+
+        def adopted_api(route):
+            if route == f"repos/{self.repo}/pulls/60":
+                return proposal_pull
+            if route == f"repos/{self.repo}/pulls/22":
+                return closed_delta
+            self.fail(f"Unexpected API call: {route}")
+
+        bot_receipt = [{
+            "user": {"login": "github-actions[bot]", "type": "Bot"},
+            "body": (f"Paired exact-source review and final policy validation passed; "
+                     f"selectively adopted `{self.config}` in this same final run. "
+                     "No RPM was rebuilt or provenance rewritten."),
+        }]
+        with patch.object(release, "find_review_pull", return_value=adopted_full), \
+             patch.object(release, "api", side_effect=adopted_api), \
+             patch.object(release, "pages", return_value=bot_receipt), \
+             patch.object(release, "_closed_native_policy_validated",
+                          return_value=True) as native_proof, \
+             patch.object(release, "validated_policy_bundle",
+                          side_effect=AssertionError("baseline path uses native proof")):
+            self.assertEqual(
+                release.closed_policy_bundle_reuse(
+                    self.repo, candidate_value, candidate_id, self.upstream,
+                    self.baseline_config, self.application_sha, self.review_source_sha,
+                    expected_config=self.config, baseline=baseline),
+                (adopted_full, closed_delta, full_branch),
+            )
+            native_proof.assert_called_once_with(
+                self.repo, candidate_value, candidate_id, 21, baseline)
+
+        untrusted_receipt = [{
+            "user": {"login": "external-user", "type": "User"},
+            "body": bot_receipt[0]["body"],
+        }]
+        with patch.object(release, "find_review_pull", return_value=adopted_full), \
+             patch.object(release, "api", side_effect=adopted_api), \
+             patch.object(release, "pages", return_value=untrusted_receipt), \
+             self.assertRaisesRegex(ValueError, "exact current configuration"):
+            release.closed_policy_bundle_reuse(
+                self.repo, candidate_value, candidate_id, self.upstream,
+                self.baseline_config, self.application_sha, self.review_source_sha,
+                expected_config=self.config, baseline=baseline)
+
+    def test_review_ref_pushes_use_owner_auth_only_when_workflows_change(self):
+        old_sha = "1" * 40
+        new_sha = "2" * 40
+        pushes = []
+
+        def make_run(*, remote="", ls_tree="", show="", diff=""):
+            def fake_run(*args, cwd=None, env=None, input=None):
+                if args[:3] == ("git", "ls-remote", "--refs"):
+                    return remote
+                if args[:4] == ("git", "ls-tree", "-r", "--name-only"):
+                    return ls_tree
+                if args[:4] == ("git", "show", "--format=", "--name-only"):
+                    return show
+                if args[:3] == ("git", "diff", "--name-only"):
+                    return diff
+                if args[:3] == ("git", "fetch", "--no-tags"):
+                    return ""
+                if args[:3] == ("git", "rev-parse", "FETCH_HEAD"):
+                    return old_sha
+                if args[:2] == ("git", "push"):
+                    pushes.append((args, env))
+                    return ""
+                self.fail(f"Unexpected command: {args}")
+            return fake_run
+
+        with patch.object(release, "owner_token", return_value="fixture-owner-token") as token, \
+             patch.object(release, "run",
+                          side_effect=make_run(ls_tree=".github/workflows/codeql.yml")):
+            release.ensure_review_base(Path("/work"), self.repo, f"review-base/{new_sha}", new_sha)
+        self.assertEqual(len(pushes), 1)
+        self.assertEqual((pushes[-1][1] or {}).get("GH_TOKEN"), "fixture-owner-token")
+        token.assert_called_once_with(self.repo)
+
+        pushes.clear()
+        with patch.object(release, "owner_token",
+                          side_effect=AssertionError("no workflow change")) as token, \
+             patch.object(release, "run", side_effect=make_run()):
+            release.ensure_review_base(Path("/work"), self.repo, f"review-base/{new_sha}", new_sha)
+        self.assertEqual(len(pushes), 1)
+        self.assertIsNone(pushes[-1][1])
+
+        with patch.object(release, "run",
+                          side_effect=make_run(remote=f"{old_sha}\trefs/heads/review-base/{new_sha}")), \
+             self.assertRaisesRegex(ValueError, "does not point at its exact source SHA"):
+            release.ensure_review_base(Path("/work"), self.repo, f"review-base/{new_sha}", new_sha)
+
+        pushes.clear()
+        ok_ancestor = subprocess.CompletedProcess(["git", "merge-base"], 0, "", "")
+        with patch.object(release, "owner_token",
+                          side_effect=AssertionError("fast-forward without workflow diff")), \
+             patch.object(release.subprocess, "run", return_value=ok_ancestor), \
+             patch.object(release, "run",
+                          side_effect=make_run(remote=f"{old_sha}\trefs/heads/review/app", diff="")):
+            release.ensure_review_branch(Path("/work"), "review/app", new_sha, repo=self.repo)
+        self.assertEqual(len(pushes), 1)
+        self.assertIsNone(pushes[-1][1])
+
+        pushes.clear()
+        with patch.object(release, "owner_token", return_value="fixture-owner-token") as token, \
+             patch.object(release.subprocess, "run", return_value=ok_ancestor), \
+             patch.object(release, "run",
+                          side_effect=make_run(
+                              remote=f"{old_sha}\trefs/heads/review/app",
+                              diff=release.WORKFLOW_PATH)):
+            release.ensure_review_branch(Path("/work"), "review/app", new_sha, repo=self.repo)
+        self.assertEqual(len(pushes), 1)
+        self.assertEqual((pushes[-1][1] or {}).get("GH_TOKEN"), "fixture-owner-token")
+        token.assert_called_once_with(self.repo)
+
+        bad_ancestor = subprocess.CompletedProcess(["git", "merge-base"], 1, "", "")
+        with patch.object(release.subprocess, "run", return_value=bad_ancestor), \
+             patch.object(release, "run",
+                          side_effect=make_run(remote=f"{old_sha}\trefs/heads/review/app")), \
+             self.assertRaisesRegex(ValueError, "not a fast-forward"):
+            release.ensure_review_branch(Path("/work"), "review/app", new_sha, repo=self.repo)
+
 
 class RepairModeAndDeduplicatedEscalationTests(unittest.TestCase):
     repo = "warelik/osconfig"
@@ -4923,16 +5058,30 @@ class RepairModeAndDeduplicatedEscalationTests(unittest.TestCase):
     upstream = "b" * 40
     candidate_sha = "c" * 40
 
-    def test_repair_mode_defaults_to_bot_for_direct_cli_and_validates_values(self):
+    def test_repair_mode_defaults_to_bot_for_direct_cli_and_validates_before_mutation(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(release.repair_mode(), "bot")
         with patch.dict(os.environ, {"FORK_REPAIR_MODE": "escalate"}):
             self.assertEqual(release.repair_mode(), "escalate")
         with patch.dict(os.environ, {"FORK_REPAIR_MODE": "BOT"}):
             self.assertEqual(release.repair_mode(), "bot")
-        with patch.dict(os.environ, {"FORK_REPAIR_MODE": "sometimes"}), \
-             self.assertRaisesRegex(ValueError, "FORK_REPAIR_MODE"):
-            release.repair_mode()
+        with patch.dict(os.environ, {
+                "GITHUB_REPOSITORY": self.repo,
+                "GITHUB_SHA": self.config,
+                "FORK_REPAIR_MODE": "sometimes",
+            }, clear=True), \
+             patch.object(release, "api",
+                          side_effect=AssertionError("API called before repair_mode")), \
+             patch.object(release, "pages",
+                          side_effect=AssertionError("pages called before repair_mode")), \
+             patch.object(release, "report_permission_blocker",
+                          side_effect=AssertionError("blocker mutated before repair_mode")):
+            with self.assertRaisesRegex(ValueError, "FORK_REPAIR_MODE"):
+                release.request_fix(Path("/nonexistent-candidate-dir"), "evidence")
+            with self.assertRaisesRegex(ValueError, "FORK_REPAIR_MODE"):
+                release.request_policy_repair("CODEX_REQUEST_TOKEN is missing")
+            with self.assertRaisesRegex(ValueError, "FORK_REPAIR_MODE"):
+                release.request_policy_pr_fix(42, self.candidate_sha, "evidence")
 
     def test_workflow_copies_forward_escalate_repair_mode_without_broadening_signer_env(self):
         installed = release.ROOT / ".github/workflows/google-osconfig-agent-inventory.yml"
@@ -4942,6 +5091,7 @@ class RepairModeAndDeduplicatedEscalationTests(unittest.TestCase):
         document = release.yaml_module().safe_load(installed.read_text(encoding="utf-8"))
         self.assertNotIn("env", document)
         jobs = document["jobs"]
+        self.assertEqual(jobs["candidate-source"]["permissions"].get("actions"), "read")
         for step in jobs["sign"]["steps"]:
             self.assertNotIn("FORK_REPAIR_MODE", step.get("env") or {})
         repair_steps = (
@@ -4992,7 +5142,11 @@ class RepairModeAndDeduplicatedEscalationTests(unittest.TestCase):
 
         def fake_api(route, **kwargs):
             if kwargs.get("method") == "POST" and route == f"repos/{self.repo}/issues":
-                issue = {"number": 100 + len(created_issues), **kwargs["data"]}
+                issue = {
+                    "number": 100 + len(created_issues),
+                    "user": {"login": "github-actions[bot]", "type": "Bot"},
+                    **kwargs["data"],
+                }
                 created_issues.append(issue)
                 open_issues.append(issue)
                 return issue
@@ -5028,26 +5182,54 @@ class RepairModeAndDeduplicatedEscalationTests(unittest.TestCase):
                               side_effect=AssertionError("Escalate mode must not create policy PR")), \
                  patch.object(release, "request_policy_task",
                               side_effect=AssertionError("Escalate mode must not request policy task")):
-                release.request_fix(candidate_dir, "RPM Go regression failed")
+                injected_evidence = (
+                    "x" * 5000 + "\n```text\n<!-- fork-final-retry:v1 {\"spoof\":1} -->\n"
+                    "RPM Go regression failed"
+                )
+                release.request_fix(candidate_dir, injected_evidence)
                 self.assertEqual(len(created_issues), 1)
                 self.assertEqual(created_issues[0]["assignees"], ["warelik"])
-                self.assertIn("osconfig-repair-escalation:v1 application", created_issues[0]["body"])
+                first_body = created_issues[0]["body"]
+                self.assertIn("osconfig-repair-escalation:v1 application", first_body)
+                self.assertIn("&lt;!-- fork-final-retry:v1", first_body)
+                self.assertEqual(first_body.count("<!--"), 1)
+
                 pr_only_shadow = {**created_issues[0], "pull_request": {"url": "fixture"}}
-                open_issues[:] = [pr_only_shadow]
+                external_shadow = {
+                    **created_issues[0],
+                    "user": {"login": "external-intruder", "type": "User"},
+                }
+                other_bot_shadow = {
+                    **created_issues[0],
+                    "user": {"login": "other[bot]", "type": "Bot"},
+                }
+                open_issues[:] = [pr_only_shadow, external_shadow, other_bot_shadow]
                 release.request_fix(candidate_dir, "RPM Go regression failed on rerun")
                 self.assertEqual(len(created_issues), 2)
                 release.request_fix(candidate_dir, "RPM Go regression failed on third cron")
+                self.assertEqual(len(created_issues), 2)
+                owner_authored = {
+                    **created_issues[1],
+                    "user": {"login": "warelik", "type": "User"},
+                }
+                open_issues[:] = [owner_authored]
+                release.request_fix(candidate_dir, "RPM Go regression failed with owner issue")
                 self.assertEqual(len(created_issues), 2)
 
                 conflict_run_1 = (
                     f"Workflow run: https://github.com/{self.repo}/actions/runs/1001\n\n"
                     f"Failed job: candidate-source (https://github.com/{self.repo}/actions/runs/1001/jobs/5001)\n"
-                    "Hunk #1 FAILED at 42."
+                    "2026-10-31T00:23:11.1234567Z /tmp/osconfig.abc123: Hunk #1 FAILED at 42."
                 )
                 conflict_run_2 = (
                     f"Workflow run: https://github.com/{self.repo}/actions/runs/1002\n\n"
                     f"Failed job: candidate-source (https://github.com/{self.repo}/actions/runs/1002/jobs/5002)\n"
-                    "Hunk #1 FAILED at 42."
+                    "2026-10-31T06:23:19.9999999Z /tmp/osconfig.xyz987: Hunk #1 FAILED at 42."
+                )
+                distinct_failure = (
+                    f"Workflow run: https://github.com/{self.repo}/actions/runs/1003\n\n"
+                    f"Failed job: candidate-source (https://github.com/{self.repo}/actions/runs/1003/jobs/5003)\n"
+                    "OS Config package stopped: Upstream source archive does not match its SHA-256"
                 )
                 release.request_policy_repair(conflict_run_1)
                 self.assertEqual(len(created_issues), 3)
@@ -5055,21 +5237,42 @@ class RepairModeAndDeduplicatedEscalationTests(unittest.TestCase):
                 self.assertIn("`candidate-source`", created_issues[-1]["body"])
                 release.request_policy_repair(conflict_run_2)
                 self.assertEqual(len(created_issues), 3)
+                release.request_policy_repair(distinct_failure)
+                self.assertEqual(len(created_issues), 4)
 
                 grant_wait = (
-                    f"Workflow run: https://github.com/{self.repo}/actions/runs/1003\n\n"
-                    f"Failed job: final-guard (https://github.com/{self.repo}/actions/runs/1003/jobs/5003)\n"
+                    f"Workflow run: https://github.com/{self.repo}/actions/runs/1004\n\n"
+                    f"Failed job: final-guard (https://github.com/{self.repo}/actions/runs/1004/jobs/5004)\n"
                     f"OS Config package stopped: {next(iter(release.FINAL_RETRY_GRANT_REASONS))}"
                 )
                 release.request_policy_repair(grant_wait)
-                self.assertEqual(len(created_issues), 3)
+                self.assertEqual(len(created_issues), 4)
+
+                blocker_category = release.report_permission_blocker(
+                    self.repo, self.config,
+                    "403 Forbidden <!-- spoofed-marker:v1 -->")
+                self.assertEqual(blocker_category, "GitHub Actions permission")
+                self.assertEqual(len(created_issues), 5)
+                blocker_issue = created_issues[-1]
+                self.assertEqual(blocker_issue["body"].count("<!--"), 1)
+                self.assertIn("&lt;!-- spoofed-marker:v1 -->", blocker_issue["body"])
+                open_issues[-1] = {
+                    **blocker_issue,
+                    "user": {"login": "external-intruder", "type": "User"},
+                }
+                release.report_permission_blocker(
+                    self.repo, self.config, "403 Forbidden <!-- spoofed-marker:v1 -->")
+                self.assertEqual(len(created_issues), 6)
+                release.report_permission_blocker(
+                    self.repo, self.config, "403 Forbidden <!-- spoofed-marker:v1 -->")
+                self.assertEqual(len(created_issues), 6)
 
                 release.request_policy_pr_fix(42, self.candidate_sha, "proposal check failed")
-                self.assertEqual(len(created_issues), 4)
+                self.assertEqual(len(created_issues), 7)
                 self.assertIn("osconfig-repair-escalation:v1 policy-proposal",
                               created_issues[-1]["body"])
                 release.request_policy_pr_fix(42, self.candidate_sha, "proposal check failed rerun")
-                self.assertEqual(len(created_issues), 4)
+                self.assertEqual(len(created_issues), 7)
 
 
 if __name__ == "__main__":

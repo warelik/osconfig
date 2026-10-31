@@ -1268,19 +1268,40 @@ def find_review_pull(repo, base_branch, head_branch, *, states=("open",)):
     return next(iter(unique.values()), None)
 
 
+def git_push_env(repo_work, repo, sha, *, old_sha=None):
+    """Supply owner Git auth only when the pushed ref touches workflow files."""
+    if old_sha is not None:
+        touched = bool(run("git", "diff", "--name-only", old_sha, sha,
+                           "--", ".github/workflows", cwd=repo_work))
+    else:
+        touched = bool(
+            run("git", "ls-tree", "-r", "--name-only", sha,
+                "--", ".github/workflows", cwd=repo_work)
+            or run("git", "show", "--format=", "--name-only", sha,
+                   "--", ".github/workflows", cwd=repo_work)
+        )
+    if not touched:
+        return None
+    if not repo:
+        repo = os.environ["GITHUB_REPOSITORY"]
+    return {**os.environ, "GH_TOKEN": owner_token(repo)}
+
+
 def ensure_review_base(repo_work, repo, branch, sha):
     remote = run("git", "ls-remote", "--refs", "origin", f"refs/heads/{branch}", cwd=repo_work)
     if remote:
         if remote.split()[0] != sha:
             raise ValueError(f"Review base {branch} does not point at its exact source SHA")
         return
-    run("git", "push", "origin", f"{sha}:refs/heads/{branch}", cwd=repo_work)
+    run("git", "push", "origin", f"{sha}:refs/heads/{branch}", cwd=repo_work,
+        env=git_push_env(repo_work, repo, sha))
 
 
-def ensure_review_branch(repo_work, branch, sha):
+def ensure_review_branch(repo_work, branch, sha, *, repo=None):
     remote = run("git", "ls-remote", "--refs", "origin", f"refs/heads/{branch}", cwd=repo_work)
     if not remote:
-        run("git", "push", "origin", f"{sha}:refs/heads/{branch}", cwd=repo_work)
+        run("git", "push", "origin", f"{sha}:refs/heads/{branch}", cwd=repo_work,
+            env=git_push_env(repo_work, repo, sha))
         return
     old = remote.split()[0]
     if old == sha:
@@ -1291,7 +1312,8 @@ def ensure_review_branch(repo_work, branch, sha):
     if subprocess.run(["git", "merge-base", "--is-ancestor", old, sha],
                       cwd=repo_work, check=False).returncode != 0:
         raise ValueError(f"Review branch {branch} is not a fast-forward of its exact old commit")
-    run("git", "push", "origin", f"{sha}:refs/heads/{branch}", cwd=repo_work)
+    run("git", "push", "origin", f"{sha}:refs/heads/{branch}", cwd=repo_work,
+        env=git_push_env(repo_work, repo, sha, old_sha=old))
 
 
 def verify_unpaired_review_context(repo_work, branch, context_sha):
@@ -3114,9 +3136,41 @@ def validated_policy_for_decision(repo, candidate, full_pr_number, action):
     return validated_policy_bundle(repo, candidate, full_pr_number)
 
 
+def _proposal_adopted_config(repo, proposal_pr, proposal_head, expected_config):
+    """Accept a closed policy proposal whose exact bot adoption receipt names expected_config."""
+    proposal = api(f"repos/{repo}/pulls/{proposal_pr}")
+    head = (proposal.get("head") or {}) if isinstance(proposal, dict) else {}
+    base = (proposal.get("base") or {}) if isinstance(proposal, dict) else {}
+    actor = (proposal.get("user") or {}) if isinstance(proposal, dict) else {}
+    owner = repo.split("/", 1)[0]
+    if (not isinstance(proposal, dict) or proposal.get("state") != "closed"
+            or not ((actor.get("login") == "github-actions[bot]" and actor.get("type") == "Bot")
+                    or (actor.get("login") == owner and actor.get("type") == "User"))
+            or head.get("sha") != proposal_head
+            or not (head.get("ref") or "").startswith(POLICY_REPAIR_BRANCH)
+            or (head.get("repo") or {}).get("full_name") != repo
+            or base.get("ref") != DEFAULT_BRANCH
+            or (base.get("repo") or {}).get("full_name") != repo):
+        return False
+    expected_bodies = {
+        (f"Paired exact-source review and final policy validation passed; "
+         f"selectively adopted `{expected_config}` in this same final run. "
+         "No RPM was rebuilt or provenance rewritten."),
+        (f"Isolated checks and exact-SHA review passed; "
+         f"selectively adopted `{expected_config}`. The proposal was not merged."),
+    }
+    return any(
+        isinstance(comment, dict)
+        and (comment.get("user") or {}).get("login") == "github-actions[bot]"
+        and (comment.get("user") or {}).get("type") == "Bot"
+        and (comment.get("body") or "").strip() in expected_bodies
+        for comment in pages(f"repos/{repo}/issues/{proposal_pr}/comments")
+    )
+
+
 def closed_policy_bundle_reuse(repo, candidate, candidate_id, upstream,
                                baseline_config, application_sha, review_source_sha, *,
-                               expected_config=None):
+                               expected_config=None, baseline=None):
     """Find a closed policy-review pair only when its native receipt is exact."""
     base_branch = f"review-base/{upstream}"
     head_branch = f"review/{upstream}-{candidate_id}"
@@ -3180,7 +3234,9 @@ def closed_policy_bundle_reuse(repo, candidate, candidate_id, upstream,
         raise ValueError("Closed policy review claimant differs from the exact candidate or context")
     if expected_config is not None and (
             not SHA.fullmatch(expected_config or "")
-            or record.get("proposalHead") != expected_config):
+            or (record.get("proposalHead") != expected_config
+                and not _proposal_adopted_config(
+                    repo, record["proposalPr"], record["proposalHead"], expected_config))):
         raise ValueError("Closed policy review claimant differs from the exact current configuration")
 
     delta_branch = delta_review_branch(record["deltaSha"])
@@ -3194,7 +3250,13 @@ def closed_policy_bundle_reuse(repo, candidate, candidate_id, upstream,
                 base_branch=delta_base_branch, head_sha=record["deltaSha"],
                 head_branch=delta_branch, allow_closed=True)):
         raise ValueError("Closed policy review claimant has no exact native delta PR context")
-    if not validated_policy_bundle(repo, candidate, pull["number"]):
+    validated = (
+        _closed_native_policy_validated(
+            repo, candidate, candidate_id, pull["number"], baseline)
+        if baseline is not None
+        else validated_policy_bundle(repo, candidate, pull["number"])
+    )
+    if not validated:
         raise ValueError("Closed policy review claimant has no verified exact shared bundle")
     return pull, delta_pull, head_branch
 
@@ -4411,7 +4473,8 @@ def prepare(candidate):
     if pull is None:
         recovered = closed_policy_bundle_reuse(
             repo, candidate_value, candidate_id, upstream, baseline_config,
-            application_sha, review_source_sha, expected_config=config)
+            application_sha, review_source_sha,
+            expected_config=config, baseline=baseline)
         if recovered is not None:
             pull, recovered_delta_pull, branch = recovered
             bundle_reuse = True
@@ -4453,11 +4516,11 @@ def prepare(candidate):
         # needs the review branches pushed again.
         ensure_review_base(repo_work, repo, base, upstream)
         ensure_review_base(repo_work, repo, delta_base_branch, delta_base)
-        ensure_review_branch(repo_work, delta_branch, delta_sha)
+        ensure_review_branch(repo_work, delta_branch, delta_sha, repo=repo)
     run("git", "update-ref", "refs/heads/candidate", review_source_sha, cwd=repo_work)
     run("git", "reset", "--hard", review_source_sha, cwd=repo_work)
     if not bundle_reuse:
-        ensure_review_branch(repo_work, branch, review_source_sha)
+        ensure_review_branch(repo_work, branch, review_source_sha, repo=repo)
     delta_pull = recovered_delta_pull
     delta_body = (
         ("Review-only application delta against the last accepted application. The complete "
@@ -4512,6 +4575,20 @@ def prepare(candidate):
                          "delta": {"review_sha": delta_sha}})
     _, finding_history, _, all_dispositions = load_review_finding_history(
         repo, pull["number"], published_at=baseline["published_at"])
+    if bundle_reuse:
+        proposal_matches = POLICY_CANDIDATE_MARKER.findall(pull.get("body") or "")
+        if len(proposal_matches) == 1:
+            proposal_pr = _strict_json_object(
+                proposal_matches[0], "Closed policy review marker").get("proposalPr")
+            if type(proposal_pr) is int and proposal_pr != pull["number"]:
+                _, proposal_findings, _, proposal_dispositions = load_review_finding_history(
+                    repo, proposal_pr, published_at=baseline["published_at"])
+                finding_history = _native_authoritative_findings(
+                    finding_history, proposal_findings)
+                for key, item in proposal_dispositions.items():
+                    if key in all_dispositions and all_dispositions[key] != item:
+                        raise ValueError("Conflicting closed policy proposal dispositions")
+                    all_dispositions[key] = item
     candidate_dispositions = [item for item in all_dispositions.values()
                               if item.get("candidate_id") == candidate_id]
     artifact = candidate / "inputs"
@@ -4654,8 +4731,8 @@ def prepare_policy_candidate(candidate_dir):
             repo_work, candidate_value["application_sha"], candidate_id)
         full_branch = f"review/{upstream}-{candidate_id}"
         delta_branch = f"review/changes-{delta_sha}"
-        ensure_review_branch(repo_work, full_branch, full_context_sha)
-        ensure_review_branch(repo_work, delta_branch, delta_sha)
+        ensure_review_branch(repo_work, full_branch, full_context_sha, repo=repo)
+        ensure_review_branch(repo_work, delta_branch, delta_sha, repo=repo)
 
         delta_body = (
             "Review-only snapshot of the proposed downstream policy, workflow, patch and regression "
@@ -4760,6 +4837,7 @@ def review(candidate_dir):
 
 
 def request_fix(candidate_dir, evidence):
+    mode = repair_mode()
     repo = os.environ["GITHUB_REPOSITORY"]
     manifest = json.loads((candidate_dir / "candidate-manifest.json").read_text())
     candidate_id = frozen_candidate_identity(manifest.get("candidate"))
@@ -4770,7 +4848,7 @@ def request_fix(candidate_dir, evidence):
             or pull["head"]["sha"] != manifest["candidateSha"]):
         print("Candidate head advanced; this run will not request a fix against the old SHA")
         return
-    if repair_mode() == "escalate":
+    if mode == "escalate":
         report_repair_escalation(
             repo,
             scope="application",
@@ -5432,12 +5510,64 @@ def request_policy_task(repo, state, evidence, token):
     print(f"Requested publisher-policy repair on PR #{state['number']}")
 
 
+def _trusted_issue_marker_exists(repo, marker):
+    owner = repo.split("/", 1)[0]
+    for issue in pages(f"repos/{repo}/issues?state=open"):
+        if not isinstance(issue, dict) or issue.get("pull_request"):
+            continue
+        actor = issue.get("user") if isinstance(issue.get("user"), dict) else {}
+        trusted = (
+            (actor.get("login") == "github-actions[bot]" and actor.get("type") == "Bot")
+            or (actor.get("login") == owner and actor.get("type") == "User")
+        )
+        if trusted and marker in (issue.get("body") or ""):
+            return True
+    return False
+
+
+def _normalize_escalation_line(line):
+    text = re.sub(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})\s*",
+                  "", (line or "").strip())
+    text = re.sub(r"https://github\.com/[^\s)]+/actions/runs/\d+(?:/jobs/\d+)?",
+                  "<workflow-run>", text)
+    text = re.sub(r"\b(?:run_id|job_id|run_attempt|attempt)[=:\s]+\d+\b",
+                  "<run>", text, flags=re.I)
+    text = re.sub(r"/(?:tmp|var/tmp|home/runner/work/_temp)/[^\s'\":]+", "<tmp>", text)
+    return " ".join(text.split())
+
+
 def _publisher_escalation_key(evidence):
+    sanitized = sanitize_job_log(evidence or "")
     sections = re.findall(r"(?ms)^Failed job: ([^\n]+)\n(.*?)(?=^Failed job: |\Z)",
-                          evidence or "")
-    jobs = sorted({header.split(" (", 1)[0].strip()
-                   for header, _ in sections if header.split(" (", 1)[0].strip()})
-    return ",".join(jobs) if jobs else "publisher"
+                          sanitized)
+    signal_re = re.compile(
+        r"OS Config package stopped:|##\[error\]|Hunk #\d+ FAILED|"
+        r"patch: \*\*\*\*|CommandFailure|CalledProcessError|Error:|error:"
+    )
+    if sections:
+        jobs = []
+        details = []
+        for header, body in sections:
+            job = header.split(" (", 1)[0].strip()
+            if not job:
+                continue
+            jobs.append(job)
+            lines = [_normalize_escalation_line(line)
+                     for line in body.splitlines()
+                     if _normalize_escalation_line(line)
+                     and not line.lstrip().startswith(("Workflow run:", "Inspect run"))]
+            matched = [line for line in lines if signal_re.search(line)]
+            summary_line = (matched[-1] if matched else (lines[-1] if lines else ""))[:240]
+            details.append(f"{job}:{summary_line}")
+        if jobs:
+            return ",".join(sorted(set(jobs))), "\n".join(sorted(set(details)))
+    lines = [_normalize_escalation_line(line)
+             for line in sanitized.splitlines()
+             if _normalize_escalation_line(line)
+             and not line.lstrip().startswith(("Workflow run:", "Inspect run"))]
+    matched = [line for line in lines if signal_re.search(line)]
+    summary_line = (matched[-1] if matched else (lines[-1] if lines else "publisher"))[:240]
+    return "publisher", f"publisher:{summary_line}"
 
 
 def report_repair_escalation(repo, *, scope, config, key, title, summary, evidence):
@@ -5447,11 +5577,14 @@ def report_repair_escalation(repo, *, scope, config, key, title, summary, eviden
         raise ValueError("Repair escalation requires exact scope, configuration, and failure key")
     key_hash = hashlib.sha256(f"{scope}\0{key}".encode("utf-8")).hexdigest()[:16]
     marker = f"<!-- osconfig-repair-escalation:v1 {scope} {config} {key_hash} -->"
-    for issue in pages(f"repos/{repo}/issues?state=open"):
-        if not issue.get("pull_request") and marker in (issue.get("body") or ""):
-            print(f"Repair escalation issue is already open for {scope} ({key_hash})")
-            return marker
-    detail = sanitize_job_log(evidence or "")[-4000:].replace("```", "'''")
+    if _trusted_issue_marker_exists(repo, marker):
+        print(f"Repair escalation issue is already open for {scope} ({key_hash})")
+        return marker
+    detail = (
+        sanitize_job_log(evidence or "")
+        .replace("<!--", "&lt;!--")
+        .replace("```", "'''")[-4000:]
+    )
     api(f"repos/{repo}/issues", method="POST", data={
         "title": title,
         "assignees": [repo.split("/")[0]],
@@ -5468,6 +5601,7 @@ def report_repair_escalation(repo, *, scope, config, key, title, summary, eviden
 
 
 def request_policy_repair(evidence):
+    mode = repair_mode()
     repo = os.environ["GITHUB_REPOSITORY"]
     config = os.environ.get("POLICY_CONFIG_SHA") or os.environ.get("GITHUB_SHA", "")
     if not SHA.fullmatch(config):
@@ -5482,8 +5616,8 @@ def request_policy_repair(evidence):
     if blocker:
         print(f"Publisher automation has a concrete GitHub setup blocker: {blocker}")
         return
-    if repair_mode() == "escalate":
-        failed_key = _publisher_escalation_key(evidence)
+    if mode == "escalate":
+        failed_jobs, failed_key = _publisher_escalation_key(evidence)
         report_repair_escalation(
             repo,
             scope="publisher",
@@ -5491,7 +5625,7 @@ def request_policy_repair(evidence):
             key=failed_key,
             title=f"Google OS Config maintenance needs manual intervention ({config[:12]})",
             summary=(
-                f"OS Config workflow failed in `{failed_key}` (such as an upstream patch "
+                f"OS Config workflow failed in `{failed_jobs}` (such as an upstream patch "
                 "conflict or publisher check failure)."
             ),
             evidence=evidence,
@@ -5521,6 +5655,7 @@ def final_retry_grant_failure(evidence):
 
 
 def request_policy_pr_fix(number, head_sha, evidence):
+    mode = repair_mode()
     repo = os.environ["GITHUB_REPOSITORY"]
     pull = api(f"repos/{repo}/pulls/{number}")
     config = (pull.get("base") or {}).get("sha", "")
@@ -5532,7 +5667,7 @@ def request_policy_pr_fix(number, head_sha, evidence):
     if blocker:
         print(f"Publisher automation has a concrete GitHub setup blocker: {blocker}")
         return
-    if repair_mode() == "escalate":
+    if mode == "escalate":
         report_repair_escalation(
             repo,
             scope="policy-proposal",
@@ -5568,9 +5703,13 @@ def report_permission_blocker(repo, config, evidence):
     if not category:
         return ""
     marker = f"<!-- osconfig-permission-blocker:v1 {config} {hashlib.sha256(category.encode()).hexdigest()[:12]} -->"
-    for issue in pages(f"repos/{repo}/issues?state=open"):
-        if marker in (issue.get("body") or ""):
-            return category
+    if _trusted_issue_marker_exists(repo, marker):
+        return category
+    safe_detail = (
+        sanitize_job_log(detail)
+        .replace("<!--", "&lt;!--")
+        .replace("```", "'''")[:2000]
+    )
     api(f"repos/{repo}/issues", method="POST", data={
         "title": "Google OS Config publisher needs GitHub setup",
         "assignees": [repo.split("/")[0]],
@@ -5578,7 +5717,7 @@ def report_permission_blocker(repo, config, evidence):
             f"Publisher automation hit a concrete setup blocker: {category}. No package was signed or published. "
             "The previous verified repository, if any, remains the delivery source. This notification requests "
             "only the specific GitHub setup described by the failure; it does not authorize a merge or deployment.\n\n"
-            f"Trusted configuration: `{config}`.\n\nFailure evidence:\n\n```text\n{detail[:2000]}\n```\n\n{marker}"),
+            f"Trusted configuration: `{config}`.\n\nFailure evidence:\n\n```text\n{safe_detail}\n```\n\n{marker}"),
     })
     return category
 

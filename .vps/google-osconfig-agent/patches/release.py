@@ -31,6 +31,7 @@ DEFAULT_BRANCH = "master"
 BOT = "chatgpt-codex-connector[bot]"
 APP = "chatgpt-codex-connector"
 REVIEW_MODES = {"bot", "owner", "none"}
+REPAIR_MODES = {"escalate", "bot"}
 OWNER_ACCEPTANCE_AUTHORIZATION_SHA256 = "3343e4d2dfc5a06b529fe32b352bfc0b798539c8454d02f60d9cae3ccd5cc7b0"
 SHA = re.compile(r"^[0-9a-f]{40}$")
 NATIVE_STATE = re.compile(r"<!-- codex-review-state:v1 (\{.*?\}) -->", re.S)
@@ -838,6 +839,13 @@ def review_mode():
     mode = os.environ.get("FORK_REVIEW_MODE", "bot").strip().lower()
     if mode not in REVIEW_MODES:
         raise ValueError("FORK_REVIEW_MODE must be bot, owner or none")
+    return mode
+
+
+def repair_mode():
+    mode = os.environ.get("FORK_REPAIR_MODE", "bot").strip().lower()
+    if mode not in REPAIR_MODES:
+        raise ValueError("FORK_REPAIR_MODE must be escalate or bot")
     return mode
 
 
@@ -1696,7 +1704,8 @@ def current_review_baseline(repo, saved_proof, *, signed_transition=None):
     return accepted_baseline_proof(repo, variable, baseline)
 
 
-def review_pair_status(repo, manifest, *, signed_transition=None):
+def review_pair_status(repo, manifest, *, signed_transition=None,
+                       allow_closed_validated=False):
     candidate = manifest.get("candidate")
     contexts = manifest.get("reviewContexts")
     accepted_baseline = current_review_baseline(
@@ -1709,7 +1718,10 @@ def review_pair_status(repo, manifest, *, signed_transition=None):
         raise ValueError("Candidate manifest identity differs from the shared ABI 1 identity")
     closed = any(api(f"repos/{repo}/pulls/{contexts[scope]['pr']}").get("state") == "closed"
                  for scope in ("full", "delta"))
-    allow_closed = closed and validated_policy_bundle(repo, candidate, contexts["full"]["pr"])
+    allow_closed = closed and (
+        bool(allow_closed_validated)
+        or validated_policy_bundle(repo, candidate, contexts["full"]["pr"])
+    )
     full = evaluate_native_review_scope(repo, contexts["full"], candidate, "full",
                                         allow_closed=allow_closed)
     delta = evaluate_native_review_scope(repo, contexts["delta"], candidate, "delta",
@@ -2752,15 +2764,16 @@ def trusted_final_retry_grant_actor(comment, owner):
 
 
 def native_final_history(repo, current_candidate, baseline, current_run_id,
-                         current_run_attempt):
+                         current_run_attempt, *, candidate_pr=None):
     """Gather complete native run-attempt, exact-job-endpoint, reservation and grant facts."""
     core = lifecycle_module()
     comments = pages(f"repos/{repo}/issues/comments")
     owner = repo.split("/", 1)[0]
     cutoff = parse_utc(baseline["published_at"])
     reservations = {}
-    candidate_pr_by_id = {core.candidate_identity(current_candidate):
-                          int(os.environ.get("CANDIDATE_PR", "0"))}
+    default_pr = (int(os.environ.get("CANDIDATE_PR", "0"))
+                  if candidate_pr is None else int(candidate_pr))
+    candidate_pr_by_id = {core.candidate_identity(current_candidate): default_pr}
     complete = True
 
     protocol_bodies = []
@@ -3102,7 +3115,8 @@ def validated_policy_for_decision(repo, candidate, full_pr_number, action):
 
 
 def closed_policy_bundle_reuse(repo, candidate, candidate_id, upstream,
-                               baseline_config, application_sha, review_source_sha):
+                               baseline_config, application_sha, review_source_sha, *,
+                               expected_config=None):
     """Find a closed policy-review pair only when its native receipt is exact."""
     base_branch = f"review-base/{upstream}"
     head_branch = f"review/{upstream}-{candidate_id}"
@@ -3164,6 +3178,10 @@ def closed_policy_bundle_reuse(repo, candidate, candidate_id, upstream,
                 head_sha=review_source_sha, head_branch=head_branch, allow_closed=True)
             or pull.get("state") != "closed"):
         raise ValueError("Closed policy review claimant differs from the exact candidate or context")
+    if expected_config is not None and (
+            not SHA.fullmatch(expected_config or "")
+            or record.get("proposalHead") != expected_config):
+        raise ValueError("Closed policy review claimant differs from the exact current configuration")
 
     delta_branch = delta_review_branch(record["deltaSha"])
     delta_base_branch = f"review-base/{baseline_config}"
@@ -3655,11 +3673,55 @@ def verify_reusable_commit(work, commit, expected_tree, expected_parent, label):
     return commit
 
 
-def published_product_inputs_match(repo, published, source_dir):
+def published_product_inputs_match(repo, published, source_dir, *, baseline_candidate=None):
     """Prove a policy-only migration leaves every signed build input identical."""
+    if not isinstance(published, dict):
+        return False
     candidate_sha = published.get("candidateSha")
     if not isinstance(candidate_sha, str) or not SHA.fullmatch(candidate_sha):
         return False
+    try:
+        current_recipe_sha = prepared_recipe_digest(source_dir)
+        source_lock = _strict_json_object(
+            (Path(source_dir) / "source.lock").read_text(encoding="utf-8"),
+            "Selected upstream source.lock")
+    except (OSError, UnicodeDecodeError, ValueError, TypeError):
+        return False
+    if (set(source_lock) != {"tag", "commit", "archiveSha256"}
+            or not re.fullmatch(r"\d{8}\.\d{2}", source_lock.get("tag", ""))
+            or not SHA.fullmatch(source_lock.get("commit", ""))
+            or not re.fullmatch(r"[0-9a-f]{64}", source_lock.get("archiveSha256", ""))):
+        return False
+    recorded_candidate = published.get("candidate")
+    candidate = recorded_candidate if isinstance(recorded_candidate, dict) else baseline_candidate
+    if isinstance(candidate, dict):
+        try:
+            candidate_id = frozen_candidate_identity(candidate)
+            if isinstance(baseline_candidate, dict):
+                frozen_candidate_identity(baseline_candidate)
+                if isinstance(recorded_candidate, dict) and recorded_candidate != baseline_candidate:
+                    return False
+            if (isinstance(recorded_candidate, dict)
+                    and published.get("candidateIdentity", candidate_id) != candidate_id):
+                return False
+        except ValueError:
+            return False
+        if (candidate.get("repository") != repo
+                or candidate.get("upstream_sha") != source_lock["commit"]):
+            return False
+        if ("upstreamCommit" in published
+                and published.get("upstreamCommit") != candidate["upstream_sha"]):
+            return False
+        if ("upstreamArchiveSha256" in published
+                and published.get("upstreamArchiveSha256") != source_lock["archiveSha256"]):
+            return False
+        if ("patchSha256" in published
+                and published.get("patchSha256") != digest(PATCH_DIR / "osconfig-inventory.patch")):
+            return False
+        if ("specSha256" in published
+                and published.get("specSha256") != digest(PATCH_DIR / "rpm/google-osconfig-agent.spec")):
+            return False
+        return candidate.get("recipe_sha256") == current_recipe_sha
     for relative in (*PRODUCT_BUILD_INPUTS, "source.lock"):
         path = PREFIX + relative
         try:
@@ -3951,7 +4013,61 @@ def advance_accepted_baseline(repo, candidate_manifest, signed_manifest, token):
     print(f"Advanced protected accepted baseline to published candidate {candidate_id}")
 
 
-def policy_inputs_match_published_config(repo, baseline_config, current_config):
+def _git_blob_bytes(repo, blob_sha):
+    if not isinstance(blob_sha, str) or not SHA.fullmatch(blob_sha):
+        raise ValueError("Invalid Git blob SHA")
+    response = api(f"repos/{repo}/git/blobs/{blob_sha}")
+    if (not isinstance(response, dict)
+            or response.get("encoding") != "base64"
+            or type(response.get("size")) is not int or response["size"] < 0
+            or response.get("sha") != blob_sha):
+        raise ValueError("GitHub did not return the requested regular Git blob")
+    try:
+        encoded = response["content"].encode("ascii")
+        decoded = base64.b64decode(b"".join(encoded.split()), validate=True)
+    except (KeyError, AttributeError, UnicodeEncodeError, ValueError, binascii.Error) as error:
+        raise ValueError("GitHub returned invalid base64 Git blob content") from error
+    actual_sha = hashlib.sha1(f"blob {len(decoded)}\0".encode("ascii") + decoded).hexdigest()
+    if len(decoded) != response["size"] or actual_sha != blob_sha:
+        raise ValueError("GitHub Git blob size or SHA-1 did not verify")
+    return decoded
+
+
+def _repository_conf_matches_adopted_evr(baseline_bytes, current_bytes, published_evr):
+    """Allow only the exact mechanical adoption minimum_evr update in repository.conf."""
+    if (not isinstance(baseline_bytes, bytes) or not isinstance(current_bytes, bytes)
+            or not isinstance(published_evr, str) or not published_evr):
+        return False
+    try:
+        osconfig_evr_key(published_evr)
+        baseline_text = baseline_bytes.decode("utf-8")
+        current_text = current_bytes.decode("utf-8")
+    except (UnicodeDecodeError, ValueError):
+        return False
+    if ("\r" in baseline_text or "\r" in current_text
+            or not baseline_text.endswith("\n") or not current_text.endswith("\n")):
+        return False
+    baseline_lines = baseline_text.splitlines()
+    current_lines = current_text.splitlines()
+    try:
+        baseline_settings = _parse_repository_settings(baseline_lines)
+        current_settings = _parse_repository_settings(current_lines)
+        osconfig_evr_key(current_settings["minimum_evr"])
+    except ValueError:
+        return False
+    if current_settings["minimum_evr"] not in {baseline_settings["minimum_evr"], published_evr}:
+        return False
+    minimum_lines = [index for index, line in enumerate(baseline_lines)
+                     if line.startswith("minimum_evr=")]
+    if len(minimum_lines) != 1:
+        return False
+    rewritten = list(baseline_lines)
+    rewritten[minimum_lines[0]] = f"minimum_evr={current_settings['minimum_evr']}"
+    return ("\n".join(rewritten) + "\n").encode("utf-8") == current_bytes
+
+
+def policy_inputs_match_published_config(repo, baseline_config, current_config, *,
+                                         published_evr=None):
     """Compare every downstream config/build/regression blob to the accepted source."""
     if not SHA.fullmatch(baseline_config) or not SHA.fullmatch(current_config):
         return False
@@ -3967,13 +4083,32 @@ def policy_inputs_match_published_config(repo, baseline_config, current_config):
                       for item in entries if isinstance(item, dict)
                       and item.get("type") == "blob"})
     previous, current = trees
-    configuration_paths = set(POLICY_FILES) | {"AGENTS.md", REPOSITORY_CONF}
+    configuration_paths = set(POLICY_FILES) | {"AGENTS.md"}
     product_paths = {PREFIX + relative for relative in PRODUCT_BUILD_INPUTS}
     configuration_paths.update(product_paths)
-    return all(previous.get(path) == current.get(path) for path in configuration_paths)
+    if not all(previous.get(path) == current.get(path) for path in configuration_paths):
+        return False
+    previous_conf = previous.get(REPOSITORY_CONF)
+    current_conf = current.get(REPOSITORY_CONF)
+    if previous_conf == current_conf:
+        return True
+    if (published_evr is None
+            or not isinstance(previous_conf, tuple) or not isinstance(current_conf, tuple)
+            or previous_conf[0] != "100644" or current_conf[0] != "100644"
+            or not SHA.fullmatch(previous_conf[1] or "")
+            or not SHA.fullmatch(current_conf[1] or "")):
+        return False
+    try:
+        baseline_conf_bytes = _git_blob_bytes(repo, previous_conf[1])
+        current_conf_bytes = _git_blob_bytes(repo, current_conf[1])
+    except (subprocess.CalledProcessError, ValueError):
+        return False
+    return _repository_conf_matches_adopted_evr(
+        baseline_conf_bytes, current_conf_bytes, published_evr)
 
 
-def candidate_config_inputs_match(repo, baseline_config, product_root, policy_root):
+def candidate_config_inputs_match(repo, baseline_config, product_root, policy_root, *,
+                                  published_evr=None):
     """Compare assembled package inputs and trusted policy files with accepted config."""
     result = api(f"repos/{repo}/git/trees/{baseline_config}?recursive=1")
     if not isinstance(result, dict) or result.get("truncated") is True:
@@ -3999,8 +4134,19 @@ def candidate_config_inputs_match(repo, baseline_config, product_root, policy_ro
             continue
         mode = "100755" if local.stat().st_mode & 0o111 else "100644"
         blob = run("git", "hash-object", str(local), cwd=product_root)
-        if expected != (mode, blob):
-            return False
+        if expected == (mode, blob):
+            continue
+        if (path == REPOSITORY_CONF and published_evr is not None
+                and mode == "100644" and isinstance(expected, tuple)
+                and expected[0] == "100644" and SHA.fullmatch(expected[1] or "")):
+            try:
+                baseline_conf_bytes = _git_blob_bytes(repo, expected[1])
+            except (subprocess.CalledProcessError, ValueError):
+                return False
+            if _repository_conf_matches_adopted_evr(
+                    baseline_conf_bytes, local.read_bytes(), published_evr):
+                continue
+        return False
     return True
 
 
@@ -4045,6 +4191,27 @@ def resolve_application_sha(application_sha, *, pull, repair_changed,
     return application_sha
 
 
+def _closed_native_policy_validated(repo, candidate, candidate_id, pull_number, baseline):
+    """Return True when a closed review pair has verified bundle or native policy proof."""
+    if validated_policy_bundle(repo, candidate, pull_number):
+        return True
+    history = native_final_history(
+        repo, candidate, baseline,
+        int(os.environ.get("GITHUB_RUN_ID", "0")),
+        int(os.environ.get("GITHUB_RUN_ATTEMPT", "1")),
+        candidate_pr=pull_number,
+    )
+    if history.get("complete") is not True:
+        return False
+    decision = lifecycle_module().authorize_final(candidate, history)
+    if (decision.get("candidate_id") != candidate_id
+            or decision.get("decision") != "policy-only"
+            or decision.get("policy_validation_allowed") is not True):
+        return False
+    state = policy_validation_state(history, candidate_id)
+    return bool(not state["active"] and not state["failed"] and state["validated"])
+
+
 def prepare(candidate):
     repo = os.environ["GITHUB_REPOSITORY"]
     config = os.environ["GITHUB_SHA"]
@@ -4082,7 +4249,7 @@ def prepare(candidate):
     branch_key = hashlib.sha256((config + "\0" + baseline_config).encode()).hexdigest()
     branch = f"review/{upstream}-{branch_key}"
     pull = find_review_pull(repo, base, branch, states=("open", "closed"))
-    if (not pull and published
+    if ((pull is None or pull.get("state") == "closed") and published
             and tracked_lock.get("commit") == upstream
             and tracked_lock.get("archiveSha256") == lock["archiveSha256"]
             and published.get("upstreamCommit") == upstream
@@ -4090,8 +4257,11 @@ def prepare(candidate):
             and published.get("patchSha256") == patch_sha
             and published.get("specSha256") == spec_sha
             and published.get("packageEvr") == settings["minimum_evr"]
-            and published_product_inputs_match(repo, published, source_dir)
-            and policy_inputs_match_published_config(repo, baseline_config, config)):
+            and published_product_inputs_match(
+                repo, published, source_dir, baseline_candidate=baseline["candidate"])
+            and policy_inputs_match_published_config(
+                repo, baseline_config, config,
+                published_evr=published.get("packageEvr"))):
         output(candidate_exists=False, published=True, upstream_commit=upstream,
                upstream_tag=lock["tag"], patch_sha=patch_sha,
                review_ready=True, review_reason="The exact signed candidate is already adopted")
@@ -4189,7 +4359,9 @@ def prepare(candidate):
     recipe_sha = recipe_digest(repo_work / PREFIX)
     if not SHA.fullmatch(baseline_config):
         raise ValueError("The signed production manifest has no exact prior configuration SHA")
-    if candidate_config_inputs_match(repo, baseline_config, repo_work, ROOT):
+    if candidate_config_inputs_match(
+            repo, baseline_config, repo_work, ROOT,
+            published_evr=published.get("packageEvr")):
         candidate_configuration_sha = baseline_config
         delta_sha = application_sha
         delta_base = baseline["candidate"]["application_sha"]
@@ -4239,15 +4411,25 @@ def prepare(candidate):
     if pull is None:
         recovered = closed_policy_bundle_reuse(
             repo, candidate_value, candidate_id, upstream, baseline_config,
-            application_sha, review_source_sha)
+            application_sha, review_source_sha, expected_config=config)
         if recovered is not None:
             pull, recovered_delta_pull, branch = recovered
             bundle_reuse = True
         else:
             bundle_reuse = False
     else:
-        bundle_reuse = bool(pull.get("state") == "closed"
-                            and validated_policy_bundle(repo, candidate_value, pull["number"]))
+        bundle_reuse = bool(
+            not repair_changed
+            and isinstance(existing_state, dict)
+            and existing_state.get("sourceConfig") == config
+            and existing_state.get("baselineConfig") == baseline_config
+            and existing_state.get("candidate") == candidate_value
+            and existing_state.get("candidateId") == candidate_id
+            and existing_state.get("deltaSha") == delta_sha
+            and pull.get("state") == "closed"
+            and _closed_native_policy_validated(
+                repo, candidate_value, candidate_id, pull["number"], baseline)
+        )
     if bundle_reuse:
         if not review_pull_identity(
                 repo, pull, base_sha=upstream, base_branch=base,
@@ -4257,6 +4439,9 @@ def prepare(candidate):
             recovered_delta_pull = find_review_pull(
                 repo, delta_base_branch, delta_branch, states=("open", "closed"))
             if (recovered_delta_pull is None
+                    or recovered_delta_pull.get("state") != "closed"
+                    or (isinstance(existing_state, dict)
+                        and recovered_delta_pull.get("number") != existing_state.get("deltaPr"))
                     or not review_pull_identity(
                         repo, recovered_delta_pull, base_sha=delta_base,
                         base_branch=delta_base_branch, head_sha=delta_sha,
@@ -4370,10 +4555,30 @@ def prepare(candidate):
                    sort_keys=True, indent=2) + "\n", encoding="utf-8")
     if not bundle_reuse:
         request_manifest_reviews(repo, manifest, {"full": pull, "delta": delta_pull}, codex_token)
-    full, delta, pair = review_pair_status(repo, manifest)
+    full, delta, pair = review_pair_status(
+        repo, manifest, allow_closed_validated=bundle_reuse)
     if bundle_reuse:
         if pair.get("state") != "ready" or pair.get("complete") is not True:
             raise ValueError("Closed policy review bundle no longer has a ready exact native review pair")
+        if (tracked_lock.get("commit") == upstream
+                and tracked_lock.get("archiveSha256") == lock["archiveSha256"]
+                and published.get("upstreamCommit") == upstream
+                and published.get("upstreamArchiveSha256") == lock["archiveSha256"]
+                and published.get("patchSha256") == patch_sha
+                and published.get("specSha256") == spec_sha
+                and published.get("packageEvr") == settings["minimum_evr"]
+                and candidate_value.get("application_sha")
+                    == baseline["candidate"].get("application_sha")
+                and published_product_inputs_match(
+                    repo, published, source_dir,
+                    baseline_candidate=baseline["candidate"])):
+            output(candidate_exists=False, published=True, upstream_commit=upstream,
+                   upstream_tag=lock["tag"], patch_sha=manifest["patchSha256"],
+                   review_ready=True,
+                   review_reason="The exact policy-only candidate is already reviewed and validated")
+            print("The exact policy-only candidate is already reviewed and validated; "
+                  "no repeat review or policy test run is needed")
+            return
     else:
         full, delta, pair = complete_machine_finding_dispositions(
             repo, manifest, full, delta, pair, codex_token)
@@ -4564,6 +4769,21 @@ def request_fix(candidate_dir, evidence):
     if (not pull_identity(repo, pull, manifest["upstreamCommit"], manifest["candidateBranch"])
             or pull["head"]["sha"] != manifest["candidateSha"]):
         print("Candidate head advanced; this run will not request a fix against the old SHA")
+        return
+    if repair_mode() == "escalate":
+        report_repair_escalation(
+            repo,
+            scope="application",
+            config=manifest["configSha"],
+            key=candidate_id,
+            title=f"Google OS Config candidate needs manual repair ({manifest['upstreamCommit'][:12]})",
+            summary=(
+                f"OS Config candidate `{candidate_id}` for upstream `{manifest['upstreamCommit']}` "
+                f"(review PR #{pull['number']} at `{manifest['candidateSha']}`) reported review "
+                "findings or an application build failure."
+            ),
+            evidence=evidence,
+        )
         return
     comments = pages(f"repos/{repo}/issues/{pull['number']}/comments")
     cycle = f"{manifest['upstreamCommit']}:{manifest['configSha']}"
@@ -5212,6 +5432,41 @@ def request_policy_task(repo, state, evidence, token):
     print(f"Requested publisher-policy repair on PR #{state['number']}")
 
 
+def _publisher_escalation_key(evidence):
+    sections = re.findall(r"(?ms)^Failed job: ([^\n]+)\n(.*?)(?=^Failed job: |\Z)",
+                          evidence or "")
+    jobs = sorted({header.split(" (", 1)[0].strip()
+                   for header, _ in sections if header.split(" (", 1)[0].strip()})
+    return ",".join(jobs) if jobs else "publisher"
+
+
+def report_repair_escalation(repo, *, scope, config, key, title, summary, evidence):
+    if (not SHA.fullmatch(config or "")
+            or scope not in {"application", "publisher", "policy-proposal"}
+            or not isinstance(key, str) or not key):
+        raise ValueError("Repair escalation requires exact scope, configuration, and failure key")
+    key_hash = hashlib.sha256(f"{scope}\0{key}".encode("utf-8")).hexdigest()[:16]
+    marker = f"<!-- osconfig-repair-escalation:v1 {scope} {config} {key_hash} -->"
+    for issue in pages(f"repos/{repo}/issues?state=open"):
+        if not issue.get("pull_request") and marker in (issue.get("body") or ""):
+            print(f"Repair escalation issue is already open for {scope} ({key_hash})")
+            return marker
+    detail = sanitize_job_log(evidence or "")[-4000:].replace("```", "'''")
+    api(f"repos/{repo}/issues", method="POST", data={
+        "title": title,
+        "assignees": [repo.split("/")[0]],
+        "body": (
+            f"{summary} No package was signed or published from this failed attempt; the "
+            "previous verified repository remains the delivery source. Resolve the source or "
+            "workflow issue manually; automated coding repair is disabled (`FORK_REPAIR_MODE=escalate`).\n\n"
+            f"Trusted configuration: `{config}`.\n\n"
+            f"Failure evidence:\n\n```text\n{detail}\n```\n\n{marker}"
+        ),
+    })
+    print(f"Opened deduplicated {scope} escalation issue for {config[:12]}")
+    return marker
+
+
 def request_policy_repair(evidence):
     repo = os.environ["GITHUB_REPOSITORY"]
     config = os.environ.get("POLICY_CONFIG_SHA") or os.environ.get("GITHUB_SHA", "")
@@ -5226,6 +5481,21 @@ def request_policy_repair(evidence):
     blocker = report_permission_blocker(repo, config, evidence)
     if blocker:
         print(f"Publisher automation has a concrete GitHub setup blocker: {blocker}")
+        return
+    if repair_mode() == "escalate":
+        failed_key = _publisher_escalation_key(evidence)
+        report_repair_escalation(
+            repo,
+            scope="publisher",
+            config=config,
+            key=failed_key,
+            title=f"Google OS Config maintenance needs manual intervention ({config[:12]})",
+            summary=(
+                f"OS Config workflow failed in `{failed_key}` (such as an upstream patch "
+                "conflict or publisher check failure)."
+            ),
+            evidence=evidence,
+        )
         return
     token = owner_token(repo)
     state = open_policy_pull(repo, config) or create_policy_pull(repo, config)
@@ -5261,6 +5531,20 @@ def request_policy_pr_fix(number, head_sha, evidence):
     blocker = report_permission_blocker(repo, config, evidence)
     if blocker:
         print(f"Publisher automation has a concrete GitHub setup blocker: {blocker}")
+        return
+    if repair_mode() == "escalate":
+        report_repair_escalation(
+            repo,
+            scope="policy-proposal",
+            config=config,
+            key=f"{number}:{head_sha}",
+            title=f"Google OS Config policy proposal #{number} needs manual repair",
+            summary=(
+                f"Publisher-policy proposal PR #{number} at `{head_sha}` failed validation "
+                "or reported review findings."
+            ),
+            evidence=evidence,
+        )
         return
     request_policy_task(repo, state, evidence, owner_token(repo))
 

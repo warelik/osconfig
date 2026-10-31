@@ -35,9 +35,14 @@ The private signing key is not part of this repository. This bootstrap commit
 contains no RPM or repository metadata. CI, signature verification, publication,
 and server delivery are distinct stages and need their own successful evidence.
 
-The workflow uses public candidate branches and keeps build/review/publisher
-policy repairs machine-maintained. It publishes only the package repository
-artifacts, not server configuration, VM inventory, or credentials.
+The workflow uses public candidate branches, advances conflict-free updates
+automatically, and selects `FORK_REPAIR_MODE` (`escalate` by default in native
+workflows, `bot` when explicitly enabled or invoked directly via CLI). Under
+`escalate`, patch conflicts, review findings, application build failures, and
+publisher/proposal failures immediately open one deduplicated native GitHub
+issue instead of opening a repair PR or waiting on a coding bot. It publishes
+only the package repository artifacts, not server configuration, VM inventory,
+or credentials.
 
 Supported server delivery uses the existing installer/updater and its explicit
 `on`/`off` service state. After a verified package replacement, that recipe enables
@@ -188,3 +193,5 @@ Trusted coding-task disposition examples are masked before receipt parsing and e
 Signing and verified-artifact recovery install gh before native reservation verification. Policy-only adoption dispatches the next trusted maintenance cycle after exact selective adoption and cleanup; this does not rebuild the unchanged signed baseline. Modern embedded signed candidates initialize and fetch their policy workspace explicitly.
 
 Fedora jobs install Python, Git and OpenSSH immediately after the frozen native-attempt shell guard and before either checkout or the first Python command. The signer validator and workflow regression enforce that order for build, signing and recovery.
+
+Candidate preparation verifies unchanged product inputs against the signed ABI `recipe_sha256` digest without per-blob Contents API lookups, normalizes only the mechanical `repository.conf` `minimum_evr` adoption rewrite against the signed baseline EVR, allows historical closed review PRs on the unchanged baseline exit, and short-circuits already-reviewed and natively policy-validated closed policy-only pairs pinned to the exact `master` configuration so post-adoption and scheduled runs do not regenerate review pairs or repeat the policy suite.

@@ -1,0 +1,579 @@
+diff --git a/agentendpoint/agentendpoint_test.go b/agentendpoint/agentendpoint_test.go
+index a5aa99c..1d064bd 100644
+--- a/agentendpoint/agentendpoint_test.go
++++ b/agentendpoint/agentendpoint_test.go
+@@ -34,7 +34,9 @@ import (
+ 
+ 	agentendpoint "cloud.google.com/go/osconfig/agentendpoint/apiv1"
+ 	"github.com/GoogleCloudPlatform/guest-logging-go/logger"
++	"github.com/GoogleCloudPlatform/osconfig/packages"
+ 	utilmocks "github.com/GoogleCloudPlatform/osconfig/util/mocks"
++	"github.com/golang/mock/gomock"
+ 	"golang.org/x/oauth2/jws"
+ 	"google.golang.org/api/option"
+ 	"google.golang.org/grpc"
+@@ -196,7 +198,18 @@ func (s *agentEndpointServiceTestServer) StartNextTask(ctx context.Context, req
+ 	case !s.execTaskComplete:
+ 		return &agentendpointpb.StartNextTaskResponse{Task: &agentendpointpb.Task{TaskType: agentendpointpb.TaskType_EXEC_STEP_TASK, TaskId: "TaskType_EXEC_STEP_TASK"}}, nil
+ 	case !s.patchTaskComplete:
+-		return &agentendpointpb.StartNextTaskResponse{Task: &agentendpointpb.Task{TaskType: agentendpointpb.TaskType_APPLY_PATCHES, TaskId: "TaskType_APPLY_PATCHES"}}, nil
++		return &agentendpointpb.StartNextTaskResponse{Task: &agentendpointpb.Task{
++			TaskType: agentendpointpb.TaskType_APPLY_PATCHES,
++			TaskId:   "TaskType_APPLY_PATCHES",
++			TaskDetails: &agentendpointpb.Task_ApplyPatchesTask{
++				ApplyPatchesTask: &agentendpointpb.ApplyPatchesTask{
++					DryRun: true,
++					PatchConfig: &agentendpointpb.PatchConfig{
++						RebootConfig: agentendpointpb.PatchConfig_NEVER,
++					},
++				},
++			},
++		}}, nil
+ 	case !s.applyConfigTaskComplete:
+ 		return &agentendpointpb.StartNextTaskResponse{Task: &agentendpointpb.Task{TaskType: agentendpointpb.TaskType_APPLY_CONFIG_TASK, TaskId: "TaskType_APPLY_CONFIG_TASK"}}, nil
+ 	default:
+@@ -250,6 +263,23 @@ func (*agentEndpointServiceTestServer) ReportInventory(ctx context.Context, req
+ }
+ 
+ func TestWaitForTask(t *testing.T) {
++	previousRunner := packages.GetCommandRunner()
++	previousPtyRunner := packages.GetPtyCommandRunner()
++	previousAptExists := packages.AptExists
++	mockController := gomock.NewController(t)
++	runner := utilmocks.NewMockCommandRunner(mockController)
++	ptyRunner := utilmocks.NewMockCommandRunner(mockController)
++	// Use the existing Debian-detection test seam to avoid host RPM probe commands.
++	runner.EXPECT().Run(gomock.Any(), gomock.Any()).Return(nil, nil, nil).AnyTimes()
++	ptyRunner.EXPECT().Run(gomock.Any(), gomock.Any()).Return(nil, nil, nil).AnyTimes()
++	packages.SetCommandRunner(runner)
++	packages.SetPtyCommandRunner(ptyRunner)
++	packages.AptExists = true
++	t.Cleanup(func() {
++		packages.SetCommandRunner(previousRunner)
++		packages.SetPtyCommandRunner(previousPtyRunner)
++		packages.AptExists = previousAptExists
++	})
+ 	ctx := context.Background()
+ 	srv := newAgentEndpointServiceTestServer()
+ 	tc, err := newTestClient(ctx, srv)
+diff --git a/agentendpoint/inventory.go b/agentendpoint/inventory.go
+index f197236..361c4e6 100644
+--- a/agentendpoint/inventory.go
++++ b/agentendpoint/inventory.go
+@@ -75,15 +75,25 @@ func (c *Client) report(ctx context.Context, state *inventory.InstanceInventory)
+ 	clog.Debugf(ctx, "Reporting instance inventory to agent endpoint.")
+ 	inventory := formatInventory(ctx, state)
+ 	vmInventory := formatVMInventory(ctx, state)
++	// The legacy format intentionally ignores Pip and Gem packages, so a
++	// package-count comparison would reject otherwise complete legacy
++	// reports. Legacy is complete when it omits no Snap inventory, the one
++	// category it cannot represent at all.
++	legacyComplete := !hasSnapInventory(vmInventory)
++	useLegacyAPI := legacyComplete && hasYumInventory(inventory)
+ 
+ 	reportFull := false
+ 	var reportInventoryRes *agentendpointpb.ReportInventoryResponse
+ 	var reportVMInventoryRes *agentendpointpb.ReportVmInventoryResponse
+ 	var err error
+ 	f := func() error {
+-		reportVMInventoryRes, err = c.reportVMInventory(ctx, vmInventory, reportFull)
+-		if shouldFallbackToLegacyAPI(err) {
++		if useLegacyAPI {
+ 			reportInventoryRes, err = c.reportInventory(ctx, inventory, reportFull)
++		} else {
++			reportVMInventoryRes, err = c.reportVMInventory(ctx, vmInventory, reportFull)
++			if legacyComplete && shouldFallbackToLegacyAPI(err) {
++				reportInventoryRes, err = c.reportInventory(ctx, inventory, reportFull)
++			}
+ 		}
+ 
+ 		if err != nil {
+@@ -106,6 +116,36 @@ func (c *Client) report(ctx context.Context, state *inventory.InstanceInventory)
+ 	}
+ }
+ 
++// hasSnapInventory reports whether the VM inventory contains Snap
++// packages, which the legacy inventory format cannot represent.
++func hasSnapInventory(vm *agentendpointpb.VmInventory) bool {
++	for _, items := range [][]*agentendpointpb.VmInventory_InventoryItem{
++		vm.GetInstalledPackages(), vm.GetAvailablePackages(),
++	} {
++		for _, item := range items {
++			if item.GetType() == "snap" {
++				return true
++			}
++		}
++	}
++	return false
++}
++
++// hasYumInventory identifies native RPM inventory whose explicit package
++// architectures are preserved by the legacy API.
++func hasYumInventory(legacy *agentendpointpb.Inventory) bool {
++	for _, pkgs := range [][]*agentendpointpb.Inventory_SoftwarePackage{
++		legacy.GetInstalledPackages(), legacy.GetAvailablePackages(),
++	} {
++		for _, pkg := range pkgs {
++			if pkg.GetYumPackage() != nil {
++				return true
++			}
++		}
++	}
++	return false
++}
++
+ func shouldFallbackToLegacyAPI(err error) bool {
+ 	if st, ok := status.FromError(err); ok == true {
+ 		return st.Code() == codes.FailedPrecondition
+@@ -633,10 +673,14 @@ func formatGooGetPackage(pkg *packages.PkgInfo) *agentendpointpb.Inventory_Softw
+ }
+ 
+ func formatYumPackage(pkg *packages.PkgInfo) *agentendpointpb.Inventory_SoftwarePackage_YumPackage {
++	architecture := pkg.Arch
++	if architecture == "all" {
++		architecture = "noarch"
++	}
+ 	fPkg := &agentendpointpb.Inventory_SoftwarePackage_YumPackage{
+ 		YumPackage: &agentendpointpb.Inventory_VersionedPackage{
+ 			PackageName:  pkg.Name,
+-			Architecture: pkg.Arch,
++			Architecture: architecture,
+ 			Version:      pkg.Version,
+ 		},
+ 	}
+diff --git a/agentendpoint/inventory_test.go b/agentendpoint/inventory_test.go
+index 66ddb67..eda1e78 100644
+--- a/agentendpoint/inventory_test.go
++++ b/agentendpoint/inventory_test.go
+@@ -26,10 +26,13 @@ import (
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"reflect"
++	"runtime"
++	"strings"
+ 	"testing"
+ 	"time"
+ 
+ 	"github.com/GoogleCloudPlatform/osconfig/inventory"
++	"github.com/GoogleCloudPlatform/osconfig/osinfo"
+ 	"github.com/GoogleCloudPlatform/osconfig/packages"
+ 	utilmocks "github.com/GoogleCloudPlatform/osconfig/util/mocks"
+ 	"github.com/GoogleCloudPlatform/osconfig/util/utiltest"
+@@ -38,6 +41,7 @@ import (
+ 	"github.com/googleapis/gax-go/v2"
+ 	"google.golang.org/grpc/codes"
+ 	"google.golang.org/grpc/status"
++	"google.golang.org/protobuf/proto"
+ 	"google.golang.org/protobuf/testing/protocmp"
+ 	"google.golang.org/protobuf/types/known/structpb"
+ 	"google.golang.org/protobuf/types/known/timestamppb"
+@@ -619,6 +623,9 @@ func TestReport(t *testing.T) {
+ 				t.Fatal(err)
+ 			}
+ 
++			// Legacy inventory has no Snap representation; use a complete legacy fixture.
++			tt.inventoryState.InstalledPackages.Snap = nil
++			tt.inventoryState.PackageUpdates.Snap = nil
+ 			tc.client.report(ctx, tt.inventoryState)
+ 
+ 			if diff := cmp.Diff(tt.wantInventory, actualInventory, protocmp.Transform()); diff != "" {
+@@ -628,6 +635,98 @@ func TestReport(t *testing.T) {
+ 	}
+ }
+ 
++type modernInventoryOSInfoProvider struct{}
++
++func (modernInventoryOSInfoProvider) GetOSInfo(context.Context) (osinfo.OSInfo, error) {
++	return osinfo.OSInfo{ShortName: "fedora", Version: "44"}, nil
++}
++
++func TestModernRPMInventoryPreservesNoarchPurl(t *testing.T) {
++	if runtime.GOOS != "linux" {
++		t.Skip("RPM package inventory is Linux-specific")
++	}
++
++	previousRunner := packages.GetCommandRunner()
++	previousRPMQueryExists := packages.RPMQueryExists
++	previousZypperExists := packages.ZypperExists
++	previousDpkgQueryExists := packages.DpkgQueryExists
++	previousCOSPkgInfoExists := packages.COSPkgInfoExists
++	previousGemExists := packages.GemExists
++	previousPipExists := packages.PipExists
++	t.Cleanup(func() {
++		packages.SetCommandRunner(previousRunner)
++		packages.RPMQueryExists = previousRPMQueryExists
++		packages.ZypperExists = previousZypperExists
++		packages.DpkgQueryExists = previousDpkgQueryExists
++		packages.COSPkgInfoExists = previousCOSPkgInfoExists
++		packages.GemExists = previousGemExists
++		packages.PipExists = previousPipExists
++	})
++	packages.RPMQueryExists = true
++	packages.ZypperExists = false
++	packages.DpkgQueryExists = false
++	packages.COSPkgInfoExists = false
++	packages.GemExists = false
++	packages.PipExists = false
++
++	runner := utilmocks.NewMockCommandRunner(gomock.NewController(t))
++	runner.EXPECT().Run(gomock.Any(), gomock.Any()).Return([]byte(
++		`{"architecture":"noarch","package":"golang-src","source_name":"golang-1.22.3-1.fc44.src.rpm","version":"0:1.22.3-1.fc44"}`+"\n"+
++			`{"architecture":"x86_64","package":"kernel-tools","source_name":"kernel-6.11.0-1.fc44.src.rpm","version":"0:6.11.0-1.fc44"}`+"\n"), nil, nil).Times(1)
++	packages.SetCommandRunner(runner)
++
++	ctx := context.Background()
++	installed, err := packages.NewInstalledPackagesProvider(modernInventoryOSInfoProvider{}).GetInstalledPackages(ctx)
++	if err != nil {
++		t.Fatalf("GetInstalledPackages() error = %v", err)
++	}
++	if len(installed.Rpm) != 2 {
++		t.Fatalf("GetInstalledPackages() returned %d RPMs, want 2", len(installed.Rpm))
++	}
++	internalArchitecture := make(map[string]string, len(installed.Rpm))
++	for _, pkg := range installed.Rpm {
++		internalArchitecture[pkg.Name] = pkg.Arch
++	}
++	if internalArchitecture["golang-src"] != "all" {
++		t.Errorf("normalized noarch RPM Arch = %q, want internal value all", internalArchitecture["golang-src"])
++	}
++	if internalArchitecture["kernel-tools"] != "x86_64" {
++		t.Errorf("x86_64 RPM Arch = %q, want x86_64", internalArchitecture["kernel-tools"])
++	}
++
++	vmInventory := formatVMInventory(ctx, &inventory.InstanceInventory{
++		ShortName:         "fedora",
++		Version:           "44",
++		InstalledPackages: &installed,
++	})
++	wire, err := proto.Marshal(vmInventory)
++	if err != nil {
++		t.Fatalf("proto.Marshal(VmInventory) error = %v", err)
++	}
++	serialized := &agentendpointpb.VmInventory{}
++	if err := proto.Unmarshal(wire, serialized); err != nil {
++		t.Fatalf("proto.Unmarshal(VmInventory) error = %v", err)
++	}
++
++	wantArchitecture := map[string]string{
++		"golang-src":   "noarch",
++		"kernel-tools": "x86_64",
++	}
++	for _, item := range serialized.GetInstalledPackages() {
++		want, ok := wantArchitecture[item.GetName()]
++		if !ok {
++			continue
++		}
++		if !strings.Contains(item.GetPurl(), "?arch="+want+"&distro=44") {
++			t.Errorf("modern inventory PURL for %s = %q, want arch=%s", item.GetName(), item.GetPurl(), want)
++		}
++		delete(wantArchitecture, item.GetName())
++	}
++	if len(wantArchitecture) != 0 {
++		t.Errorf("modern inventory omitted RPMs: %v", wantArchitecture)
++	}
++}
++
+ func TestReportVmInventory(t *testing.T) {
+ 	ctx := context.Background()
+ 	ctrl := gomock.NewController(t)
+@@ -680,6 +779,184 @@ func TestReportVmInventory(t *testing.T) {
+ 
+ }
+ 
++func TestReportUsesLegacyAPIForRepresentableNativeRPMInventory(t *testing.T) {
++	ctx := context.Background()
++	ctrl := gomock.NewController(t)
++	defer ctrl.Finish()
++
++	previousZypperExists := packages.ZypperExists
++	packages.ZypperExists = false
++	t.Cleanup(func() { packages.ZypperExists = previousZypperExists })
++
++	state := &inventory.InstanceInventory{
++		ShortName: "fedora",
++		Version:   "44",
++		InstalledPackages: &packages.Packages{Rpm: []*packages.PkgInfo{
++			{Name: "golang-src", Arch: "all", Version: "1.22.3-1.fc44", Type: "rpm"},
++			{Name: "kernel-tools", Arch: "x86_64", Version: "6.11.0-1.fc44", Type: "rpm"},
++			{Name: "kernel-tools-libs", Arch: "aarch64", Version: "6.11.0-1.fc44", Type: "rpm"},
++		}},
++		PackageUpdates: &packages.Packages{Yum: []*packages.PkgInfo{{Name: "noarch-update", Arch: "all", Version: "1-1.fc44", Type: "rpm"}}},
++	}
++
++	var requests []*agentendpointpb.ReportInventoryRequest
++	mockClient := utilmocks.NewMockAgentEndpointClient(ctrl)
++	mockClient.EXPECT().ReportVmInventory(gomock.Any(), gomock.Any()).Times(0)
++	mockClient.EXPECT().ReportInventory(gomock.Any(), gomock.Any()).Times(2).DoAndReturn(
++		func(_ context.Context, req *agentendpointpb.ReportInventoryRequest, _ ...gax.CallOption) (*agentendpointpb.ReportInventoryResponse, error) {
++			requests = append(requests, req)
++			if len(requests) == 1 {
++				return &agentendpointpb.ReportInventoryResponse{ReportFullInventory: true}, nil
++			}
++			return &agentendpointpb.ReportInventoryResponse{}, nil
++		})
++
++	tc, err := newMockTestClient(ctx, mockClient)
++	if err != nil {
++		t.Fatal(err)
++	}
++	tc.client.report(ctx, state)
++
++	if len(requests) != 2 {
++		t.Fatalf("ReportInventory called %d times, want checksum and full-inventory requests", len(requests))
++	}
++	if requests[0].GetInventoryChecksum() == "" || requests[0].GetInventory() != nil {
++		t.Fatalf("first legacy request = %v, want checksum only", requests[0])
++	}
++	if requests[1].GetInventory() == nil {
++		t.Fatal("second legacy request has no full inventory")
++	}
++
++	wantArchitecture := map[string]string{
++		"golang-src":        "noarch",
++		"kernel-tools":      "x86_64",
++		"kernel-tools-libs": "aarch64",
++		"noarch-update":     "noarch",
++	}
++	for _, list := range [][]*agentendpointpb.Inventory_SoftwarePackage{
++		requests[1].GetInventory().GetInstalledPackages(),
++		requests[1].GetInventory().GetAvailablePackages(),
++	} {
++		for _, item := range list {
++			pkg := item.GetYumPackage()
++			if pkg == nil {
++				continue
++			}
++			want, ok := wantArchitecture[pkg.GetPackageName()]
++			if !ok {
++				continue
++			}
++			if pkg.GetArchitecture() != want {
++				t.Errorf("legacy inventory architecture for %s = %q, want %q", pkg.GetPackageName(), pkg.GetArchitecture(), want)
++			}
++			delete(wantArchitecture, pkg.GetPackageName())
++		}
++	}
++	if len(wantArchitecture) != 0 {
++		t.Errorf("legacy inventory omitted RPMs: %v", wantArchitecture)
++	}
++}
++
++func TestReportKeepsModernAPIWhenLegacyWouldOmitSnap(t *testing.T) {
++	ctx := context.Background()
++	ctrl := gomock.NewController(t)
++	defer ctrl.Finish()
++
++	previousZypperExists := packages.ZypperExists
++	packages.ZypperExists = false
++	t.Cleanup(func() { packages.ZypperExists = previousZypperExists })
++
++	state := &inventory.InstanceInventory{
++		ShortName: "fedora",
++		Version:   "44",
++		InstalledPackages: &packages.Packages{
++			Rpm:  []*packages.PkgInfo{{Name: "golang-src", Arch: "all", Version: "1.22.3-1.fc44", Type: "rpm"}},
++			Snap: []*packages.PkgInfo{{Name: "snap-app", Arch: "x86_64", Version: "1", Type: "snap"}},
++		},
++	}
++
++	var request *agentendpointpb.ReportVmInventoryRequest
++	mockClient := utilmocks.NewMockAgentEndpointClient(ctrl)
++	mockClient.EXPECT().ReportVmInventory(gomock.Any(), gomock.Any()).Times(1).Do(
++		func(_ context.Context, req *agentendpointpb.ReportVmInventoryRequest, _ ...gax.CallOption) {
++			request = req
++		},
++	).Return(&agentendpointpb.ReportVmInventoryResponse{}, nil)
++	mockClient.EXPECT().ReportInventory(gomock.Any(), gomock.Any()).Times(0)
++
++	tc, err := newMockTestClient(ctx, mockClient)
++	if err != nil {
++		t.Fatal(err)
++	}
++	tc.client.report(ctx, state)
++
++	if request == nil || request.GetInventoryChecksum() == "" {
++		t.Fatal("modern API was not given its checksum request")
++	}
++}
++
++func TestReportFallsBackToLegacyWhenModernAPIIsUnsupported(t *testing.T) {
++	ctx := context.Background()
++	ctrl := gomock.NewController(t)
++	defer ctrl.Finish()
++
++	previousZypperExists := packages.ZypperExists
++	packages.ZypperExists = false
++	t.Cleanup(func() { packages.ZypperExists = previousZypperExists })
++
++	state := &inventory.InstanceInventory{
++		ShortName: "fedora",
++		Version:   "44",
++		InstalledPackages: &packages.Packages{
++			Deb: []*packages.PkgInfo{{Name: "test-deb", Arch: "x86_64", Version: "1-1", Type: "deb"}},
++		},
++	}
++
++	var legacyRequest *agentendpointpb.ReportInventoryRequest
++	mockClient := utilmocks.NewMockAgentEndpointClient(ctrl)
++	mockClient.EXPECT().ReportVmInventory(gomock.Any(), gomock.Any()).Times(1).Return(
++		nil, status.Error(codes.FailedPrecondition, "legacy API required"))
++	mockClient.EXPECT().ReportInventory(gomock.Any(), gomock.Any()).Times(1).Do(
++		func(_ context.Context, req *agentendpointpb.ReportInventoryRequest, _ ...gax.CallOption) {
++			legacyRequest = req
++		},
++	).Return(&agentendpointpb.ReportInventoryResponse{}, nil)
++
++	tc, err := newMockTestClient(ctx, mockClient)
++	if err != nil {
++		t.Fatal(err)
++	}
++	tc.client.report(ctx, state)
++
++	if legacyRequest == nil || legacyRequest.GetInventoryChecksum() == "" || legacyRequest.GetInventory() != nil {
++		t.Fatalf("legacy fallback request = %v, want checksum only", legacyRequest)
++	}
++}
++
++func TestReportRejectsLegacyFallbackWhenItWouldOmitSnap(t *testing.T) {
++	ctx := context.Background()
++	ctrl := gomock.NewController(t)
++	defer ctrl.Finish()
++
++	state := &inventory.InstanceInventory{
++		ShortName: "fedora",
++		Version:   "44",
++		InstalledPackages: &packages.Packages{
++			Rpm:  []*packages.PkgInfo{{Name: "golang-src", Arch: "all", Version: "1-1.fc44", Type: "rpm"}},
++			Snap: []*packages.PkgInfo{{Name: "snap-app", Arch: "x86_64", Version: "1", Type: "snap"}},
++		},
++	}
++	mockClient := utilmocks.NewMockAgentEndpointClient(ctrl)
++	mockClient.EXPECT().ReportVmInventory(gomock.Any(), gomock.Any()).Times(1).Return(
++		nil, status.Error(codes.FailedPrecondition, "legacy API required"))
++	mockClient.EXPECT().ReportInventory(gomock.Any(), gomock.Any()).Times(0)
++	tc, err := newMockTestClient(ctx, mockClient)
++	if err != nil {
++		t.Fatal(err)
++	}
++	tc.client.report(ctx, state)
++}
++
+ func Test_computeFingerprint_gotExpectedFingerprintFormat(t *testing.T) {
+ 	ctx := context.Background()
+ 	fingerprint, err := computeFingerprint(ctx, generateInventory())
+@@ -991,3 +1268,10 @@ func Test_pkgInfoToInventoryItem_propagatesLocation(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestFormatYumPackagePreservesNoarch(t *testing.T) {
++	got := formatYumPackage(&packages.PkgInfo{Name: "golang-src", Arch: "all", Type: "rpm"})
++	if got.YumPackage.GetArchitecture() != "noarch" {
++		t.Errorf("formatYumPackage() architecture = %q, want noarch", got.YumPackage.GetArchitecture())
++	}
++}
+diff --git a/packages/packages_linux.go b/packages/packages_linux.go
+index bf8d7a1..4a2a5e1 100644
+--- a/packages/packages_linux.go
++++ b/packages/packages_linux.go
+@@ -228,8 +228,12 @@ func enrichDebPkgInfoWithPurl(pkgs []*PkgInfo, shortname string, version string)
+ 
+ func enrichRpmPkgInfoWithPurl(pkgs []*PkgInfo, shortname string, version string) []*PkgInfo {
+ 	for i, pkg := range pkgs {
++		purlArch := pkg.Arch
++		if purlArch == noarch {
++			purlArch = "noarch"
++		}
+ 		qualifiersMap := map[string]string{
+-			"arch":   pkg.Arch,
++			"arch":   purlArch,
+ 			"distro": version, // For RPM, accepted distro format is version (eg. distro=9.1)
+ 		}
+ 		pkgs[i].Purl = packageurl.NewPackageURL(pkg.Type, shortname, pkg.Name, pkg.Version, packageurl.QualifiersFromMap(qualifiersMap), "").ToString()
+diff --git a/packages/yum.go b/packages/yum.go
+index ee87694..8258c02 100644
+--- a/packages/yum.go
++++ b/packages/yum.go
+@@ -117,6 +117,7 @@ func parseYumUpdates(data []byte) []*PkgInfo {
+ 
+ 	var pkgs []*PkgInfo
+ 	var upgrading bool
++	packageIndent := -1
+ 	packagesInstallOrUpdateKeywords := []string{"Upgrading:", "Updating:", "Installing:", "Installing dependencies:", "Installing weak dependencies:"}
+ 	for _, ln := range lines {
+ 		pkg := bytes.Fields(ln)
+@@ -127,17 +128,24 @@ func parseYumUpdates(data []byte) []*PkgInfo {
+ 		// Yum has this as Updating, dnf is Upgrading.
+ 		if slices.Contains(packagesInstallOrUpdateKeywords, string(bytes.Join(pkg, []byte(" ")))) {
+ 			upgrading = true
++			packageIndent = -1
+ 			continue
+ 		} else if !upgrading {
+ 			continue
+ 		}
+-		// A package line should have 6 fields, break unless this is a 'replacing' entry.
++		// DNF5 indents replacement annotations beneath their package row. An
++		// empty repository can leave six fields, just like a real package named replacing.
++		indent := len(ln) - len(bytes.TrimLeft(ln, " \t"))
++		if string(pkg[0]) == "replacing" && (len(pkg) != 6 || (packageIndent >= 0 && indent > packageIndent)) {
++			continue
++		}
++		// A package line should have 6 fields; shorter rows end the update list.
+ 		if len(pkg) < 6 {
+-			if string(pkg[0]) == "replacing" {
+-				continue
+-			}
+ 			break
+ 		}
++		if packageIndent < 0 {
++			packageIndent = indent
++		}
+ 
+ 		pkgs = append(pkgs, &PkgInfo{Name: string(pkg[0]), Arch: osinfo.NormalizeArchitecture(string(pkg[1])), RawArch: string(pkg[1]), Version: string(pkg[2]), Type: typeRPM})
+ 	}
+diff --git a/packages/yum_test.go b/packages/yum_test.go
+index 300b27d..80c9f79 100644
+--- a/packages/yum_test.go
++++ b/packages/yum_test.go
+@@ -85,6 +85,32 @@ func TestRemoveYum(t *testing.T) {
+ }
+ 
+ func TestYumUpdates(t *testing.T) {
++	t.Run("PackageNamedReplacing", func(t *testing.T) {
++		got := parseYumUpdates([]byte(`Upgrading:
++ replacing x86_64 x86_64 updates 1 M
++   replacing old-package x86_64 1.0-1 updates 1 M
++   replacing x86_64 x86_64 updates 1 M
++ foo noarch 2.0-1 updates 1 M
++Installing:
++ replacing noarch noarch updates 1 M
++   replacing noarch noarch updates 1 M
++Transaction Summary
++`))
++		want := []struct{ name, arch, version string }{
++			{"replacing", "x86_64", "x86_64"},
++			{"foo", "noarch", "2.0-1"},
++			{"replacing", "noarch", "noarch"},
++		}
++		if len(got) != len(want) {
++			t.Fatalf("expected %d package updates, got %v", len(want), got)
++		}
++		for i, expected := range want {
++			if got[i].Name != expected.name || got[i].RawArch != expected.arch || got[i].Version != expected.version {
++				t.Errorf("update %d: got %+v, want %+v", i, got[i], expected)
++			}
++		}
++	})
++
+ 	data := []byte(`
+ 	=================================================================================================================================================================================
+ 	Package                                      Arch                           Version                                              Repository                                Size
+@@ -94,6 +120,8 @@ func TestYumUpdates(t *testing.T) {
+ 	    replacing kernel.x86_64 1.0.0-4
+ 	Upgrading:
+ 	  foo                                       noarch                         2.0.0-1                                              BaseOS                                   361 k
++	    replacing                             x86_64                         x86_64                                              updates                                   1 M
++	    replacing                             x86_64                         noarch                                              updates                                   1 M
+ 	  bar                                       x86_64                         2.0.0-1                                              repo                                      10 M
+ 	Obsoleting:
+ 	  baz                                       noarch                         2.0.0-1                                              repo                                      10 M

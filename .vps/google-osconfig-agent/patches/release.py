@@ -3781,7 +3781,7 @@ def published_candidate_identity(repo, published, work_root):
         run("git", "config", key, value, cwd=repo_work)
     run("git", "remote", "add", "upstream", f"https://github.com/{UPSTREAM}.git", cwd=repo_work)
     run("git", "remote", "add", "origin", f"https://github.com/{repo}.git", cwd=repo_work)
-    run("git", "fetch", "--depth=1", "upstream", upstream, cwd=repo_work)
+    run("git", "fetch", "--no-tags", "upstream", upstream, cwd=repo_work)
     if run("git", "rev-parse", "FETCH_HEAD", cwd=repo_work) != upstream:
         raise ValueError("Reconstructed baseline upstream differs from the signed manifest")
     run("git", "checkout", "-b", "baseline", upstream, cwd=repo_work)
@@ -4106,7 +4106,7 @@ def prepare(candidate):
         run("git", "config", key, value, cwd=repo_work)
     run("git", "remote", "add", "upstream", f"https://github.com/{UPSTREAM}.git", cwd=repo_work)
     run("git", "remote", "add", "origin", f"https://github.com/{repo}.git", cwd=repo_work)
-    run("git", "fetch", "--depth=1", "upstream", upstream, cwd=repo_work)
+    run("git", "fetch", "--no-tags", "upstream", upstream, cwd=repo_work)
     if run("git", "rev-parse", "FETCH_HEAD", cwd=repo_work) != upstream:
         raise ValueError("Fetched commit differs from source.lock")
     run("git", "checkout", "-B", "candidate", upstream, cwd=repo_work)

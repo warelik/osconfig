@@ -27,7 +27,7 @@ endpoint supports only the legacy API may therefore fail to report inventory.
 ## Package and release boundary
 
 `repository.conf` binds the repository to the dedicated primary signing
-fingerprint `2730BEB4EE57C47CBD97B6A2697251684BDF2CE9`. Its minimum EVR
+fingerprint `EFE9C5EA122C4A4964D7306046AB9009B638EDAC`. Its minimum EVR
 `0:20261015.00-1.vps1.fc44` is a lower bound for an acceptable fixed package;
 it does not claim that this package has been built, signed, or published. The
 workflow verifies exact source identity and review before signing and publication.

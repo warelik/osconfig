@@ -3,6 +3,7 @@ import ast
 import base64
 import hashlib
 import inspect
+import io
 import json
 import os
 from datetime import datetime, timedelta, timezone
@@ -125,6 +126,123 @@ class ExactShaReviewTests(unittest.TestCase):
         ready, reason = self.gate(comments=[self.clean_native_comment("b" * 40)])
         self.assertFalse(ready)
         self.assertEqual(reason, release.WAITING)
+
+
+class ReviewModeTests(unittest.TestCase):
+    candidate = {"repository": "warelik/osconfig"}
+    request = {"id": 7, "created_at": "2026-10-19T09:00:00Z"}
+
+    class Core:
+        @staticmethod
+        def candidate_identity(_candidate):
+            return "c" * 64
+
+    def test_none_posts_exact_owner_acceptance_once_without_trigger(self):
+        with patch.dict(release.os.environ, {"FORK_REVIEW_MODE": "none"}), \
+                patch.object(release, "lifecycle_module", return_value=self.Core), \
+                patch.object(release, "owner_token", return_value="owner-token"), \
+                patch.object(release, "api", return_value={"id": 8}) as api:
+            self.assertEqual(release.review_trigger_prefix(), "")
+            self.assertTrue(release._ensure_owner_acceptance(
+                self.candidate, "full", 7, self.request, "a" * 40, "b" * 40, []))
+        body = api.call_args.kwargs["data"]["body"]
+        self.assertIn('"request_id":7', body)
+        self.assertIn('"repository":"warelik/osconfig"', body)
+        with patch.dict(release.os.environ, {"FORK_REVIEW_MODE": "none"}), \
+                patch.object(release, "lifecycle_module", return_value=self.Core), \
+                patch.object(release, "api") as duplicate:
+            self.assertFalse(release._ensure_owner_acceptance(
+                self.candidate, "full", 7, self.request, "a" * 40, "b" * 40,
+                [{"body": body, "user": {"login": "warelik", "type": "User"}}]))
+        duplicate.assert_not_called()
+
+    def test_bot_keeps_configured_trigger_without_acceptance(self):
+        with patch.dict(release.os.environ, {
+                "FORK_REVIEW_MODE": "bot", "FORK_REVIEW_TRIGGER": "@reviewer review"}):
+            self.assertEqual(release.review_trigger_prefix(), "@reviewer review\n\n")
+            with patch.object(release, "api") as api:
+                self.assertFalse(release._ensure_owner_acceptance(
+                    self.candidate, "delta", 7, self.request, "a" * 40, "b" * 40, []))
+            api.assert_not_called()
+        with patch.dict(release.os.environ, {"FORK_REVIEW_MODE": "sometimes"}), \
+                self.assertRaisesRegex(ValueError, "FORK_REVIEW_MODE"):
+            release.review_mode()
+
+    def test_none_satisfies_waiting_local_gate_but_bot_still_waits(self):
+        sha = "a" * 40
+        pull = {"head": {"sha": sha}}
+        request = {"created_at": "2026-10-19T09:00:00Z",
+                   "user": {"login": "warelik", "type": "User"},
+                   "body": f"<!-- osconfig-codex:{sha} -->"}
+
+        def pages(route):
+            return [request] if "/issues/" in route else []
+
+        with patch.object(release, "api", return_value=pull), \
+                patch.object(release, "pull_identity", return_value=True), \
+                patch.object(release, "pages", side_effect=pages):
+            with patch.dict(release.os.environ, {"FORK_REVIEW_MODE": "none"}):
+                ready, _ = release.review_status(
+                    "warelik/osconfig", 3, sha, "1" * 40, "master")
+                self.assertTrue(ready)
+            with patch.dict(release.os.environ, {"FORK_REVIEW_MODE": "bot"}):
+                ready, reason = release.review_status(
+                    "warelik/osconfig", 3, sha, "1" * 40, "master")
+                self.assertFalse(ready)
+                self.assertEqual(reason, release.WAITING)
+
+
+class BaselineFingerprintRotationTests(unittest.TestCase):
+    repo = "warelik/osconfig"
+    old_fingerprint = "A" * 40
+    new_fingerprint = "B" * 40
+    config_sha = "c" * 40
+
+    def baseline_conf(self, fingerprint):
+        return (
+            "# Managed by ~/.vps/google-osconfig-agent/install.sh; local edits are replaced on the next install.\n"
+            "github_owner=warelik\n"
+            "github_repo=osconfig\n"
+            f"signing_fingerprint={fingerprint}\n"
+            "minimum_evr=0:20261027.00-1.vps494.fc44\n"
+        ).encode()
+
+    def test_current_fingerprint_short_circuits_without_fallback(self):
+        with patch.object(release, "published_manifest", return_value={"ok": True}) as manifest, \
+                patch.object(release, "_baseline_signing_fingerprint") as fallback:
+            self.assertEqual(
+                release.published_baseline_manifest(self.repo, self.new_fingerprint), {"ok": True})
+        manifest.assert_called_once_with("warelik", "osconfig", self.new_fingerprint)
+        fallback.assert_not_called()
+
+    def test_rotated_settings_verify_baseline_under_its_signing_fingerprint(self):
+        manifest = {"configSha": self.config_sha}
+        raw = json.dumps(manifest).encode()
+        variable = {"value": json.dumps({"publication": {
+            "metadata_sha256": hashlib.sha256(raw).hexdigest()}})}
+        with patch.object(release, "published_manifest", side_effect=[None, {"ok": True}]) as verify, \
+                patch.object(release, "owner_token", return_value="owner-token"), \
+                patch.object(release, "api", return_value=variable), \
+                patch.object(release, "urlopen", return_value=io.BytesIO(raw)), \
+                patch.object(release, "content", return_value=self.baseline_conf(self.old_fingerprint)):
+            self.assertEqual(
+                release.published_baseline_manifest(self.repo, self.new_fingerprint), {"ok": True})
+        self.assertEqual(verify.call_args_list[1].args, ("warelik", "osconfig", self.old_fingerprint))
+
+    def test_same_fingerprint_returns_none_without_second_verification(self):
+        with patch.object(release, "published_manifest", return_value=None) as verify, \
+                patch.object(release, "_baseline_signing_fingerprint",
+                             return_value=self.new_fingerprint):
+            self.assertIsNone(release.published_baseline_manifest(self.repo, self.new_fingerprint))
+        verify.assert_called_once()
+
+    def test_baseline_fingerprint_rejects_manifest_bytes_outside_checkpoint(self):
+        variable = {"value": json.dumps({"publication": {"metadata_sha256": "0" * 64}})}
+        with patch.object(release, "owner_token", return_value="owner-token"), \
+                patch.object(release, "api", return_value=variable), \
+                patch.object(release, "urlopen", return_value=io.BytesIO(b"{}")), \
+                self.assertRaisesRegex(ValueError, "protected baseline checkpoint"):
+            release._baseline_signing_fingerprint(self.repo)
 
 
 class ClosedPolicyBundleReuseTests(unittest.TestCase):

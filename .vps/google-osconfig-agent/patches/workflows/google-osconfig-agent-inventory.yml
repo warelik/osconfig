@@ -36,6 +36,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
+      actions: read
       contents: write
       pull-requests: write
       issues: write
@@ -213,6 +214,7 @@ jobs:
           CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
           FORK_REVIEW_MODE: ${{ vars.FORK_REVIEW_MODE || 'bot' }}
           FORK_REVIEW_TRIGGER: ${{ vars.FORK_REVIEW_TRIGGER || '@codex review' }}
+          FORK_REPAIR_MODE: ${{ vars.FORK_REPAIR_MODE || 'escalate' }}
           POLICY_PR_NUMBER: ${{ inputs.policy_pr }}
           FORK_MAINTENANCE_ROOT: ${{ github.workspace }}/machine-maintenance
         run: python3 -B trusted/.vps/google-osconfig-agent/patches/release.py policy-resume .
@@ -513,6 +515,7 @@ jobs:
           CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
           FORK_REVIEW_MODE: ${{ vars.FORK_REVIEW_MODE || 'bot' }}
           FORK_REVIEW_TRIGGER: ${{ vars.FORK_REVIEW_TRIGGER || '@codex review' }}
+          FORK_REPAIR_MODE: ${{ vars.FORK_REPAIR_MODE || 'escalate' }}
           POLICY_PR_NUMBER: ${{ needs.policy-check.outputs.pr }}
           POLICY_HEAD_SHA: ${{ needs.policy-check.outputs.head }}
         run: |
@@ -1291,6 +1294,7 @@ jobs:
           CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
           FORK_REVIEW_MODE: ${{ vars.FORK_REVIEW_MODE || 'bot' }}
           FORK_REVIEW_TRIGGER: ${{ vars.FORK_REVIEW_TRIGGER || '@codex review' }}
+          FORK_REPAIR_MODE: ${{ vars.FORK_REPAIR_MODE || 'escalate' }}
           REVIEW_REASON: ${{ needs.review.outputs.reason }}
         run: |
           python3 -B .vps/google-osconfig-agent/patches/release.py failed-job-evidence \
@@ -1333,6 +1337,7 @@ jobs:
           CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
           FORK_REVIEW_MODE: ${{ vars.FORK_REVIEW_MODE || 'bot' }}
           FORK_REVIEW_TRIGGER: ${{ vars.FORK_REVIEW_TRIGGER || '@codex review' }}
+          FORK_REPAIR_MODE: ${{ vars.FORK_REPAIR_MODE || 'escalate' }}
           POLICY_CONFIG_SHA: ${{ github.sha }}
         run: |
           python3 -B .vps/google-osconfig-agent/patches/release.py failed-job-evidence \

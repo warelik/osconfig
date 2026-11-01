@@ -2059,6 +2059,30 @@ class PendingApplicationScopeContinuationTests(unittest.TestCase):
                     now=self.start + timedelta(seconds=release.REPAIR_WINDOW_SECONDS))
         self.assertFalse(any(call.kwargs.get("method") == "POST" for call in api.call_args_list))
 
+    def test_missing_request_recovery_forwards_authoritative_initial_baseline_flag(self):
+        initial_proof = {
+            "endpoint": f"repos/{self.repo}/actions/variables/FORK_ACCEPTED_BASELINE",
+            "variable": None,
+            "publication_endpoint": f"repos/{self.repo}/deployments?environment=github-pages",
+            "publications": [],
+        }
+        for expected_initial, proof in ((False, None), (True, initial_proof)):
+            with self.subTest(initial_baseline=expected_initial):
+                manifest, _comments, pulls = self.fixture()
+                if proof is not None:
+                    manifest["acceptedBaselineProof"] = proof
+                context = manifest["reviewContexts"]["delta"]
+                with patch.object(release, "api", return_value=pulls[12]), \
+                        patch.object(release, "pages", return_value=[]), \
+                        patch.object(release, "request_lifecycle_review") as request:
+                    release.continue_pending_lifecycle_reviews(
+                        self.repo, manifest, {"complete": True}, {"complete": False}, "token",
+                        now=self.start)
+                request.assert_called_once_with(
+                    self.repo, pulls[12], manifest["candidate"], manifest["candidateIdentity"],
+                    "delta", context["review_sha"], context["base_sha"], "token",
+                    initial_baseline=expected_initial)
+
 
 class BuildInfrastructureFailureRoutingTests(unittest.TestCase):
     def test_classifier_routes_unlisted_failures_without_hiding_application_failure(self):
@@ -2614,9 +2638,33 @@ class FindingDispositionReceiptTests(unittest.TestCase):
                     release.request_manifest_reviews(self.repo, manifest, pulls, "owner-token")
                 self.assertEqual(request.call_count, 2)
                 request.assert_any_call(self.repo, pulls["delta"], candidate, self.current_id,
-                                        "delta", delta_sha, delta_base, "owner-token")
+                                        "delta", delta_sha, delta_base, "owner-token",
+                                        initial_baseline=False)
                 request.assert_any_call(self.repo, pulls["full"], candidate, self.current_id,
-                                        "full", "7" * 40, "d" * 40, "owner-token")
+                                        "full", "7" * 40, "d" * 40, "owner-token",
+                                        initial_baseline=False)
+        initial_manifest = {
+            "candidate": candidate, "candidateIdentity": self.current_id,
+            "acceptedBaselineProof": {
+                "endpoint": f"repos/{self.repo}/actions/variables/FORK_ACCEPTED_BASELINE",
+                "variable": None,
+                "publication_endpoint": f"repos/{self.repo}/deployments?environment=github-pages",
+                "publications": [],
+            },
+            "reviewContexts": {
+                "full": {"review_sha": "7" * 40, "base_sha": "d" * 40},
+                "delta": {"review_sha": candidate["configuration_sha"], "base_sha": "d" * 40},
+            },
+        }
+        with patch.object(release, "request_lifecycle_review") as request:
+            release.request_manifest_reviews(self.repo, initial_manifest, pulls, "owner-token")
+        self.assertEqual(request.call_count, 2)
+        request.assert_any_call(self.repo, pulls["delta"], candidate, self.current_id,
+                                "delta", candidate["configuration_sha"], "d" * 40, "owner-token",
+                                initial_baseline=True)
+        request.assert_any_call(self.repo, pulls["full"], candidate, self.current_id,
+                                "full", "7" * 40, "d" * 40, "owner-token",
+                                initial_baseline=True)
 
     repo = "warelik/osconfig"
     old_app = "a" * 40

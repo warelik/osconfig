@@ -1581,8 +1581,11 @@ def continue_pending_lifecycle_reviews(repo, manifest, full, delta, token, *, no
         marker = owner_review_marker(manifest["candidateIdentity"], scope,
                                      context["review_sha"], context["base_sha"])
         if latest_owner_review_request(owners, marker, owner) is None:
-            request_lifecycle_review(repo, pull, manifest["candidate"], manifest["candidateIdentity"],
-                                     scope, context["review_sha"], context["base_sha"], token)
+            request_lifecycle_review(
+                repo, pull, manifest["candidate"], manifest["candidateIdentity"],
+                scope, context["review_sha"], context["base_sha"], token,
+                initial_baseline=_is_initial_baseline_proof(
+                    repo, manifest.get("acceptedBaselineProof")))
             continue
         if not review_followup_due(owners, sha=context["review_sha"], now=now):
             continue

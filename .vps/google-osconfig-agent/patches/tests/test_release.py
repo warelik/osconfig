@@ -1655,6 +1655,18 @@ class ProductRecipeIdentityTests(unittest.TestCase):
         build_script = (release.PATCH_DIR / "build-rpm.sh").read_text(encoding="utf-8")
         self.assertNotIn("check-upstream.sh", build_script)
 
+    def test_license_verification_is_generated_before_rpmbuild(self):
+        build_script = (release.PATCH_DIR / "build-rpm.sh").read_text(encoding="utf-8")
+        report = build_script.index('report all --verify "$license_expr"')
+        vendored = build_script.index("go mod vendor")
+        rpmbuild = build_script.index("rpmbuild -ba")
+        self.assertLess(vendored, report)
+        self.assertLess(report, rpmbuild)
+        self.assertIn("Generated license-config repair data", build_script)
+        self.assertIn("STALE missing:", build_script)
+        self.assertIn("STALE sha256:", build_script)
+        self.assertIn("UNDETECTED %s sha256=%s", build_script)
+
     def test_application_input_reuse_ignores_modes_and_diagnostics_but_not_blobs(self):
         with tempfile.TemporaryDirectory(prefix="osconfig-recipe-reuse-") as temporary:
             root = Path(temporary)

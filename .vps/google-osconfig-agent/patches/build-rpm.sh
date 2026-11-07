@@ -9,7 +9,7 @@ output=${2:-}
     echo 'Usage: build-rpm.sh /absolute/candidate-directory /absolute/output-directory' >&2
     exit 2
 }
-for command_name in go rpmbuild sha256sum tar mkdir mktemp rm cp rpm patch gofmt jq; do
+for command_name in go rpmbuild sha256sum tar mkdir mktemp rm cp rpm patch gofmt jq go_vendor_license; do
     command -v "$command_name" >/dev/null 2>&1 || {
         echo "Missing RPM build command: $command_name" >&2
         exit 1
@@ -74,6 +74,36 @@ gofmt -w "$patched_dir/packages/yum.go" "$patched_dir/packages/yum_test.go" \
     go test -count=1 -timeout=5m ./packages ./agentendpoint
     go mod vendor
 )
+
+# Generate the license verification result before rpmbuild compiles anything.
+# The spec %check stage runs the same command, but only after the full Go
+# build; upstream dependency bumps make saved manual license entries stale,
+# so fail here with the exact repair data (paths and hashes) instead.
+license_expr=$(sed -n 's/^License:[[:space:]]*//p' "$spec_file")
+[[ -n $license_expr ]] || { echo 'Spec file has no License expression' >&2; exit 1; }
+license_report=$work/license-report.txt
+if ! (cd "$patched_dir" && go_vendor_license --config "$vendor_config" report all --verify "$license_expr") > "$license_report" 2>&1; then
+    cat "$license_report" >&2
+    echo '--- Generated license-config repair data (go-vendor-tools.toml) ---' >&2
+    awk '/^path = / { p = $3; gsub(/"/, "", p) } /^sha256sum = / { s = $3; gsub(/"/, "", s); print p " " s }' \
+        "$vendor_config" | while read -r saved_path saved_sha; do
+        if [[ ! -f $patched_dir/$saved_path ]]; then
+            echo "STALE missing: $saved_path" >&2
+        else
+            actual_sha=$(sha256sum "$patched_dir/$saved_path" | cut -d' ' -f1)
+            [[ $actual_sha == "$saved_sha" ]] || \
+                echo "STALE sha256: $saved_path saved=$saved_sha current=$actual_sha" >&2
+        fi
+    done
+    sed -n 's/^- \(vendor\/.*\)$/\1/p' "$license_report" | while read -r undetected_path; do
+        [[ -f $patched_dir/$undetected_path ]] && \
+            printf 'UNDETECTED %s sha256=%s\n' "$undetected_path" \
+                "$(sha256sum "$patched_dir/$undetected_path" | cut -d' ' -f1)" >&2
+    done
+    echo '--- End of generated license-config repair data ---' >&2
+    echo 'Vendor license verification failed before rpmbuild; see generated repair data above' >&2
+    exit 1
+fi
 
 mkdir -p "$output" "$work/rpmbuild/SOURCES" "$work/rpmbuild/SPECS"
 tar -czf "$work/rpmbuild/SOURCES/osconfig-$tag.tar.gz" -C "$work" "osconfig-$tag"
